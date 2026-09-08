@@ -519,6 +519,7 @@ rax_cpu.o: rax.c rax.h rax_malloc.h
 test: all q36_agent_test $(SAMPLING_TEST)
 	./q36-eval --self-test-extractors
 	./q36_agent_test
+	python3 tests/test_agent_password.py ./q36_agent_test
 	./tests/test_sampling
 	./q36_test --quant-primitives --ssd-cache-shrink --qwen-tool-call-format --vector-fixtures --server
 
@@ -529,6 +530,7 @@ test-unit: test
 test-metal: metal q36_agent_test_metal $(SAMPLING_TEST)
 	./q36-eval --self-test-extractors
 	./q36_agent_test_metal
+	python3 tests/test_agent_password.py ./q36_agent_test_metal
 	./tests/test_sampling
 	./q36_test --quant-primitives --ssd-cache-shrink --qwen-tool-call-format --vector-fixtures --server
 	./q36_test --vulkan-kernels

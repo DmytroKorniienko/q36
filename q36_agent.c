@@ -25,6 +25,7 @@
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <termios.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -104,6 +105,13 @@ typedef struct {
 typedef struct agent_bash_job agent_bash_job;
 
 typedef struct {
+    int fd;
+    int job_id;
+    double deadline;
+    char prompt[512];
+} agent_password_request;
+
+typedef struct {
     q36_engine *engine;
     agent_config *cfg;
     q36_session *session;
@@ -143,6 +151,10 @@ typedef struct {
     bool web_approval_result;
     char web_approval_message[256];
     char web_approval_error[160];
+    bool password_pending;
+    bool password_answered;
+    bool password_result;
+    agent_password_request password_request;
     bool queued_user_drain_pending;
     bool queued_user_drain_answered;
     char *queued_user_drain_text;
@@ -986,6 +998,8 @@ static const char agent_tools_prompt_edit_upto[] =
 static const char agent_tools_prompt_after_edit[] =
     "For long-running bash commands, pass refresh_sec. If a bash job is still running, use "
     "bash_status to check it early or bash_stop to terminate it.\n\n"
+    "Run sudo normally when needed. In interactive mode, terminal password requests open a private "
+    "password prompt for the user. Never ask for passwords in chat or put them in tool arguments.\n\n"
     "Use google_search to find web pages. Use visit_page to read a known URL with a visible browser. "
     "The first web call may ask the user for permission to start a visible browser.\n\n"
     "<tools>\n"
@@ -4341,6 +4355,45 @@ static void worker_answer_web_approval(agent_worker *w, bool allow,
     pthread_mutex_unlock(&w->mu);
 }
 
+/* The UI writes the password directly to the job's terminal. Only the request
+ * and its completion cross the worker boundary, never the password. */
+static bool agent_request_password(agent_worker *w,
+                                   const agent_password_request *request) {
+    if (!w || !w->cfg || w->cfg->non_interactive) return false;
+    pthread_mutex_lock(&w->mu);
+    w->password_request = *request;
+    w->password_pending = true;
+    w->password_answered = false;
+    w->password_result = false;
+    agent_wake_locked(w);
+    while (!w->stop && !w->password_answered)
+        pthread_cond_wait(&w->cond, &w->mu);
+    bool ok = w->password_answered && w->password_result;
+    w->password_pending = false;
+    pthread_mutex_unlock(&w->mu);
+    return ok;
+}
+
+static bool worker_take_password_request(agent_worker *w,
+                                         agent_password_request *request) {
+    pthread_mutex_lock(&w->mu);
+    bool pending = w->password_pending;
+    if (pending) {
+        *request = w->password_request;
+        w->password_pending = false;
+    }
+    pthread_mutex_unlock(&w->mu);
+    return pending;
+}
+
+static void worker_answer_password(agent_worker *w, bool ok) {
+    pthread_mutex_lock(&w->mu);
+    w->password_result = ok;
+    w->password_answered = true;
+    pthread_cond_signal(&w->cond);
+    pthread_mutex_unlock(&w->mu);
+}
+
 /* When a model turn finishes with a tool call, queued user messages should not
  * preempt that tool.  The worker asks the UI thread for the queue contents only
  * after the tool result is appended, so the next model input can contain both
@@ -7165,6 +7218,7 @@ struct agent_bash_job {
     int id;
     pid_t pid;
     int pipe_fd;
+    int tty_fd;
     int tmp_fd;
     char path[PATH_MAX];
     char *cmd;
@@ -7204,6 +7258,7 @@ static void agent_bash_job_free(agent_bash_job *job) {
         waitpid(job->pid, NULL, 0);
     }
     if (job->pipe_fd >= 0) close(job->pipe_fd);
+    if (job->tty_fd >= 0) close(job->tty_fd);
     if (job->tmp_fd >= 0) close(job->tmp_fd);
     free(job->cmd);
     free(job);
@@ -7272,14 +7327,55 @@ static void agent_bash_finalize(agent_bash_job *job, int status) {
         close(job->tmp_fd);
         job->tmp_fd = -1;
     }
+    if (job->tty_fd >= 0) {
+        close(job->tty_fd);
+        job->tty_fd = -1;
+    }
     if (WIFEXITED(status)) job->exit_status = WEXITSTATUS(status);
     else if (WIFSIGNALED(status)) job->exit_status = 128 + WTERMSIG(status);
     else job->exit_status = -1;
     job->running = false;
-    /* A child can still open /dev/tty directly and alter terminal state even
-     * though its stdin is /dev/null.  Ask the UI thread to verify raw mode at
-     * a safe point instead of touching linenoise from the worker path. */
+    /* Programs can explicitly open the user's terminal by path. Verify raw
+     * mode on the UI thread, where linenoise state is owned. */
     agent_worker_note_terminal_mode_may_have_changed(job->worker);
+}
+
+static void agent_bash_drain_terminal(agent_bash_job *job) {
+    if (job->tty_fd < 0) return;
+    agent_password_request request = {
+        .fd = job->tty_fd,
+        .job_id = job->id,
+        .deadline = job->start_time + job->timeout_sec,
+    };
+    size_t used = 0;
+    char buf[512];
+    ssize_t n;
+    while ((n = read(job->tty_fd, buf, sizeof(buf))) > 0) {
+        /* Terminal prompts are UI-only. Do not copy them to the model's
+         * output file; some password readers enable masked terminal echo. */
+        for (ssize_t i = 0; i < n; i++) {
+            unsigned char c = (unsigned char)buf[i];
+            if (used + 1 < sizeof(request.prompt) &&
+                ((c >= 32 && c != 127) || c == '\n' || c == '\t'))
+                request.prompt[used++] = c;
+        }
+    }
+    request.prompt[used] = '\0';
+    struct termios mode;
+    if (!used || tcgetattr(job->tty_fd, &mode) != 0) return;
+    if (mode.c_lflag & ECHO) {
+        agent_publish(job->worker, request.prompt, used);
+        return;
+    }
+    if (!agent_request_password(job->worker, &request)) {
+        job->timed_out = now_sec() >= request.deadline;
+        const char *msg = job->timed_out ? "Password entry timed out.\n" :
+            "Password entry cancelled or unavailable.\n";
+        agent_bash_note_output(job, msg, strlen(msg));
+        write_all(job->tmp_fd, msg, strlen(msg));
+        kill(-job->pid, SIGKILL);
+        kill(job->pid, SIGKILL);
+    }
 }
 
 /* Drain available output, notice process exit, and enforce timeout.  This is
@@ -7306,6 +7402,10 @@ static void agent_bash_poll(agent_bash_job *job) {
             close(job->tmp_fd);
             job->tmp_fd = -1;
         }
+        if (job->tty_fd >= 0) {
+            close(job->tty_fd);
+            job->tty_fd = -1;
+        }
         agent_worker_note_terminal_mode_may_have_changed(job->worker);
         return;
     }
@@ -7315,11 +7415,13 @@ static void agent_bash_poll(agent_bash_job *job) {
         kill(job->pid, SIGKILL);
         while (waitpid(job->pid, &status, 0) < 0 && errno == EINTR) {}
         agent_bash_finalize(job, status);
+        return;
     }
+    agent_bash_drain_terminal(job);
 }
 
-/* Spawn a shell command into its own process group so bash_stop/timeout can
- * kill grandchildren created by the shell, not just the /bin/sh wrapper. */
+/* A separate session prevents /dev/tty readers such as sudo from stealing
+ * the editor's input. Interactive jobs get a private controlling terminal. */
 static agent_bash_job *agent_bash_start(agent_worker *w, const char *cmd,
                                         int timeout_sec, char *err, size_t err_len) {
     char tmp_path[] = "/tmp/q36_agent_output_XXXXXX";
@@ -7336,21 +7438,47 @@ static agent_bash_job *agent_bash_start(agent_worker *w, const char *cmd,
         unlink(tmp_path);
         return NULL;
     }
+    int ttyfd = -1, slavefd = -1;
+    if (w->cfg && !w->cfg->non_interactive && isatty(STDIN_FILENO)) {
+        ttyfd = posix_openpt(O_RDWR | O_NOCTTY | O_CLOEXEC);
+        if (ttyfd >= 0 && grantpt(ttyfd) == 0 && unlockpt(ttyfd) == 0) {
+            const char *name = ptsname(ttyfd);
+            if (name) slavefd = open(name, O_RDWR | O_NOCTTY | O_CLOEXEC);
+        }
+        if (slavefd < 0) {
+            snprintf(err, err_len, "failed to create command terminal: %s", strerror(errno));
+            if (ttyfd >= 0) close(ttyfd);
+            close(pipefd[0]);
+            close(pipefd[1]);
+            close(tmpfd);
+            unlink(tmp_path);
+            return NULL;
+        }
+    }
+    fcntl(tmpfd, F_SETFD, FD_CLOEXEC);
+    fcntl(pipefd[0], F_SETFD, FD_CLOEXEC);
+    fcntl(pipefd[1], F_SETFD, FD_CLOEXEC);
     pid_t pid = fork();
     if (pid < 0) {
         snprintf(err, err_len, "failed to fork: %s", strerror(errno));
         close(pipefd[0]);
         close(pipefd[1]);
         close(tmpfd);
+        if (ttyfd >= 0) close(ttyfd);
+        if (slavefd >= 0) close(slavefd);
         unlink(tmp_path);
         return NULL;
     }
     if (pid == 0) {
-        setpgid(0, 0);
+        if (setsid() < 0) _exit(127);
+        if (slavefd >= 0) {
+            if (ioctl(slavefd, TIOCSCTTY, 0) < 0) _exit(127);
+            close(slavefd);
+            close(ttyfd);
+        }
         close(tmpfd);
-        /* The bash tool is not interactive.  Give the shell /dev/null as
-         * stdin so it does not inherit the live linenoise terminal and reset
-         * it from raw mode to cooked mode behind the agent's back. */
+        /* Ordinary stdin reads still get EOF. Only explicit /dev/tty password
+         * readers use the private terminal. */
         int null_fd = open("/dev/null", O_RDONLY);
         if (null_fd >= 0) {
             if (dup2(null_fd, STDIN_FILENO) < 0)
@@ -7369,9 +7497,10 @@ static agent_bash_job *agent_bash_start(agent_worker *w, const char *cmd,
     }
 
     close(pipefd[1]);
-    setpgid(pid, pid);
+    if (slavefd >= 0) close(slavefd);
     int old_flags;
     set_nonblock(pipefd[0], true, &old_flags);
+    if (ttyfd >= 0) set_nonblock(ttyfd, true, NULL);
 
     agent_bash_job *job = xmalloc(sizeof(*job));
     memset(job, 0, sizeof(*job));
@@ -7379,6 +7508,7 @@ static agent_bash_job *agent_bash_start(agent_worker *w, const char *cmd,
     job->id = w->next_bash_job_id++;
     job->pid = pid;
     job->pipe_fd = pipefd[0];
+    job->tty_fd = ttyfd;
     job->tmp_fd = tmpfd;
     snprintf(job->path, sizeof(job->path), "%s", tmp_path);
     job->cmd = xstrdup(cmd);
@@ -10115,6 +10245,93 @@ static const char *agent_yes_no_auto_name(agent_yes_no_auto answer) {
     }
 }
 
+static void agent_clear_password(void *ptr, size_t len) {
+    volatile unsigned char *p = ptr;
+    while (len--) *p++ = 0;
+}
+
+/* This reader deliberately bypasses linenoise, history, and the prompt queue.
+ * The only destination for its input is the command's private terminal. */
+static bool agent_prompt_password(agent_worker *w,
+                                   const agent_password_request *request) {
+    struct termios saved, raw, child;
+    if (tcgetattr(STDIN_FILENO, &saved) != 0) return false;
+    raw = saved;
+    cfmakeraw(&raw);
+    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) != 0) return false;
+
+    printf("\r\nPassword for bash job %d (input hidden; Ctrl+C cancels)\r\n",
+           request->job_id);
+    for (const char *p = request->prompt; *p; p++) {
+        if (*p == '\n') putchar('\r');
+        putchar(*p);
+    }
+    fflush(stdout);
+
+    char password[1024] = {0};
+    size_t len = 0;
+    bool ok = false;
+    while (now_sec() < request->deadline && !worker_should_interrupt(w) &&
+           !agent_sigint) {
+        struct pollfd pfd[2] = {
+            {.fd = STDIN_FILENO, .events = POLLIN},
+            {.fd = request->fd, .events = 0},
+        };
+        int rc = poll(pfd, 2, 100);
+        if (rc < 0 && errno == EINTR) continue;
+        if (rc < 0 || (pfd[0].revents & (POLLHUP | POLLERR | POLLNVAL)) ||
+            (pfd[1].revents & (POLLHUP | POLLERR | POLLNVAL))) break;
+        if (tcgetattr(request->fd, &child) != 0 || (child.c_lflag & ECHO)) break;
+        if (!(pfd[0].revents & POLLIN)) continue;
+        unsigned char c;
+        if (read(STDIN_FILENO, &c, 1) != 1) break;
+        if (c == 3 || c == 4 || c == 27) break;
+        if (c == '\r' || c == '\n') {
+            password[len++] = '\n';
+            size_t sent = 0;
+            while (sent < len) {
+                ssize_t n = write(request->fd, password + sent, len - sent);
+                if (n < 0 && errno == EINTR) continue;
+                if (n <= 0) break;
+                sent += (size_t)n;
+            }
+            ok = sent == len;
+            break;
+        }
+        if (c == 127 || c == 8) {
+            if (len) {
+                do { len--; } while (len && (password[len] & 0xc0) == 0x80);
+            }
+        } else if (c == 21) {
+            len = 0;
+        } else if (c >= 32 && len + 1 < sizeof(password)) {
+            password[len++] = c;
+        }
+    }
+    agent_clear_password(password, sizeof(password));
+    /* Discard input following Enter/cancellation so a pasted secret suffix
+     * cannot become a chat message when the editor resumes. */
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &saved);
+    printf("\n%s", ok ? "" : "Password entry cancelled.\n");
+    fflush(stdout);
+    return ok;
+}
+
+static int editor_prompt_password(agent_editor *editor, agent_worker *w,
+                                   const agent_password_request *request,
+                                   const char *prompt, const char *status) {
+    char *saved_input = NULL;
+    if (editor->active && editor->edit.buf && editor->edit.len)
+        saved_input = xstrndup(editor->edit.buf, editor->edit.len);
+    editor_stop(editor);
+    editor_restore_terminal_layout(editor);
+    bool ok = agent_prompt_password(w, request);
+    worker_answer_password(w, ok);
+    int rc = editor_start(editor, prompt, status, saved_input);
+    free(saved_input);
+    return rc;
+}
+
 /* Shared y/n prompt.  By default it blocks forever like the historical helper;
  * callers that cannot safely stall the agent can request an automatic answer
  * after timeout_sec seconds. */
@@ -10520,6 +10737,13 @@ static int run_agent(q36_engine *engine, agent_config *cfg) {
                 free(echo);
             }
             worker_answer_queued_user_drain(&worker, queued);
+            continue;
+        }
+
+        agent_password_request password_request;
+        if (worker_take_password_request(&worker, &password_request)) {
+            if (editor_prompt_password(&editor, &worker, &password_request,
+                                       prompt, statusline) != 0) break;
             continue;
         }
 

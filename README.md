@@ -423,6 +423,12 @@ Explicit `--ctx`, `-ctk`, and `-ctv` values override the preset.
 then changes to the requested project for agent tools. Built-in path tools also
 expand `~` to the current user's home directory.
 
+When a command such as `sudo` requests a terminal password, the interactive
+agent opens a private prompt with input hidden. Type the password there;
+Ctrl+C cancels the command. Password input is sent directly to the command,
+without entering chat history, traces, or captured tool output. Other command
+stdin reads receive EOF; `--non-interactive` cannot prompt for passwords.
+
 Sessions are stored in `~/.q36/kvcache`. Use `/save` to persist the current
 session, `/list` to show saved sessions, and `/switch <sha>` to resume one.
 The session ID remains stable across later saves. `/del <sha>` removes a saved
