@@ -84,17 +84,20 @@ uint32_t q36_ssd_shrink_cache_experts(uint32_t experts) {
 }
 
 bool q36_ssd_auto_cache_plan(uint64_t            recommended_bytes,
+                             uint32_t            percent,
+                             uint64_t            model_limit_bytes,
                              uint64_t            non_routed_bytes,
                              uint64_t            per_expert_bytes,
                              uint64_t            max_model_experts,
                              q36_ssd_cache_plan *out) {
     if (!out) return false;
     memset(out, 0, sizeof(*out));
-    if (recommended_bytes == 0 || per_expert_bytes == 0) return false;
+    if (recommended_bytes == 0 || per_expert_bytes == 0 || percent < 50 || percent > 95) return false;
 
-    out->model_target_bytes =
-        recommended_bytes > UINT64_MAX / 4ull ?
-            UINT64_MAX : (recommended_bytes * 4ull) / 5ull;
+    out->model_target_bytes = (recommended_bytes / 100) * percent +
+                              (recommended_bytes % 100) * percent / 100;
+    if (model_limit_bytes && out->model_target_bytes > model_limit_bytes)
+        out->model_target_bytes = model_limit_bytes;
     if (out->model_target_bytes > non_routed_bytes) {
         out->cache_bytes = out->model_target_bytes - non_routed_bytes;
     }

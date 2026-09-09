@@ -1,4 +1,5 @@
 #include "q36.h"
+#include "q36_prompt_prefix.h"
 #include "linenoise.h"
 #include "q36_ssd.h"
 
@@ -27,6 +28,7 @@
 typedef struct {
     const char *prompt;
     const char *system;
+    q36_prompt_prefix prefix;
     int n_predict;
     int ctx_size;
     float temperature;
@@ -88,6 +90,8 @@ static void usage(FILE *fp) {
         "      GGUF model path. Default: " Q36_DEFAULT_MODEL_PATH "\n"
         "  --mtp FILE\n"
         "      Optional MTP support GGUF used for draft-token probes.\n"
+        "  --prefix-file FILE\n"
+        "      Preload complete USER:/ASSISTANT: conversation pairs.\n"
         "  --vision FILE\n"
         "      Qwen3-VL mmproj sidecar. It remains disk-backed.\n"
         "  --mtp-draft N\n"
@@ -544,6 +548,15 @@ static void print_generated_token(void *ud, int token) {
 static void build_prompt(q36_engine *engine, const cli_generation_options *gen, q36_tokens *out) {
     if (is_rendered_chat_prompt(gen->prompt)) {
         q36_tokenize_rendered_chat(engine, gen->prompt, out);
+    } else if (gen->prefix.count) {
+        q36_think_mode mode = cli_prompt_think_mode(gen);
+        q36_chat_begin(engine, out);
+        if (mode == Q36_THINK_MAX) q36_chat_append_max_effort_prefix(engine, out);
+        if (gen->system && gen->system[0])
+            q36_chat_append_message(engine, out, "system", gen->system);
+        q36_prompt_prefix_append(engine, out, &gen->prefix);
+        q36_chat_append_message(engine, out, "user", gen->prompt ? gen->prompt : "");
+        q36_chat_append_assistant_prefix(engine, out, mode);
     } else {
         q36_encode_chat_prompt(engine, gen->system, gen->prompt,
                                cli_prompt_think_mode(gen), out);
@@ -1010,6 +1023,19 @@ static int repl_chat_create_session(q36_engine *engine, repl_chat *chat, int ctx
     return 0;
 }
 
+static int repl_chat_prefill_prefix(repl_chat *chat) {
+    char err[160] = {0};
+    cli_prefill_progress progress = {
+        .input_tokens = chat->transcript.len,
+        .use_color = q36_log_is_tty(stderr),
+    };
+    q36_session_set_progress(chat->session, cli_prefill_progress_cb, &progress);
+    int rc = q36_session_sync(chat->session, &chat->transcript, err, sizeof(err));
+    q36_session_set_progress(chat->session, NULL, NULL);
+    if (rc) fprintf(stderr, "q36: prefix prefill failed: %s\n", err);
+    return rc;
+}
+
 static int repl_chat_init(q36_engine *engine, repl_chat *chat, const cli_config *cfg) {
     memset(chat, 0, sizeof(*chat));
     chat->enabled_think_mode = cfg->gen.think_mode == Q36_THINK_NONE ?
@@ -1022,7 +1048,17 @@ static int repl_chat_init(q36_engine *engine, repl_chat *chat, const cli_config 
     if (cfg->gen.system && cfg->gen.system[0]) {
         q36_chat_append_message(engine, &chat->transcript, "system", cfg->gen.system);
     }
-    return repl_chat_create_session(engine, chat, cfg->gen.ctx_size);
+    q36_prompt_prefix_append(engine, &chat->transcript, &cfg->gen.prefix);
+    if (repl_chat_create_session(engine, chat, cfg->gen.ctx_size) != 0) {
+        q36_tokens_free(&chat->transcript);
+        return 1;
+    }
+    if (cfg->gen.prefix.count && repl_chat_prefill_prefix(chat) != 0) {
+        q36_session_free(chat->session);
+        q36_tokens_free(&chat->transcript);
+        return 1;
+    }
+    return 0;
 }
 
 static void repl_chat_reset(q36_engine *engine, repl_chat *chat, const cli_config *cfg) {
@@ -1041,6 +1077,8 @@ static void repl_chat_reset(q36_engine *engine, repl_chat *chat, const cli_confi
     if (cfg->gen.system && cfg->gen.system[0]) {
         q36_chat_append_message(engine, &chat->transcript, "system", cfg->gen.system);
     }
+    q36_prompt_prefix_append(engine, &chat->transcript, &cfg->gen.prefix);
+    if (cfg->gen.prefix.count) (void)repl_chat_prefill_prefix(chat);
 }
 
 static void repl_chat_free(repl_chat *chat) {
@@ -1467,6 +1505,17 @@ static cli_config parse_options(int argc, char **argv) {
             }
             c.prompt_owned = read_prompt_file(need_arg(&i, argc, argv, arg), true);
             c.gen.prompt = c.prompt_owned;
+        } else if (!strcmp(arg, "--prefix-file")) {
+            if (c.gen.prefix.count) {
+                fprintf(stderr, "specify --prefix-file only once\n");
+                exit(2);
+            }
+            char err[256] = {0};
+            if (q36_prompt_prefix_load(&c.gen.prefix,
+                    need_arg(&i, argc, argv, arg), err, sizeof(err)) != 0) {
+                fprintf(stderr, "%s\n", err);
+                exit(2);
+            }
         } else if (!strcmp(arg, "-sys") || !strcmp(arg, "--system")) {
             c.gen.system = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
@@ -1662,6 +1711,10 @@ static cli_config parse_options(int argc, char **argv) {
     if (!cache_type_v_set)
         c.engine.cache_type_v = q36_default_kv_cache_type_v(c.engine.backend, c.engine.ssd_streaming);
 
+    if (c.gen.prefix.count && is_rendered_chat_prompt(c.gen.prompt)) {
+        fprintf(stderr, "q36: --prefix-file cannot accompany an already-rendered prompt\n");
+        exit(2);
+    }
     return c;
 }
 
@@ -1681,6 +1734,12 @@ static void cli_apply_model_sampling_defaults(
 int main(int argc, char **argv) {
     cli_config cfg = parse_options(argc, argv);
     if (cfg.gen.dump_tokens) {
+        if (cfg.gen.prefix.count) {
+            fprintf(stderr, "q36: --dump-tokens cannot be combined with --prefix-file\n");
+            q36_prompt_prefix_free(&cfg.gen.prefix);
+            free(cfg.prompt_owned);
+            return 2;
+        }
         if (cfg.gen.prompt == NULL) {
             fprintf(stderr, "q36: --dump-tokens requires -p or --prompt-file\n");
             free(cfg.prompt_owned);
@@ -1693,6 +1752,7 @@ int main(int argc, char **argv) {
         return rc;
     }
     q36_engine *engine = NULL;
+    cfg.engine.context_size = cfg.gen.ctx_size;
     if (q36_engine_open(&engine, &cfg.engine) != 0) {
         free(cfg.prompt_owned);
         return 1;
@@ -1714,6 +1774,7 @@ int main(int argc, char **argv) {
         rc = run_generation(engine, &cfg);
     }
     q36_engine_close(engine);
+    q36_prompt_prefix_free(&cfg.gen.prefix);
     free(cfg.prompt_owned);
     return rc;
 }

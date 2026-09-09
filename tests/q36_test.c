@@ -326,6 +326,15 @@ static void test_quant_primitives(void) {
 }
 
 static void test_ssd_cache_shrink(void) {
+    q36_ssd_cache_plan plan;
+    TEST_ASSERT(q36_ssd_auto_cache_plan(1000, 80, 0, 200, 10, 100, &plan));
+    TEST_ASSERT(plan.model_target_bytes == 800 && plan.cache_experts == 60);
+    TEST_ASSERT(q36_ssd_auto_cache_plan(1000, 80, 600, 200, 10, 100, &plan));
+    TEST_ASSERT(plan.model_target_bytes == 600 && plan.cache_experts == 40);
+    TEST_ASSERT(q36_ssd_auto_cache_plan(UINT64_MAX, 80, 1000, 200, 10, 30, &plan));
+    TEST_ASSERT(plan.model_target_bytes == 1000 && plan.cache_experts == 30);
+    TEST_ASSERT(!q36_ssd_auto_cache_plan(1000, 96, 0, 200, 10, 100, &plan));
+    TEST_ASSERT(!q36_ssd_auto_cache_plan(0, 80, 0, 200, 10, 100, &plan));
     TEST_ASSERT(q36_ssd_shrink_cache_experts(0) == 0);
     TEST_ASSERT(q36_ssd_shrink_cache_experts(1) == 0);
     TEST_ASSERT(q36_ssd_shrink_cache_experts(2) == 1);
@@ -5478,6 +5487,8 @@ static void test_tool_call_quality_one(bool quality) {
     bool decode_ok = true;
     bool saw_tool_start = false;
     bool saw_tool_end = false;
+    qwen_tool_decode_tracker tracker;
+    qwen_tool_decode_tracker_init(&tracker);
     for (int i = 0; i < r.max_tokens; i++) {
         int token = q36_session_sample(session, r.temperature, r.top_k,
                                        r.top_p, r.min_p, &rng);
@@ -5485,7 +5496,8 @@ static void test_tool_call_quality_one(bool quality) {
         char *piece = q36_token_text(engine, token, &piece_len);
         buf_append(&text, piece, piece_len);
         free(piece);
-        observe_tool_markers(text.ptr ? text.ptr : "", &saw_tool_start, &saw_tool_end, NULL);
+        qwen_tool_decode_tracker_update(&tracker, text.ptr, text.len);
+        observe_tool_markers(&tracker, text.ptr, &saw_tool_start, &saw_tool_end, NULL);
         if (saw_tool_end) break;
         if (q36_session_eval(session, token, err, sizeof(err)) != 0) {
             decode_ok = false;
@@ -5550,15 +5562,16 @@ static void test_thinking_generation(void) {
     fprintf(stderr, "q36-test: think=HIGH prompt=%d tokens vs think=NONE prompt=%d tokens\n",
             prompt_high.len, prompt_none.len);
 
-    char *none_text = q36_token_text(engine, prompt_none.v[prompt_none.len - 1], NULL);
-    char *high_text = q36_token_text(engine, prompt_high.v[prompt_high.len - 1], NULL);
-    fprintf(stderr, "q36-test: NONE last token: %s\n", none_text ? none_text : "(null)");
-    fprintf(stderr, "q36-test: HIGH last token: %s\n", high_text ? high_text : "(null)");
-
-    bool none_is_close_think = none_text && strstr(none_text, "</think>") != NULL;
-    bool high_is_open_think = high_text && strstr(high_text, "<think>") != NULL;
-    TEST_ASSERT(none_is_close_think);
-    TEST_ASSERT(high_is_open_think);
+    size_t none_len = 0, high_len = 0;
+    char *none_text = render_tokens_text(engine, &prompt_none, &none_len);
+    char *high_text = render_tokens_text(engine, &prompt_high, &high_len);
+    const char *none_suffix = "<|im_start|>assistant\n<think>\n\n</think>\n\n";
+    const char *high_suffix = "<|im_start|>assistant\n<think>\n";
+    /* Qwen puts newline tokens after the marker; validate the complete suffix. */
+    TEST_ASSERT(none_text && none_len >= strlen(none_suffix) &&
+                !strcmp(none_text + none_len - strlen(none_suffix), none_suffix));
+    TEST_ASSERT(high_text && high_len >= strlen(high_suffix) &&
+                !strcmp(high_text + high_len - strlen(high_suffix), high_suffix));
 
     free(none_text);
     free(high_text);
@@ -6659,6 +6672,38 @@ static void test_qwen_tool_call_format(void) {
     buf_free(&b);
     tool_calls_free(&multi);
 
+    /* Every token split must preserve literal markers in the parameter body. */
+    const char *literal = "x </tool_call> <think>literal</think> </parameter> &lt;/parameter> &amp;lt;/parameter> &lt;ordinary&gt;";
+    buf args = {0};
+    buf_puts(&args, "{\"code\":");
+    json_escape(&args, literal);
+    buf_puts(&args, "}");
+    tool_calls escaped = {0};
+    tool_call escaped_call = {.name = strdup("write"), .arguments = strdup(args.ptr)};
+    tool_calls_push(&escaped, escaped_call);
+    append_qwen_tool_calls_text(&b, &escaped, NULL, false);
+    for (size_t split = 0; split <= b.len; split++) {
+        qwen_tool_decode_tracker tracker;
+        qwen_tool_decode_tracker_init(&tracker);
+        qwen_tool_decode_tracker_update(&tracker, b.ptr, split);
+        if (split < b.len - 1) TEST_ASSERT(tracker.mode != QWEN_TOOL_TRACK_DONE);
+        qwen_tool_decode_tracker_update(&tracker, b.ptr, b.len);
+        TEST_ASSERT(tracker.mode == QWEN_TOOL_TRACK_DONE);
+    }
+    content = reasoning = NULL;
+    cp = strdup(b.ptr);
+    TEST_ASSERT(parse_generated_message(cp, &content, &reasoning, &parsed));
+    TEST_ASSERT(parsed.len == 1);
+    if (parsed.len == 1) TEST_ASSERT(!strcmp(parsed.v[0].arguments, args.ptr));
+    TEST_ASSERT(!reasoning || !reasoning[0]);
+    free(cp);
+    free(content);
+    free(reasoning);
+    tool_calls_free(&parsed);
+    tool_calls_free(&escaped);
+    buf_free(&args);
+    buf_free(&b);
+
     fprintf(stderr, "q36-test: Qwen tool format round-trip test passed\n");
 }
 
@@ -6814,13 +6859,16 @@ static void test_qwen_tool_call_quality(void) {
     bool decode_ok = true;
     bool saw_tool_start = false;
     bool saw_tool_end = false;
+    qwen_tool_decode_tracker tracker;
+    qwen_tool_decode_tracker_init(&tracker);
     for (int i = 0; i < r.max_tokens; i++) {
         int token = q36_session_sample(session, r.temperature, r.top_k, r.top_p, r.min_p, &rng);
         size_t piece_len = 0;
         char *piece = q36_token_text(engine, token, &piece_len);
         buf_append(&text, piece, piece_len);
         free(piece);
-        observe_tool_markers(text.ptr ? text.ptr : "", &saw_tool_start, &saw_tool_end, NULL);
+        qwen_tool_decode_tracker_update(&tracker, text.ptr, text.len);
+        observe_tool_markers(&tracker, text.ptr, &saw_tool_start, &saw_tool_end, NULL);
         if (saw_tool_end) break;
         if (q36_session_eval(session, token, err, sizeof(err)) != 0) {
             decode_ok = false;

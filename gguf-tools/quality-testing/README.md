@@ -96,3 +96,23 @@ python3 gguf-tools/quality-testing/render_q36_quality_prompts.py
 
 These prompts are for quality checks. The imatrix workflow uses the larger
 Q36 imatrix dataset under `gguf-tools/imatrix/dataset/`.
+
+## Strict validation and rendered prompts
+
+The scorer parses logprobs structurally and rejects missing, null, or non-finite
+values. Local scoring also rejects any non-finite entry in the full vocabulary.
+`--rendered-prompt` treats manifest prompts as already rendered chat text;
+`--dump-first-logits FILE` writes the first scoring frontier using hexadecimal
+float notation. `--max-cases N` requires at least N manifest cases.
+
+Use `validate_scores.py --help` to validate complete score tables against an
+explicit manifest before comparing scores. The validator checks coverage,
+uniqueness, counts, finite values, and consistent aggregate rows.
+
+`q36-bench --dump-frontier-logits-dir DIR` writes complete float32 logit vectors
+at each prefill frontier. `compare_frontier_logits.py` requires explicit model,
+backend, context, quantization, vocabulary, and frontier expectations and checks
+every finite float32 bit. Pass directories containing only the frontier JSON
+files; its verdict covers those frontiers, not generation quality.
+
+Run the parser and validator regressions with `make test-quality`.

@@ -53,6 +53,7 @@ typedef struct {
     bool ssd_streaming_full_layers_set;
     bool warm_weights;
     bool quality;
+    const char *dump_frontier_logits_dir;
 } bench_config;
 
 static double bench_now_sec(void) {
@@ -111,6 +112,7 @@ static void usage(FILE *fp) {
         "  --ctx-alloc N          Allocated context. Default: ctx-max + gen-tokens + 1\n"
         "  --step-mul F           Multiplicative step. Default: 1\n"
         "  --step-incr N          Linear step when --step-mul is 1. Default: 2048\n"
+        "  --dump-frontier-logits-dir DIR  Write complete logits before decode.\n"
         "  --gen-tokens N         Greedy decode tokens per frontier. Default: 128\n"
         "                         0 benchmarks prefill only: no snapshot, decode,\n"
         "                         or restore, so each frontier extends the last.\n"
@@ -255,6 +257,8 @@ static bench_config parse_options(int argc, char **argv) {
             c.step_incr = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--step-mul")) {
             c.step_mul = parse_double_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--dump-frontier-logits-dir")) {
+            c.dump_frontier_logits_dir = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--gen-tokens") || !strcmp(arg, "--tokens") || !strcmp(arg, "-n")) {
             c.gen_tokens = parse_nonnegative_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--csv")) {
@@ -376,6 +380,102 @@ static bench_config parse_options(int argc, char **argv) {
     return c;
 }
 
+static void json_write_string(FILE *fp, const char *s) {
+    fputc('"', fp);
+    if (s) {
+        for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+            switch (*p) {
+            case '"':  fputs("\\\"", fp); break;
+            case '\\': fputs("\\\\", fp); break;
+            case '\b': fputs("\\b", fp); break;
+            case '\f': fputs("\\f", fp); break;
+            case '\n': fputs("\\n", fp); break;
+            case '\r': fputs("\\r", fp); break;
+            case '\t': fputs("\\t", fp); break;
+            default:
+                if (*p < 0x20) fprintf(fp, "\\u%04x", (unsigned)*p);
+                else fputc((char)*p, fp);
+                break;
+            }
+        }
+    }
+    fputc('"', fp);
+}
+
+static int write_frontier_logits_json(
+        const bench_config *cfg,
+        q36_engine         *engine,
+        q36_session        *session,
+        int                 frontier,
+        int                 previous) {
+    if (!cfg->dump_frontier_logits_dir) return 0;
+
+    const int vocab = q36_engine_vocab_size(engine);
+    int got = 0;
+    const float *logits = q36_session_logits(session, &got);
+    if (!logits || got != vocab) {
+        fprintf(stderr, "q36-bench: missing frontier logits at %d\n", frontier);
+        return 1;
+    }
+    for (int i = 0; i < vocab; i++) {
+        if (!isfinite(logits[i])) {
+            fprintf(stderr, "q36-bench: non-finite frontier logit %d at %d\n", i, frontier);
+            return 1;
+        }
+    }
+
+    char path[PATH_MAX];
+    const int n = snprintf(path,
+                           sizeof(path),
+                           "%s/frontier_%06d.logits.json",
+                           cfg->dump_frontier_logits_dir,
+                           frontier);
+    if (n <= 0 || (size_t)n >= sizeof(path)) {
+        fprintf(stderr, "q36-bench: frontier logits path is too long\n");
+        return 1;
+    }
+
+    FILE *fp = fopen(path, "wb");
+    if (!fp) {
+        fprintf(stderr, "q36-bench: failed to open %s: %s\n", path, strerror(errno));
+        return 1;
+    }
+
+    const int argmax = q36_session_argmax(session);
+    fprintf(fp, "{\n  \"source\":\"q36-bench\",\n  \"model\":");
+    json_write_string(fp, cfg->model_path);
+    fprintf(fp,
+            ",\n  \"backend\":\"%s\",\n  \"quality\":%s,\n"
+            "  \"quant_bits\":%d,\n  \"prompt_tokens\":%d,\n"
+            "  \"frontier_tokens\":%d,\n  \"prefill_tokens\":%d,\n"
+            "  \"ctx\":%d,\n  \"vocab\":%d,\n"
+            "  \"argmax_id\":%d,\n  \"argmax_logit\":%.9g,\n  \"logits\":[",
+            q36_backend_name(cfg->backend),
+            cfg->quality ? "true" : "false",
+            q36_engine_routed_quant_bits(engine),
+            frontier,
+            frontier,
+            frontier - previous,
+            cfg->ctx_alloc,
+            vocab,
+            argmax,
+            logits[argmax]);
+    for (int i = 0; i < vocab; i++) {
+        if (i) fputc(',', fp);
+        if ((i % 8) == 0) fputs("\n    ", fp);
+        if (isfinite(logits[i])) fprintf(fp, "%.9g", logits[i]);
+        else fputs("null", fp);
+    }
+    fputs("\n  ]\n}\n", fp);
+    int failed = ferror(fp);
+    if (fclose(fp) != 0) failed = 1;
+    if (failed) {
+        fprintf(stderr, "q36-bench: failed to close %s\n", path);
+        return 1;
+    }
+    return 0;
+}
+
 static int next_frontier(const bench_config *c, int cur) {
     if (cur >= c->ctx_max) return c->ctx_max;
     int next;
@@ -412,6 +512,7 @@ int main(int argc, char **argv) {
     bench_config cfg = parse_options(argc, argv);
 
     q36_engine_options opt = {
+        .context_size = cfg.ctx_alloc,
         .model_path = cfg.model_path,
         .mtp_path = cfg.mtp_path,
         .backend = cfg.backend,
@@ -509,6 +610,13 @@ int main(int argc, char **argv) {
 #endif
         const double prefill_sec = prefill_t1 - prefill_t0;
         const int prefill_tokens = frontier - previous;
+        if (getenv("Q36_BENCH_TRACE"))
+            fprintf(stderr, "q36-bench: prefill frontier=%d tokens=%d seconds=%.6f\n",
+                    frontier, prefill_tokens, prefill_sec);
+        if (write_frontier_logits_json(&cfg, engine, session, frontier, previous)) {
+            rc = 1;
+            break;
+        }
 
         if (cfg.gen_tokens > 0 &&
             q36_session_save_snapshot(session, &snap, err, sizeof(err)) != 0) {
@@ -523,6 +631,8 @@ int main(int argc, char **argv) {
 #else
         (void)prof_decode;
 #endif
+        const bool spec_trace = getenv("Q36_BENCH_SPEC_TRACE") != NULL;
+        unsigned spec_calls = 0, spec_tokens = 0, spec_hist[18] = {0};
         const double gen_t0 = bench_now_sec();
         for (int i = 0; i < cfg.gen_tokens; ) {
             if (q36_session_pos(session) + 1 >= q36_session_ctx(session)) {
@@ -550,6 +660,14 @@ int main(int argc, char **argv) {
                     rc = 1;
                     break;
                 }
+                if (spec_trace) {
+                    spec_calls++;
+                    spec_tokens += n;
+                    if (n <= 17) spec_hist[n]++;
+                    if (spec_calls % 32 == 0)
+                        fprintf(stderr, "q36-bench: spec calls=%u accepted=%u avg=%.3f\n",
+                                spec_calls, spec_tokens, (double)spec_tokens / spec_calls);
+                }
                 i += n;
             } else {
                 if (q36_session_eval(session, token, err, sizeof(err)) != 0) {
@@ -561,6 +679,12 @@ int main(int argc, char **argv) {
             }
         }
         const double gen_t1 = bench_now_sec();
+        if (spec_trace && spec_calls) {
+            fprintf(stderr, "q36-bench: spec frontier=%d calls=%u avg=%.3f histogram=",
+                    frontier, spec_calls, (double)spec_tokens / spec_calls);
+            for (int n = 1; n <= 17; n++) fprintf(stderr, "%s%d:%u", n == 1 ? "" : ",", n, spec_hist[n]);
+            fputc('\n', stderr);
+        }
 #ifndef Q36_NO_GPU
         if (prof_decode) q36_gpu_prof_report("decode");
 #endif

@@ -559,6 +559,10 @@ struct q36_engine {
     uint32_t n_threads;
     uint32_t cpu_prefill_cap;
     uint32_t prefill_cap_override;
+    int context_size;
+    uint32_t planned_sessions, live_sessions;
+    uint64_t session_bytes, context_hint_bytes;
+    uint64_t streaming_model_limit;
     int power_percent;
     int mtp_draft_tokens;
     float mtp_margin;
@@ -597,7 +601,10 @@ struct q36_session {
     q36_tokens checkpoint;
     bool checkpoint_valid;
     bool vision_state;
+    q36_vision_span *vision_spans;
+    size_t vision_count;
     int32_t rope_delta;
+    uint64_t reserved_context_bytes;
     float *logits;
     float *sample_probs;
     float *mtp_logits;
@@ -1151,11 +1158,6 @@ static bool q36_backend_supports_ssd_streaming(q36_backend backend) {
     return q36_backend_uses_graph(backend);
 }
 
-#ifndef Q36_NO_GPU
-static bool q36_backend_supports_streaming_auto_cache(q36_backend backend) {
-    return q36_backend_uses_graph(backend);
-}
-#endif
 
 static bool q36_engine_uses_vulkan_runtime(const q36_engine *e) {
     return e && q36_backend_uses_graph(e->backend);
@@ -4421,6 +4423,7 @@ static void mtp_weights_bind(q36_mtp_weights *w, const q36_model *m) {
 }
 #endif
 
+#ifndef Q36_NO_GPU
 static bool q36_streaming_tensor_expert_bytes(const q36_tensor *t, uint64_t *bytes_out) {
     uint64_t row_bytes = 0;
     uint64_t expert_bytes = 0;
@@ -4505,7 +4508,6 @@ static bool q36_streaming_routed_expert_bytes(const q36_weights *weights,
         weights, NULL, NULL, NULL, per_expert_bytes_out);
 }
 
-#ifndef Q36_NO_GPU
 static bool q36_weights_streaming_layer_experts_uniform(
         const q36_weights *weights, uint32_t il) {
 #ifdef Q36_METAL
@@ -4562,15 +4564,6 @@ static bool q36_streaming_full_layer_budget(const q36_weights *weights,
 }
 #endif
 
-static uint32_t q36_streaming_cache_experts_for_byte_budget(const q36_weights *weights,
-                                                            uint64_t bytes,
-                                                            uint64_t *per_expert_bytes_out) {
-    uint64_t per_expert_bytes = 0;
-    if (per_expert_bytes_out) *per_expert_bytes_out = 0;
-    if (!weights || bytes == 0 || !q36_streaming_routed_expert_bytes(weights, &per_expert_bytes)) return 0;
-    if (per_expert_bytes_out) *per_expert_bytes_out = per_expert_bytes;
-    return q36_ssd_cache_experts_for_byte_budget(bytes, per_expert_bytes);
-}
 
 #ifndef Q36_NO_GPU
 static bool q36_weights_streaming_non_routed_bytes(const q36_weights *weights,
@@ -4686,70 +4679,93 @@ static q36_gpu_stream_expert_table q36_stream_expert_table_make(const q36_model 
 }
 #endif
 
-static uint64_t q36_streaming_manual_cache_safe_bytes(void) {
-#ifdef Q36_NO_GPU
-    return 0;
-#else
-    const uint64_t gib = 1024ull * 1024ull * 1024ull;
+#ifndef Q36_NO_GPU
+static uint64_t q36_streaming_model_limit(q36_engine *e, uint64_t contexts) {
     uint64_t recommended = q36_gpu_recommended_working_set_size();
-    if (recommended == 0) return 0;
-    uint64_t safe = recommended > UINT64_MAX / 7ull ? UINT64_MAX : (recommended * 7ull) / 10ull;
-    return (safe / gib) * gib;
-#endif
+    /* The remaining 20% belongs to the OS and driver. Reserve graph/KV state
+     * explicitly, plus a bounded staging margin independent of context size. */
+    uint64_t budget = recommended / 5 * 4;
+    uint64_t reserve = 256ull * 1024 * 1024;
+    if (e->mtp_ready) reserve += e->mtp_model.size;
+    if (contexts >= budget || reserve >= budget - contexts) return 0;
+    return budget - contexts - reserve;
 }
+
+static uint64_t q36_streaming_context_bytes(q36_engine *e, int ctx) {
+    q36_context_memory m = q36_context_memory_estimate_configured(
+        e->backend, ctx, q36_engine_gpu_prefill_cap(e), e->cache_type_k, e->cache_type_v);
+    return m.total_bytes;
+}
+#endif
 
 #ifndef Q36_NO_GPU
 static bool q36_engine_configure_streaming_auto_cache(q36_engine *e) {
-    if (!e || !e->ssd_streaming ||
-        !q36_backend_supports_ssd_streaming(e->backend) ||
-        e->ssd_streaming_cache_experts != 0 ||
-        e->ssd_streaming_cache_bytes != 0) {
-        return true;
-    }
-    if (!q36_backend_supports_streaming_auto_cache(e->backend)) return true;
-
+    if (!e || !e->ssd_streaming || Q36_MODEL_DENSE) return true;
     uint64_t recommended = q36_gpu_recommended_working_set_size();
-    if (recommended == 0) {
-        fprintf(stderr,
-                "q36: SSD streaming auto cache: recommended working set unavailable; set --ssd-streaming-cache-experts N or NGB explicitly\n");
-        return false;
-    }
-    uint64_t non_routed_bytes = 0;
-    if (!q36_weights_streaming_non_routed_bytes(&e->weights, &non_routed_bytes)) {
-        fprintf(stderr, "q36: SSD streaming auto cache could not measure non-routed model weights\n");
-        return false;
-    }
-    uint64_t per_expert_bytes = 0;
-    if (!q36_streaming_routed_expert_bytes(&e->weights, &per_expert_bytes)) {
-        fprintf(stderr, "q36: SSD streaming auto cache could not measure routed expert size\n");
+    uint64_t fixed = 0, per_expert = 0;
+    if (!recommended || !q36_weights_streaming_non_routed_bytes(&e->weights, &fixed) ||
+        !q36_streaming_routed_expert_bytes(&e->weights, &per_expert)) return false;
+    e->context_hint_bytes = q36_streaming_context_bytes(e, e->context_size);
+    if (e->context_hint_bytes > UINT64_MAX / e->planned_sessions) return false;
+    uint64_t contexts = e->context_hint_bytes * e->planned_sessions;
+    e->streaming_model_limit = q36_streaming_model_limit(e, contexts);
+    if (fixed >= e->streaming_model_limit ||
+        per_expert > (e->streaming_model_limit - fixed) / Q36_N_EXPERT_USED) {
+        fprintf(stderr, "q36: SSD streaming context and static weights leave no expert-cache room\n");
         return false;
     }
     q36_ssd_cache_plan plan;
-    if (!q36_ssd_auto_cache_plan(recommended,
-                                 non_routed_bytes,
-                                 per_expert_bytes,
-                                 (uint64_t)Q36_N_LAYER * Q36_N_EXPERT,
-                                 &plan)) {
-        fprintf(stderr, "q36: SSD streaming auto cache could not compute a valid cache budget\n");
+    if (!q36_ssd_auto_cache_plan(recommended, 80, e->streaming_model_limit, fixed,
+                                 per_expert, (uint64_t)Q36_N_LAYER * Q36_N_EXPERT, &plan)) return false;
+    uint64_t requested = e->ssd_streaming_cache_bytes ?
+        e->ssd_streaming_cache_bytes / per_expert : e->ssd_streaming_cache_experts;
+    uint32_t fitted = plan.cache_experts;
+    if (requested && requested < fitted) fitted = (uint32_t)requested;
+    if (!fitted || (e->ssd_streaming_cache_bytes && !requested)) {
+        fprintf(stderr, "q36: SSD streaming cache target is smaller than one expert\n");
         return false;
     }
-    e->ssd_streaming_cache_experts = plan.cache_experts;
-    fprintf(stderr, "q36: SSD streaming auto cache budget\n");
-    fprintf(stderr, "q36:   %s recommends %.2f GiB working set\n",
-            q36_backend_name(e->backend), (double)recommended / 1073741824.0);
-    fprintf(stderr, "q36:   using 80%% total for model + cached experts: %.2f GiB\n",
-            (double)plan.model_target_bytes / 1073741824.0);
-    fprintf(stderr, "q36:   non-routed weights: %.2f GiB\n",
-            (double)non_routed_bytes / 1073741824.0);
-    fprintf(stderr, "q36:   routed expert size: %.2f MiB\n",
-            (double)per_expert_bytes / 1048576.0);
-    fprintf(stderr, "q36:   cached expert count: %u (%.2f GiB)\n",
-            e->ssd_streaming_cache_experts,
-            (double)plan.effective_cache_bytes / 1073741824.0);
-    if (plan.model_target_bytes <= non_routed_bytes) {
-        fprintf(stderr,
-                "q36:   note: non-routed weights already fill the 80%% target; keeping a one-expert cache\n");
+    e->ssd_streaming_cache_experts = fitted;
+    if (e->ssd_streaming_cache_bytes) e->ssd_streaming_cache_bytes = (uint64_t)fitted * per_expert;
+    fprintf(stderr, "q36: SSD streaming budget: working set %.2f GiB, contexts %.2f GiB "
+                    "(%u x %d), model limit %.2f GiB, static %.2f GiB, cache %u experts (%.2f GiB)\n",
+            recommended / 1073741824.0, contexts / 1073741824.0,
+            e->planned_sessions, e->context_size, e->streaming_model_limit / 1073741824.0,
+            fixed / 1073741824.0, fitted, fitted * per_expert / 1073741824.0);
+    if (requested > fitted)
+        fprintf(stderr, "q36: SSD cache target reduced from %" PRIu64 " to %u experts for runtime headroom\n", requested, fitted);
+    return true;
+}
+#endif
+
+#ifndef Q36_NO_GPU
+static bool q36_streaming_reserve_session(q36_engine *e, int ctx, uint64_t *bytes_out) {
+    *bytes_out = 0;
+    if (!e->ssd_streaming || Q36_MODEL_DENSE) return true;
+    uint64_t bytes = q36_streaming_context_bytes(e, ctx);
+    if (bytes > UINT64_MAX - e->session_bytes) return false;
+    uint64_t contexts = e->session_bytes + bytes;
+    uint32_t remaining = e->planned_sessions > e->live_sessions + 1 ?
+        e->planned_sessions - e->live_sessions - 1 : 0;
+    if (remaining && e->context_hint_bytes > (UINT64_MAX - contexts) / remaining) return false;
+    contexts += e->context_hint_bytes * remaining;
+    uint64_t limit = q36_streaming_model_limit(e, contexts);
+    uint64_t fixed = 0, resident = 0, per_expert = 0;
+    uint32_t slots = 0;
+    if (!q36_weights_streaming_non_routed_bytes(&e->weights, &fixed) ||
+        !q36_streaming_routed_expert_bytes(&e->weights, &per_expert) ||
+        (e->ssd_streaming_full_layers && !q36_streaming_full_layer_budget(
+            &e->weights, e->ssd_streaming_full_layers, &slots, &resident))) return false;
+    if (fixed >= limit || resident >= limit - fixed) return false;
+    uint64_t fit = (limit - fixed - resident) / per_expert;
+    if (fit < Q36_N_EXPERT_USED) return false;
+    if (fit < e->ssd_streaming_cache_experts) {
+        fprintf(stderr, "q36: SSD cache reduced %u -> %" PRIu64 " experts for %u live sessions\n",
+                e->ssd_streaming_cache_experts, fit, e->live_sessions + 1);
+        e->ssd_streaming_cache_experts = (uint32_t)fit;
+        q36_gpu_set_streaming_expert_cache_budget((uint32_t)fit);
     }
+    *bytes_out = bytes;
     return true;
 }
 #endif
@@ -5041,6 +5057,41 @@ static bool q36_vulkan_prewarm_skip_tensor(const q36_engine *e, const q36_tensor
     int il = q36_weights_tensor_routed_layer(&e->weights, t);
     return e->ssd_streaming && il >= 0 && (uint32_t)il >= e->ssd_streaming_full_layers;
 }
+
+#ifdef Q36_METAL
+static void q36_streaming_lock_static_weights(q36_engine *e) {
+    if (!e->ssd_streaming || getenv("Q36_METAL_DISABLE_STREAMING_STATIC_LOCK")) return;
+    uint64_t fixed = 0, per_expert = 0, resident = 0;
+    uint32_t slots = 0;
+    if (!q36_weights_streaming_non_routed_bytes(&e->weights, &fixed) ||
+        !q36_streaming_routed_expert_bytes(&e->weights, &per_expert) ||
+        (e->ssd_streaming_full_layers && !q36_streaming_full_layer_budget(
+            &e->weights, e->ssd_streaming_full_layers, &slots, &resident))) return;
+    uint64_t budget = e->streaming_model_limit;
+    uint64_t experts = (uint64_t)e->ssd_streaming_cache_experts * per_expert;
+    if (fixed > budget || resident > budget - fixed || experts > budget - fixed - resident) return;
+    uint64_t pin_budget = budget - resident - experts;
+    uint64_t locked = 0;
+    size_t page = (size_t)getpagesize();
+    bool can_lock = true;
+    for (uint64_t i = 0; i < e->model.n_tensors; i++) {
+        const q36_tensor *t = &e->model.tensors[i];
+        if (!t->bytes || q36_tensor_is_disabled_embedded_mtp(e, t) ||
+            q36_weights_tensor_routed_layer(&e->weights, t) >= 0) continue;
+        uint64_t off = t->abs_offset / page * page, end = t->abs_offset + t->bytes;
+        if (end > e->model.size) continue;
+        while (can_lock && off < end) {
+            size_t len = end - off > 256ull * 1024 * 1024 ? 256u * 1024 * 1024 : (size_t)(end - off);
+            uint64_t charged = ((uint64_t)len + page - 1) / page * page;
+            if (charged > pin_budget - locked) break;
+            if (mlock(e->model.map + off, len)) can_lock = false;
+            else locked += charged;
+            off += len;
+        }
+    }
+    fprintf(stderr, "q36: Metal SSD static weights locked %.2f GiB within runtime budget\n", locked / 1073741824.0);
+}
+#endif
 
 static bool q36_vulkan_set_model_spans(const q36_engine *e) {
     uint64_t *offsets = malloc(e->model.n_tensors * sizeof(*offsets));
@@ -9119,6 +9170,37 @@ void q36_chat_append_message(q36_engine *e, q36_tokens *tokens, const char *role
     free(text);
 }
 
+int q36_chat_append_multimodal_message(q36_engine *e, q36_tokens *tokens,
+                                       const char *role, const char **parts,
+                                       q36_vision_embedding *images, size_t image_count,
+                                       q36_vision_span *spans, char *err, size_t errlen) {
+    if (!e || !tokens || !role || !parts || (image_count && (!images || !spans)))
+        goto invalid;
+    for (size_t i = 0; i < image_count; i++) {
+        if (!images[i].data || !images[i].token_count ||
+            (uint64_t)images[i].grid_width * images[i].grid_height != images[i].token_count ||
+            e->vocab.vision_start_id < 0 || e->vocab.vision_end_id < 0 || e->vocab.image_pad_id < 0)
+            goto invalid;
+    }
+    if (!image_count) {
+        q36_chat_append_message(e, tokens, role, parts[0]);
+        return 1;
+    }
+    bool tool = !strcmp(role, "tool");
+    chat_append_open_role(e, tokens, tool ? "user" : role);
+    if (tool) q36_tokenize_rendered_chat(e, "<tool_response>\n", tokens);
+    for (size_t i = 0; i <= image_count; i++) {
+        if (parts[i]) q36_tokenize_rendered_chat(e, parts[i], tokens);
+        if (i < image_count) q36_prompt_append_vision(e, tokens, &spans[i], &images[i], err, errlen);
+    }
+    if (tool) q36_tokenize_rendered_chat(e, "\n</tool_response>", tokens);
+    chat_append_close_role(e, tokens);
+    return 1;
+invalid:
+    if (err && errlen) snprintf(err, errlen, "invalid image observation");
+    return 0;
+}
+
 int q36_chat_append_vision_message(q36_engine *e, q36_tokens *tokens,
                                     const char *role, const char *content,
                                     q36_vision_span *span,
@@ -9691,6 +9773,8 @@ int q36_engine_open(q36_engine **out, const q36_engine_options *opt) {
     e->n_threads = q36_resolve_thread_count(opt->n_threads);
     e->cpu_prefill_cap = opt->prefill_chunk ? opt->prefill_chunk : q36_default_cpu_prefill_cap();
     e->prefill_cap_override = opt->prefill_chunk;
+    e->context_size = opt->context_size > 0 ? opt->context_size : 4096;
+    e->planned_sessions = opt->session_count > 0 ? (uint32_t)opt->session_count : 1;
     e->cache_type_k = opt->cache_type_k;
     e->cache_type_v = opt->cache_type_v;
     e->power_percent = opt->power_percent > 0 ? opt->power_percent : 100;
@@ -9816,35 +9900,6 @@ int q36_engine_open(q36_engine **out, const q36_engine_options *opt) {
         q36_engine_close(e);
         return 1;
     }
-    if (e->ssd_streaming && e->ssd_streaming_cache_bytes != 0) {
-        uint64_t requested_cache_bytes = e->ssd_streaming_cache_bytes;
-        uint64_t safe_cache_bytes = q36_streaming_manual_cache_safe_bytes();
-        if (safe_cache_bytes != 0 && e->ssd_streaming_cache_bytes > safe_cache_bytes) {
-            e->ssd_streaming_cache_bytes = safe_cache_bytes;
-            fprintf(stderr,
-                    "q36: %s SSD streaming cache budget %.2f GiB capped to %.2f GiB to keep expert buffers lockable\n",
-                    q36_backend_name(e->backend),
-                    (double)requested_cache_bytes / 1073741824.0,
-                    (double)e->ssd_streaming_cache_bytes / 1073741824.0);
-        }
-        uint64_t per_expert_bytes = 0;
-        uint32_t budget = q36_streaming_cache_experts_for_byte_budget(&e->weights,
-                                                                      e->ssd_streaming_cache_bytes,
-                                                                      &per_expert_bytes);
-        if (budget == 0 || per_expert_bytes == 0) {
-            fprintf(stderr,
-                    "q36: --ssd-streaming-cache-experts byte budget is too small or invalid for this model\n");
-            q36_engine_close(e);
-            return 1;
-        }
-        e->ssd_streaming_cache_experts = budget;
-        fprintf(stderr,
-                "q36: %s SSD streaming cache budget %.2f GiB / %.2f MiB per expert = %u experts\n",
-                q36_backend_name(e->backend),
-                (double)e->ssd_streaming_cache_bytes / 1073741824.0,
-                (double)per_expert_bytes / 1048576.0,
-                budget);
-    }
     e->routed_quant_bits = q36_quant_bits_from_type(
         Q36_MODEL_DENSE ? e->weights.layer[0].ffn_gate_shexp->type :
                           e->weights.layer[0].ffn_gate_exps->type);
@@ -9902,16 +9957,17 @@ int q36_engine_open(q36_engine **out, const q36_engine_options *opt) {
                 q36_engine_close(e);
                 return 1;
             }
-            uint64_t required = (uint64_t)reserve + Q36_N_EXPERT;
-            if (required > e->ssd_streaming_cache_experts) {
-                fprintf(stderr,
-                        "q36: %u full resident layers require %u expert slots "
-                        "plus %u for dynamic prefill, but the streaming budget has %u\n",
-                        e->ssd_streaming_full_layers, reserve,
-                        Q36_N_EXPERT,
-                        e->ssd_streaming_cache_experts);
-                q36_engine_close(e);
-                return 1;
+            if ((uint64_t)reserve + Q36_N_EXPERT > e->ssd_streaming_cache_experts) {
+                uint32_t old = e->ssd_streaming_full_layers;
+                e->ssd_streaming_full_layers = e->ssd_streaming_cache_experts > Q36_N_EXPERT ?
+                    (e->ssd_streaming_cache_experts - Q36_N_EXPERT) / Q36_N_EXPERT : 0;
+                if (!q36_streaming_full_layer_budget(&e->weights, e->ssd_streaming_full_layers,
+                                                      &reserve, &resident_bytes)) {
+                    q36_engine_close(e);
+                    return 1;
+                }
+                fprintf(stderr, "q36: SSD full layers reduced %u -> %u for runtime headroom\n",
+                        old, e->ssd_streaming_full_layers);
             }
             e->ssd_streaming_cache_experts -= (uint32_t)reserve;
             fprintf(stderr,
@@ -9926,6 +9982,9 @@ int q36_engine_open(q36_engine **out, const q36_engine_options *opt) {
         q36_gpu_set_streaming_full_layers(e->ssd_streaming ?
                                           e->ssd_streaming_full_layers : 0);
         q36_gpu_set_streaming_expert_cache_budget(e->ssd_streaming_cache_experts);
+#ifdef Q36_METAL
+        q36_streaming_lock_static_weights(e);
+#endif
         if (e->ssd_streaming) {
             uint64_t slab_gate_bytes = 0, slab_up_bytes = 0;
             uint64_t slab_down_bytes = 0, slab_expert_bytes = 0;
@@ -10072,6 +10131,10 @@ int q36_prompt_append_vision(q36_engine *e, q36_tokens *prompt,
     span->embedding = *embedding;
     memset(embedding, 0, sizeof(*embedding));
     return 1;
+}
+
+int q36_engine_embd_dim(q36_engine *e) {
+    return e ? (int)Q36_N_EMBD : 0;
 }
 
 int q36_engine_vocab_size(q36_engine *e) {
@@ -10282,7 +10345,15 @@ int q36_engine_debug_tensor_row_packed(q36_engine *e, const char *tensor_name, u
 int q36_session_create(q36_session **out, q36_engine *e, int ctx_size) {
     q36_session *s;
     if (!out || !e || ctx_size <= 0 || ctx_size > Q36_CONTEXT_ALLOC_MAX) return 1;
+    uint64_t reserved = 0;
+#ifndef Q36_NO_GPU
+    if (!q36_streaming_reserve_session(e, ctx_size, &reserved)) {
+        fprintf(stderr, "q36: requested context leaves insufficient SSD streaming memory\n");
+        return 1;
+    }
+#endif
     s = xcalloc(1, sizeof(*s));
+    s->reserved_context_bytes = reserved;
     s->engine = e;
     s->ctx_size = ctx_size;
     s->logits = xmalloc((size_t)Q36_N_VOCAB * sizeof(*s->logits));
@@ -10312,6 +10383,7 @@ int q36_session_create(q36_session **out, q36_engine *e, int ctx_size) {
         free(s->logits);
         free(s->sample_probs);
         free(s->mtp_logits);
+        free(s->vision_spans);
         free(s);
         return 1;
     }
@@ -10321,12 +10393,16 @@ int q36_session_create(q36_session **out, q36_engine *e, int ctx_size) {
         s->mtp_draft_token = -1;
     }
     q36_session_reset_runtime(s);
+    e->session_bytes += reserved;
+    e->live_sessions++;
     *out = s;
     return 0;
 }
 
 void q36_session_free(q36_session *s) {
     if (!s) return;
+    s->engine->session_bytes -= s->reserved_context_bytes;
+    s->engine->live_sessions--;
     q36_tokens_free(&s->checkpoint);
     if (q36_engine_uses_vulkan_runtime(s->engine)) {
 #ifndef Q36_NO_GPU
@@ -10338,6 +10414,7 @@ void q36_session_free(q36_session *s) {
     free(s->logits);
     free(s->sample_probs);
     free(s->mtp_logits);
+    free(s->vision_spans);
     free(s);
 }
 
@@ -10471,6 +10548,32 @@ static int q36_session_prefill_range(q36_session *s, const q36_tokens *prompt, i
     return 0;
 }
 
+/* Image pads alone cannot identify the image that conditioned the live state. */
+const q36_vision_span *q36_session_vision_spans(const q36_session *s, size_t *count) {
+    if (count) *count = s && s->checkpoint_valid ? s->vision_count : 0;
+    return s && s->checkpoint_valid ? s->vision_spans : NULL;
+}
+
+bool q36_session_vision_prefix_matches(const q36_session *s,
+                                       const q36_vision_span *images, size_t count) {
+    if (!s || !s->checkpoint_valid || (count && !images)) return false;
+    if (count < s->vision_count) return false;
+    for (size_t i = 0; i < s->vision_count; i++) {
+        const q36_vision_span *a = &s->vision_spans[i], *b = &images[i];
+        if (a->token_start != b->token_start ||
+            a->embedding.token_count != b->embedding.token_count ||
+            a->embedding.grid_width != b->embedding.grid_width ||
+            a->embedding.grid_height != b->embedding.grid_height ||
+            memcmp(a->embedding.fingerprint, b->embedding.fingerprint, 32)) return false;
+    }
+    if (s->vision_state && !s->vision_count) return false;
+    for (size_t i = s->vision_count; i < count; i++) {
+        if (!images[i].token_start || images[i].token_start - 1u < (uint32_t)s->checkpoint.len)
+            return false;
+    }
+    return true;
+}
+
 int q36_session_sync(q36_session *s, const q36_tokens *prompt, char *err, size_t errlen) {
     if (!s || !prompt) {
         if (err && errlen) snprintf(err, errlen, "invalid sync arguments");
@@ -10492,6 +10595,9 @@ int q36_session_sync(q36_session *s, const q36_tokens *prompt, char *err, size_t
     }
     q36_session_reset_runtime(s);
     s->vision_state = false;
+    free(s->vision_spans);
+    s->vision_spans = NULL;
+    s->vision_count = 0;
     s->rope_delta = 0;
     s->mtp_draft_valid = false;
     s->mtp_draft_token = -1;
@@ -10516,15 +10622,22 @@ int q36_session_sync_vision(q36_session *s, const q36_tokens *prompt,
         if (err && errlen) snprintf(err, errlen, "vision prompt exceeds context");
         return 1;
     }
+    bool reuse = q36_session_vision_prefix_matches(s, images, image_count) &&
+                 prompt->len >= s->checkpoint.len &&
+                 q36_tokens_starts_with(prompt, &s->checkpoint);
     uint64_t previous_end = 0;
     for (size_t k = 0; k < image_count; k++) {
         const q36_vision_span *span = &images[k];
         uint64_t end = (uint64_t)span->token_start + span->embedding.token_count;
-        if (!span->embedding.data || !span->embedding.token_count ||
+        if ((!span->embedding.data && !(reuse && k < s->vision_count)) ||
+            !span->embedding.token_count ||
             !span->embedding.grid_width || !span->embedding.grid_height ||
             (uint64_t)span->embedding.grid_width * span->embedding.grid_height !=
                 span->embedding.token_count ||
-            span->token_start < previous_end || end > (uint64_t)prompt->len) {
+            span->token_start == 0 || span->token_start - 1u < previous_end ||
+            end >= (uint64_t)prompt->len ||
+            prompt->v[span->token_start - 1] != s->engine->vocab.vision_start_id ||
+            prompt->v[end] != s->engine->vocab.vision_end_id) {
             if (err && errlen) snprintf(err, errlen, "malformed vision span");
             return 1;
         }
@@ -10534,20 +10647,30 @@ int q36_session_sync_vision(q36_session *s, const q36_tokens *prompt,
                 return 1;
             }
         }
-        previous_end = end;
+        previous_end = end + 1;
     }
 
-    q36_session_reset_runtime(s);
+    int pos = 0;
+    size_t first_image = 0;
+    if (reuse) {
+        pos = s->checkpoint.len;
+        first_image = s->vision_count;
+    } else {
+        q36_session_invalidate(s);
+    }
+    q36_vision_span *identities = realloc(s->vision_spans, image_count * sizeof(*identities));
+    if (!identities) {
+        if (err && errlen) snprintf(err, errlen, "unable to allocate image identities");
+        q36_session_invalidate(s);
+        return 1;
+    }
+    s->vision_spans = identities;
+    s->vision_state = true;
     s->mtp_draft_valid = false;
     s->mtp_draft_token = -1;
-    s->checkpoint.len = 0;
-    s->checkpoint_valid = false;
-    s->vision_state = true;
-    s->rope_delta = 0;
 #ifndef Q36_NO_GPU
-    q36_gpu_stream_expert_cache_reset_route_hotness();
-    int pos = 0;
-    for (size_t k = 0; k < image_count; k++) {
+    if (!reuse) q36_gpu_stream_expert_cache_reset_route_hotness();
+    for (size_t k = first_image; k < image_count; k++) {
         const q36_vision_span *span = &images[k];
         q36_tokens prefix = *prompt;
         prefix.len = (int)span->token_start;
@@ -10603,10 +10726,15 @@ int q36_session_sync_vision(q36_session *s, const q36_tokens *prompt,
         uint32_t extent = span->embedding.grid_width > span->embedding.grid_height ?
                           span->embedding.grid_width : span->embedding.grid_height;
         s->rope_delta = (int32_t)(base + extent) - pos;
+        s->vision_spans[k] = *span;
+        s->vision_spans[k].embedding.data = NULL;
+        s->vision_count = k + 1;
     }
     return q36_session_prefill_range(s, prompt, pos, err, errlen);
 #else
     (void)previous_end;
+    (void)pos;
+    (void)first_image;
     return 1;
 #endif
 }
@@ -10720,6 +10848,20 @@ int q36_session_sample_penalized(q36_session *s,
         s->logits, Q36_N_VOCAB, temperature, top_k, top_p, min_p,
         tokens, n_tokens, presence_penalty, frequency_penalty,
         rng, s->sample_probs);
+}
+
+int q36_session_argmax_penalized_excluding(q36_session *s, int excluded_id,
+                                           const int *tokens, int n_tokens,
+                                           float presence, float frequency) {
+    if (!s || excluded_id < 0 || excluded_id >= (int)Q36_N_VOCAB ||
+        !q36_session_ensure_logits_host(s)) return -1;
+    float saved = s->logits[excluded_id];
+    s->logits[excluded_id] = -INFINITY;
+    uint64_t rng = 1;
+    int token = q36_sample_logits_penalized(s->logits, Q36_N_VOCAB,
+        0, 0, 1, 0, tokens, n_tokens, presence, frequency, &rng, s->sample_probs);
+    s->logits[excluded_id] = saved;
+    return token;
 }
 
 bool q36_session_in_think(q36_session *s) {
@@ -10922,6 +11064,7 @@ static bool q36_sessions_eval_batch_vulkan_supported(q36_decode_item *items,
     }
     for (int i = 0; i < count; i++) {
         q36_session *s = items[i].session;
+        if (s && s->vision_state) return false;
         q36_vulkan_runtime *rt = s ? s->runtime : NULL;
         if (!s || s->engine != e || !s->checkpoint_valid || !rt ||
             rt->prefill_cap < (uint32_t)count) {
@@ -11249,6 +11392,9 @@ void q36_session_invalidate(q36_session *s) {
     s->checkpoint_valid = false;
     s->checkpoint.len = 0;
     s->vision_state = false;
+    free(s->vision_spans);
+    s->vision_spans = NULL;
+    s->vision_count = 0;
     s->rope_delta = 0;
 }
 

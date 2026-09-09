@@ -84,6 +84,8 @@ typedef struct {
     const char *vision_path;
     q36_backend backend;
     int n_threads;
+    int context_size;   /* Planned context per session; zero uses 4096. */
+    int session_count;  /* Planned simultaneous sessions; zero uses one. */
     uint32_t prefill_chunk;
     int mtp_draft_tokens;
     float mtp_margin;
@@ -148,6 +150,11 @@ int q36_engine_open(q36_engine **out, const q36_engine_options *opt);
 void q36_engine_close(q36_engine *e);
 void q36_engine_summary(q36_engine *e);
 int q36_inspect_model(const char *model_path);
+int q36_engine_embd_dim(q36_engine *e);
+int q36_chat_append_multimodal_message(q36_engine *e, q36_tokens *tokens,
+                                       const char *role, const char **parts,
+                                       q36_vision_embedding *images, size_t image_count,
+                                       q36_vision_span *spans, char *err, size_t errlen);
 int q36_engine_vocab_size(q36_engine *e);
 int q36_engine_power(q36_engine *e);
 int q36_engine_set_power(q36_engine *e, int power_percent);
@@ -254,7 +261,14 @@ int q36_session_sync(q36_session *s, const q36_tokens *prompt, char *err, size_t
 int q36_session_sync_vision(q36_session *s, const q36_tokens *prompt,
                             const q36_vision_span *images, size_t image_count,
                             char *err, size_t errlen);
+bool q36_session_vision_prefix_matches(const q36_session *s,
+                                       const q36_vision_span *images, size_t count);
+int q36_session_argmax_penalized_excluding(q36_session *s, int excluded_id,
+                                           const int *tokens, int n_tokens,
+                                           float presence, float frequency);
 bool q36_session_has_vision_state(const q36_session *s);
+/* Identity metadata only; embedding data is NULL. Valid until the next sync. */
+const q36_vision_span *q36_session_vision_spans(const q36_session *s, size_t *count);
 bool q36_session_rewrite_requires_rebuild(int live_len, int canonical_len, int common);
 q36_session_rewrite_result q36_session_rewrite_from_common(
         q36_session *s, const q36_tokens *prompt, int common,

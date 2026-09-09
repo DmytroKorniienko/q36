@@ -25,6 +25,8 @@ uint32_t q36_ssd_cache_experts_for_byte_budget(uint64_t bytes,
                                                uint64_t per_expert_bytes);
 uint32_t q36_ssd_shrink_cache_experts(uint32_t experts);
 bool q36_ssd_auto_cache_plan(uint64_t            recommended_bytes,
+                             uint32_t            percent,
+                             uint64_t            model_limit_bytes,
                              uint64_t            non_routed_bytes,
                              uint64_t            per_expert_bytes,
                              uint64_t            max_model_experts,

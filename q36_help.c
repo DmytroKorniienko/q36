@@ -228,6 +228,7 @@ static void print_cli_specific(FILE *fp, const help_colors *c, bool full) {
     opt(fp, c, "q36", "Start the interactive prompt.");
     opt(fp, c, "q36 -p TEXT", "Run one prompt and exit.");
     opt(fp, c, "q36 --prompt-file FILE", "Run a long prompt from a file and exit.");
+    opt(fp, c, "--prefix-file FILE", "Preload complete user/assistant conversation pairs.");
     fputc('\n', fp);
     if (full) {
         print_cli_diagnostics(fp, c);
@@ -269,6 +270,8 @@ static void print_cli_commands(FILE *fp, const help_colors *c) {
 
 static void print_agent_specific(FILE *fp, const help_colors *c) {
     title(fp, c, "Agent Options");
+    opt(fp, c, "--prefix-file FILE", "Prepend complete user/assistant pairs; retain them after reset and compaction.");
+    opt(fp, c, "--vision FILE", "Enable view_image with a disk-streamed vision sidecar (Vulkan).");
     opt(fp, c, "-p, --prompt TEXT", "Submit an initial prompt after startup.");
     opt(fp, c, "--non-interactive", "Run without TUI. With -p: one turn; without -p: repeated stdin prompts.");
     opt(fp, c, "--edit-upto", "Enable anchored [upto] edits. Exact old/new replacement is the default.");
@@ -283,6 +286,7 @@ static void print_agent_specific(FILE *fp, const help_colors *c) {
 
 static void print_agent_sessions(FILE *fp, const help_colors *c) {
     title(fp, c, "Agent Runtime Commands");
+    opt(fp, c, "/hints on|off", "Enable or disable brief programming hints for this run.");
     opt(fp, c, "/save", "Save the current session in ~/.q36/kvcache.");
     opt(fp, c, "/compact", "Compact the current session context now.");
     opt(fp, c, "/list", "List saved sessions, sorted by recent update time.");
@@ -298,6 +302,8 @@ static void print_agent_sessions(FILE *fp, const help_colors *c) {
 
 static void print_server_api(FILE *fp, const help_colors *c) {
     title(fp, c, "HTTP API");
+    opt(fp, c, "--vision FILE", "Accept PNG/JPEG image blocks with a disk-streamed vision sidecar (Vulkan).");
+    para(fp, c, "ignore_eos=true requires explicit temperature=0 and generates to the output limit unless stopped.");
     opt(fp, c, "--host HOST", "Bind address. Default: 127.0.0.1");
     opt(fp, c, "--port N", "Bind port. Default: 8000");
     opt(fp, c, "--cors", "Add Access-Control-Allow-* headers for browser JS clients.");
@@ -352,7 +358,12 @@ static void print_bench_specific(FILE *fp, const help_colors *c) {
 
 static void print_eval_specific(FILE *fp, const help_colors *c) {
     title(fp, c, "Evaluation");
-    opt(fp, c, "-n, --tokens N", "Max generated tokens per question. Default: 16000");
+    opt(fp, c, "--suite core|hard|hard-smoke|all", "Select evaluation cases. Default: core.");
+    opt(fp, c, "--list-cases", "List selected cases without loading a model.");
+    opt(fp, c, "--validate-cases", "Validate embedded case metadata and answers.");
+    opt(fp, c, "--source NAME, --domain NAME, --case-id ID", "Filter the selected evaluation suite.");
+    opt(fp, c, "--retry-incomplete", "Retry incomplete answers once with twice the output budget.");
+    opt(fp, c, "-n, --tokens N", "Override per-case output budgets. Core default: 16000");
     opt(fp, c, "--questions N", "Run only the first N embedded questions.");
     opt(fp, c, "--case-sequence LIST", "Run 1-based case numbers in this comma-separated order.");
     opt(fp, c, "--trace FILE", "Write questions, outputs, and grading decisions.");

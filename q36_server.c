@@ -1,4 +1,5 @@
 #include "q36.h"
+#include "q36_tool_text.h"
 #include "rax.h"
 
 /* OpenAI/Anthropic compatible local server.
@@ -452,6 +453,135 @@ static bool json_raw_value_is_complete(const char *json) {
     return *p == '\0';
 }
 
+#define SERVER_IMAGE_MARKER_BYTES 64
+
+typedef struct {
+    char marker[SERVER_IMAGE_MARKER_BYTES];
+    uint8_t *encoded;
+    size_t encoded_len;
+} server_image_input;
+
+typedef struct {
+    server_image_input *v;
+    size_t len;
+    size_t cap;
+} server_image_inputs;
+
+static void server_image_inputs_free(server_image_inputs *images) {
+    if (!images) return;
+    for (size_t i = 0; i < images->len; i++) free(images->v[i].encoded);
+    free(images->v);
+    memset(images, 0, sizeof(*images));
+}
+
+static int base64_value(unsigned char c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return 26 + c - 'a';
+    if (c >= '0' && c <= '9') return 52 + c - '0';
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+static bool server_decode_base64(const char *src, uint8_t **out, size_t *out_len) {
+    const size_t n = src ? strlen(src) : 0;
+    if (n == 0 || (n & 3u) != 0 || n > 64u * 1024u * 1024u)
+        return false;
+    size_t cap = (n / 4u) * 3u;
+    uint8_t *decoded = xmalloc(cap ? cap : 1);
+    size_t used = 0;
+    for (size_t i = 0; i < n; i += 4) {
+        int a = base64_value((unsigned char)src[i]);
+        int b = base64_value((unsigned char)src[i + 1]);
+        bool pad2 = src[i + 2] == '=';
+        bool pad3 = src[i + 3] == '=';
+        int c = pad2 ? 0 : base64_value((unsigned char)src[i + 2]);
+        int d = pad3 ? 0 : base64_value((unsigned char)src[i + 3]);
+        if (a < 0 || b < 0 || c < 0 || d < 0 ||
+            (pad2 && !pad3) || ((pad2 || pad3) && i + 4 != n)) {
+            free(decoded);
+            return false;
+        }
+        uint32_t bits = ((uint32_t)a << 18) | ((uint32_t)b << 12) |
+                        ((uint32_t)c << 6) | (uint32_t)d;
+        decoded[used++] = (uint8_t)(bits >> 16);
+        if (!pad2) decoded[used++] = (uint8_t)(bits >> 8);
+        if (!pad3) decoded[used++] = (uint8_t)bits;
+    }
+    *out = decoded;
+    *out_len = used;
+    return true;
+}
+
+static bool server_image_media_type(const char *media_type) {
+    return media_type &&
+           (!strcasecmp(media_type, "image/png") ||
+            !strcasecmp(media_type, "image/jpeg") ||
+            !strcasecmp(media_type, "image/jpg"));
+}
+
+static bool server_image_inputs_push_base64(server_image_inputs *images,
+                                            const char *media_type,
+                                            const char *base64,
+                                            char marker[SERVER_IMAGE_MARKER_BYTES]) {
+    if (!images || images->len >= 16 || !server_image_media_type(media_type)) return false;
+    server_image_input image = {0};
+    if (!server_decode_base64(base64, &image.encoded, &image.encoded_len))
+        return false;
+    unsigned char nonce[12];
+    if (!random_bytes(nonce, sizeof(nonce))) {
+        uint64_t fallback = (uint64_t)time(NULL) ^
+                            ((uint64_t)getpid() << 32) ^
+                            (uint64_t)(uintptr_t)images;
+        memcpy(nonce, &fallback, sizeof(fallback));
+        memset(nonce + sizeof(fallback), 0, sizeof(nonce) - sizeof(fallback));
+    }
+    static const char hex[] = "0123456789abcdef";
+    size_t pos = (size_t)snprintf(image.marker, sizeof(image.marker),
+                                  "\036" "Q36_IMAGE_");
+    for (size_t i = 0; i < sizeof(nonce) && pos + 2 < sizeof(image.marker); i++) {
+        image.marker[pos++] = hex[nonce[i] >> 4];
+        image.marker[pos++] = hex[nonce[i] & 15];
+    }
+    image.marker[pos++] = '\x1f';
+    image.marker[pos] = '\0';
+    if (images->len == images->cap) {
+        size_t cap = images->cap ? images->cap * 2 : 2;
+        images->v = xrealloc(images->v, cap * sizeof(images->v[0]));
+        images->cap = cap;
+    }
+    images->v[images->len++] = image;
+    snprintf(marker, SERVER_IMAGE_MARKER_BYTES, "%s", image.marker);
+    return true;
+}
+
+static bool server_image_inputs_push_data_uri(
+        server_image_inputs *images, const char *uri,
+        char marker[SERVER_IMAGE_MARKER_BYTES]) {
+    static const char png[] = "data:image/png;base64,";
+    static const char jpeg[] = "data:image/jpeg;base64,";
+    static const char jpg[] = "data:image/jpg;base64,";
+    if (!uri) return false;
+    if (!strncmp(uri, png, sizeof(png) - 1))
+        return server_image_inputs_push_base64(
+            images, "image/png", uri + sizeof(png) - 1, marker);
+    if (!strncmp(uri, jpeg, sizeof(jpeg) - 1))
+        return server_image_inputs_push_base64(
+            images, "image/jpeg", uri + sizeof(jpeg) - 1, marker);
+    if (!strncmp(uri, jpg, sizeof(jpg) - 1))
+        return server_image_inputs_push_base64(
+            images, "image/jpg", uri + sizeof(jpg) - 1, marker);
+    return false;
+}
+
+static void append_owned_text(char **dst, const char *text) {
+    buf b = {0};
+    buf_puts(&b, *dst ? *dst : "");
+    buf_puts(&b, text ? text : "");
+    free(*dst);
+    *dst = buf_take(&b);
+}
+
 static bool json_content(const char **p, char **out) {
     json_ws(p);
     if (**p == '"') return json_string(p, out);
@@ -579,6 +709,10 @@ static void random_tool_id(char *dst, size_t dstlen, api_style api) {
 }
 
 typedef struct server server;
+static void server_inference_lock(server *s);
+static void server_inference_unlock(server *s);
+static bool server_encode_image(server *s, const server_image_input *input,
+                                q36_vision_embedding *out, char *err, size_t errlen);
 typedef struct server_slot server_slot;
 
 typedef struct {
@@ -592,6 +726,7 @@ typedef struct {
     int len;
     int cap;
     char *raw_tool_text;
+    bool replay_empty_think;
 } tool_calls;
 
 typedef struct {
@@ -617,8 +752,12 @@ typedef struct {
 typedef struct {
     char *role;
     char *content;
+    server_image_inputs images;
     char *reasoning;
     char *tool_call_id;
+    char **result_ids;
+    size_t result_count;
+    bool other_content;
     tool_calls calls;
 } chat_msg;
 
@@ -644,12 +783,19 @@ typedef struct {
     req_kind kind;
     api_style api;
     q36_tokens prompt;
+    q36_vision_span *images;
+    size_t image_count;
+    char (*image_markers)[SERVER_IMAGE_MARKER_BYTES];
     char *model;
     stop_list stops;
     char *raw_body;
     char *prompt_text;
+    char **continuation_ids;
+    size_t continuation_count;
+    char *tool_schema_key;
     tool_schema_orders tool_orders;
     int max_tokens;
+    int cached_tokens;
     int top_k;
     float temperature;
     float top_p;
@@ -663,6 +809,7 @@ typedef struct {
     uint64_t seed;
     bool stream;
     bool stream_include_usage;
+    bool ignore_eos;
     q36_think_mode think_mode;
     bool has_tools;
     bool kat_coder;
@@ -694,10 +841,13 @@ static void tool_calls_push(tool_calls *calls, tool_call tc) {
 }
 
 static void chat_msg_free(chat_msg *m) {
+    server_image_inputs_free(&m->images);
     free(m->role);
     free(m->content);
     free(m->reasoning);
     free(m->tool_call_id);
+    for (size_t i = 0; i < m->result_count; i++) free(m->result_ids[i]);
+    free(m->result_ids);
     tool_calls_free(&m->calls);
     memset(m, 0, sizeof(*m));
 }
@@ -795,13 +945,26 @@ static void request_apply_model_sampling_defaults(q36_engine *engine, request *r
     if (!r->min_p_set) r->min_p = min_p;
 }
 
+static bool request_validate_ignore_eos(const request *r, char *err, size_t errlen) {
+    if (!r->ignore_eos || (r->temperature_set && r->temperature == 0.0f)) return true;
+    snprintf(err, errlen, "ignore_eos requires an explicit temperature of 0");
+    return false;
+}
+
 static void request_free(request *r) {
     q36_tokens_free(&r->prompt);
+    for (size_t i = 0; i < r->image_count; i++)
+        q36_vision_embedding_free(&r->images[i].embedding);
+    free(r->images);
+    free(r->image_markers);
     free(r->model);
     for (int i = 0; i < r->stops.len; i++) free(r->stops.v[i]);
     free(r->stops.v);
     free(r->raw_body);
     free(r->prompt_text);
+    for (size_t i = 0; i < r->continuation_count; i++) free(r->continuation_ids[i]);
+    free(r->continuation_ids);
+    free(r->tool_schema_key);
     tool_schema_orders_free(&r->tool_orders);
     memset(r, 0, sizeof(*r));
 }
@@ -815,12 +978,16 @@ static void request_sampling(const request *r, float *temperature, int *top_k,
 }
 
 static q36_think_mode think_mode_from_enabled(bool enabled, q36_think_mode effort) {
-    if (!enabled) return Q36_THINK_NONE;
+    if (!enabled || effort == Q36_THINK_NONE) return Q36_THINK_NONE;
     return effort == Q36_THINK_MAX ? Q36_THINK_MAX : Q36_THINK_HIGH;
 }
 
 static bool parse_reasoning_effort_name(const char *s, q36_think_mode *out) {
     if (!s) return false;
+    if (!strcmp(s, "none")) {
+        *out = Q36_THINK_NONE;
+        return true;
+    }
     if (!strcmp(s, "max")) {
         *out = Q36_THINK_MAX;
         return true;
@@ -1392,6 +1559,131 @@ bad:
     return false;
 }
 
+static bool parse_image_url_value(const char **p, char **url) {
+    json_ws(p);
+    if (**p == '"') return json_string(p, url);
+    if (**p != '{') return false;
+    (*p)++;
+    json_ws(p);
+    while (**p && **p != '}') {
+        char *key = NULL;
+        if (!json_string(p, &key)) return false;
+        json_ws(p);
+        if (**p != ':') {
+            free(key);
+            return false;
+        }
+        (*p)++;
+        bool ok = true;
+        if (!strcmp(key, "url")) {
+            char *next = NULL;
+            ok = json_string(p, &next);
+            if (ok) {
+                free(*url);
+                *url = next;
+            }
+        } else {
+            ok = json_skip_value(p);
+        }
+        free(key);
+        if (!ok) return false;
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != '}') return false;
+    (*p)++;
+    return *url != NULL;
+}
+
+static bool parse_openai_content_object(const char **p, chat_msg *msg) {
+    if (**p != '{') return false;
+    (*p)++;
+    char *type = NULL;
+    char *text = NULL;
+    char *image_url = NULL;
+    json_ws(p);
+    while (**p && **p != '}') {
+        char *key = NULL;
+        if (!json_string(p, &key)) goto bad;
+        json_ws(p);
+        if (**p != ':') {
+            free(key);
+            goto bad;
+        }
+        (*p)++;
+        bool ok = true;
+        if (!strcmp(key, "type"))
+            ok = json_string_replace(p, &type);
+        else if (!strcmp(key, "text"))
+            ok = json_content_replace(p, &text);
+        else if (!strcmp(key, "image_url")) {
+            free(image_url);
+            image_url = NULL;
+            ok = parse_image_url_value(p, &image_url);
+        } else
+            ok = json_skip_value(p);
+        free(key);
+        if (!ok) goto bad;
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != '}') goto bad;
+    (*p)++;
+
+    if (type && (!strcmp(type, "image_url") || !strcmp(type, "input_image"))) {
+        char marker[SERVER_IMAGE_MARKER_BYTES];
+        if (!server_image_inputs_push_data_uri(&msg->images, image_url, marker))
+            goto bad;
+        append_owned_text(&msg->content, marker);
+    } else if (text) {
+        append_owned_text(&msg->content, text);
+    }
+    free(type);
+    free(text);
+    free(image_url);
+    return true;
+bad:
+    free(type);
+    free(text);
+    free(image_url);
+    return false;
+}
+
+static bool parse_openai_content(const char **p, chat_msg *msg) {
+    json_ws(p);
+    if (**p == '"') {
+        char *text = NULL;
+        if (!json_string(p, &text)) return false;
+        append_owned_text(&msg->content, text);
+        free(text);
+        return true;
+    }
+    if (json_lit(p, "null")) return true;
+    if (**p != '[') return false;
+    (*p)++;
+    json_ws(p);
+    while (**p && **p != ']') {
+        if (**p == '"') {
+            char *text = NULL;
+            if (!json_string(p, &text)) return false;
+            append_owned_text(&msg->content, text);
+            free(text);
+        } else if (**p == '{') {
+            if (!parse_openai_content_object(p, msg)) return false;
+        } else if (!json_skip_value(p)) {
+            return false;
+        }
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != ']') return false;
+    (*p)++;
+    return true;
+}
+
 static bool parse_messages(const char **p, chat_msgs *msgs) {
     json_ws(p);
     if (**p != '[') return false;
@@ -1419,7 +1711,10 @@ static bool parse_messages(const char **p, chat_msgs *msgs) {
                     goto fail;
                 }
             } else if (!strcmp(key, "content")) {
-                if (!json_content_replace(p, &msg.content)) {
+                free(msg.content);
+                msg.content = NULL;
+                server_image_inputs_free(&msg.images);
+                if (!parse_openai_content(p, &msg)) {
                     free(key);
                     goto fail;
                 }
@@ -1464,6 +1759,7 @@ static bool parse_messages(const char **p, chat_msgs *msgs) {
         (*p)++;
         if (!msg.role) msg.role = xstrdup("user");
         if (!msg.content) msg.content = xstrdup("");
+        if (msg.images.len && strcmp(msg.role, "user") && strcmp(msg.role, "tool")) goto fail;
         chat_msgs_push(msgs, msg);
         memset(&msg, 0, sizeof(msg));
         json_ws(p);
@@ -1494,11 +1790,50 @@ static bool append_anthropic_block_content(buf *dst, const char *text) {
     return true;
 }
 
+static bool parse_anthropic_image_source(const char **p,
+                                         char **source_type,
+                                         char **media_type,
+                                         char **data) {
+    json_ws(p);
+    if (**p != '{') return false;
+    (*p)++;
+    json_ws(p);
+    while (**p && **p != '}') {
+        char *key = NULL;
+        if (!json_string(p, &key)) return false;
+        json_ws(p);
+        if (**p != ':') {
+            free(key);
+            return false;
+        }
+        (*p)++;
+        bool ok;
+        if (!strcmp(key, "type"))
+            ok = json_string_replace(p, source_type);
+        else if (!strcmp(key, "media_type"))
+            ok = json_string_replace(p, media_type);
+        else if (!strcmp(key, "data"))
+            ok = json_string_replace(p, data);
+        else
+            ok = json_skip_value(p);
+        free(key);
+        if (!ok) return false;
+        json_ws(p);
+        if (**p == ',') (*p)++;
+        json_ws(p);
+    }
+    if (**p != '}') return false;
+    (*p)++;
+    return true;
+}
+
 /* Anthropic content is block-structured, while the engine consumes one compact
  * chat_msg per role.  Parsing collapses text/thinking into strings, converts
  * assistant tool_use blocks to tool_calls, and keeps tool_result blocks as
  * escaped text because Q36 sees tool results in its chat template. */
-static bool parse_anthropic_content_block(const char **p, const char *role, chat_msg *msg) {
+static bool parse_anthropic_content_mode(const char **p, chat_msg *msg, bool allow_tools);
+
+static bool parse_anthropic_content_block(const char **p, chat_msg *msg, bool allow_tools) {
     if (**p != '{') return false;
     (*p)++;
     char *type = NULL;
@@ -1508,6 +1843,10 @@ static bool parse_anthropic_content_block(const char **p, const char *role, chat
     char *name = NULL;
     char *input = NULL;
     char *tool_result = NULL;
+    chat_msg result = {0};
+    char *source_type = NULL;
+    char *media_type = NULL;
+    char *image_data = NULL;
 
     json_ws(p);
     while (**p && **p != '}') {
@@ -1550,7 +1889,12 @@ static bool parse_anthropic_content_block(const char **p, const char *role, chat
                 goto bad;
             }
         } else if (!strcmp(key, "content")) {
-            if (!json_content_replace(p, &tool_result)) {
+            if (!json_raw_value_replace(p, &tool_result)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "source")) {
+            if (!parse_anthropic_image_source(p, &source_type, &media_type, &image_data)) {
                 free(key);
                 goto bad;
             }
@@ -1566,20 +1910,43 @@ static bool parse_anthropic_content_block(const char **p, const char *role, chat
     if (**p != '}') goto bad;
     (*p)++;
 
-    if (type && !strcmp(type, "tool_use") && !strcmp(role, "assistant")) {
+    if (!allow_tools && (!type || (strcmp(type, "text") && strcmp(type, "image")))) goto bad;
+    if (!type || strcmp(type, "tool_result")) msg->other_content = true;
+    if (type && !strcmp(type, "tool_use")) {
         tool_call tc = {0};
         tc.id = id ? xstrdup(id) : NULL;
         tc.name = name ? xstrdup(name) : xstrdup("");
         tc.arguments = input ? xstrdup(input) : xstrdup("{}");
         tool_calls_push(&msg->calls, tc);
     } else if (type && !strcmp(type, "tool_result")) {
+        if (!id || !id[0]) msg->other_content = true;
+        else {
+            msg->result_ids = xrealloc(msg->result_ids,
+                                      (msg->result_count + 1) * sizeof(char *));
+            msg->result_ids[msg->result_count++] = xstrdup(id);
+        }
+        const char *nested = tool_result ? tool_result : "\"\"";
+        if (!parse_anthropic_content_mode(&nested, &result, false)) goto bad;
         buf b = {0};
         buf_puts(&b, msg->content ? msg->content : "");
         buf_puts(&b, "<tool_response>\n");
-        append_xml_text_escaped(&b, tool_result);
+        append_xml_text_escaped(&b, result.content);
+        for (size_t i = 0; i < result.images.len; i++) {
+            if (msg->images.len == msg->images.cap) {
+                msg->images.cap = msg->images.cap ? msg->images.cap * 2 : 2;
+                msg->images.v = xrealloc(msg->images.v, msg->images.cap * sizeof(msg->images.v[0]));
+            }
+            msg->images.v[msg->images.len++] = result.images.v[i];
+            memset(&result.images.v[i], 0, sizeof(result.images.v[i]));
+        }
         buf_puts(&b, "\n</tool_response>");
         free(msg->content);
         msg->content = buf_take(&b);
+    } else if (type && !strcmp(type, "image")) {
+        char marker[SERVER_IMAGE_MARKER_BYTES];
+        if (!source_type || strcmp(source_type, "base64") ||
+            !server_image_inputs_push_base64(&msg->images, media_type, image_data, marker)) goto bad;
+        append_owned_text(&msg->content, marker);
     } else {
         if (text) {
             buf b = {0};
@@ -1604,6 +1971,10 @@ static bool parse_anthropic_content_block(const char **p, const char *role, chat
     free(name);
     free(input);
     free(tool_result);
+    chat_msg_free(&result);
+    free(source_type);
+    free(media_type);
+    free(image_data);
     return true;
 bad:
     free(type);
@@ -1613,12 +1984,19 @@ bad:
     free(name);
     free(input);
     free(tool_result);
+    chat_msg_free(&result);
+    free(source_type);
+    free(media_type);
+    free(image_data);
     return false;
 }
 
-static bool parse_anthropic_content(const char **p, chat_msg *msg) {
+static bool parse_anthropic_content_mode(const char **p, chat_msg *msg, bool allow_tools) {
     json_ws(p);
-    if (**p == '"') return json_string(p, &msg->content);
+    if (**p == '"') {
+        msg->other_content = true;
+        return json_string(p, &msg->content);
+    }
     if (json_lit(p, "null")) {
         msg->content = xstrdup("");
         return true;
@@ -1628,6 +2006,7 @@ static bool parse_anthropic_content(const char **p, chat_msg *msg) {
     json_ws(p);
     while (**p && **p != ']') {
         if (**p == '"') {
+            msg->other_content = true;
             char *s = NULL;
             if (!json_string(p, &s)) return false;
             buf b = {0};
@@ -1637,7 +2016,7 @@ static bool parse_anthropic_content(const char **p, chat_msg *msg) {
             msg->content = buf_take(&b);
             free(s);
         } else if (**p == '{') {
-            if (!parse_anthropic_content_block(p, msg->role ? msg->role : "", msg)) return false;
+            if (!parse_anthropic_content_block(p, msg, allow_tools)) return false;
         } else if (!json_skip_value(p)) {
             return false;
         }
@@ -1649,6 +2028,10 @@ static bool parse_anthropic_content(const char **p, chat_msg *msg) {
     (*p)++;
     if (!msg->content) msg->content = xstrdup("");
     return true;
+}
+
+static bool parse_anthropic_content(const char **p, chat_msg *msg) {
+    return parse_anthropic_content_mode(p, msg, true);
 }
 
 static bool parse_anthropic_messages(const char **p, chat_msgs *msgs) {
@@ -1687,6 +2070,16 @@ static bool parse_anthropic_messages(const char **p, chat_msgs *msgs) {
                 free(msg.content);
                 free(msg.reasoning);
                 tool_calls_free(&msg.calls);
+                server_image_inputs_free(&msg.images);
+                for (size_t i = 0; i < msg.result_count; i++) free(msg.result_ids[i]);
+                free(msg.result_ids);
+                msg.result_ids = parsed.result_ids;
+                msg.result_count = parsed.result_count;
+                msg.other_content = parsed.other_content;
+                parsed.result_ids = NULL;
+                parsed.result_count = 0;
+                msg.images = parsed.images;
+                memset(&parsed.images, 0, sizeof(parsed.images));
                 msg.content = parsed.content;
                 msg.reasoning = parsed.reasoning;
                 msg.calls = parsed.calls;
@@ -1707,6 +2100,8 @@ static bool parse_anthropic_messages(const char **p, chat_msgs *msgs) {
         (*p)++;
         if (!msg.role) msg.role = xstrdup("user");
         if (!msg.content) msg.content = xstrdup("");
+        if ((msg.images.len && strcmp(msg.role, "user")) ||
+            (msg.calls.len && strcmp(msg.role, "assistant"))) goto fail;
         chat_msgs_push(msgs, msg);
         memset(&msg, 0, sizeof(msg));
         json_ws(p);
@@ -1954,7 +2349,11 @@ static void append_qwen_parameter(buf *b, const json_arg *arg) {
     buf_puts(b, "<parameter=");
     buf_puts(b, arg->key ? arg->key : "");
     buf_puts(b, ">\n");
-    buf_puts(b, arg->value ? arg->value : "");
+    for (const char *p = arg->value ? arg->value : ""; *p; p++) {
+        if (q36_tool_text_needs_escape(p, Q36_PARAM_END))
+            buf_puts(b, *p == '<' ? "&lt;" : "&amp;");
+        else buf_putc(b, *p);
+    }
     buf_puts(b, "\n</parameter>\n");
 }
 
@@ -2421,6 +2820,8 @@ static char *render_qwen_chat_prompt_text(const chat_msgs *msgs, const char *too
                 buf_puts(&out, reasoning);
                 buf_puts(&out, "\n</think>\n\n");
             }
+            if (!keep_reasoning && m->calls.replay_empty_think)
+                buf_puts(&out, "<think>\n\n</think>\n\n");
             buf_puts(&out, content);
             append_qwen_tool_calls_text(&out, &m->calls, tool_orders,
                                         content_nonempty);
@@ -2478,6 +2879,117 @@ static bool chat_prompt_preserves_reasoning(const chat_msgs *msgs,
  * fields that affect model semantics, rendering, streaming, or cache keys, and
  * skip extension fields.  The output is always a rendered Q36 chat/completion
  * prompt plus the small amount of protocol state needed to translate the reply. */
+static char *render_tokens_text(q36_engine *engine, const q36_tokens *tokens, size_t *out_len);
+
+static void request_note_tool_continuation(request *r, const chat_msgs *msgs,
+                                           const char *schemas) {
+    r->tool_schema_key = xstrdup(schemas ? schemas : "");
+    size_t count = 0;
+    for (int i = 0; i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (!strcmp(m->role, "tool") && m->tool_call_id && m->tool_call_id[0]) count++;
+        else if (r->api == API_ANTHROPIC && !strcmp(m->role, "user") &&
+                 m->result_count && !m->other_content) count += m->result_count;
+        else return;
+    }
+    if (!count || count > 16) return;
+    r->continuation_ids = xmalloc(count * sizeof(char *));
+    for (int i = 0; i < msgs->len; i++) {
+        const chat_msg *m = &msgs->v[i];
+        if (!strcmp(m->role, "tool"))
+            r->continuation_ids[r->continuation_count++] = xstrdup(m->tool_call_id);
+        else for (size_t k = 0; k < m->result_count; k++)
+            r->continuation_ids[r->continuation_count++] = xstrdup(m->result_ids[k]);
+    }
+}
+
+static bool request_tokenize_multimodal_prompt(q36_engine *e, server *s,
+                                               request *r,
+                                               const chat_msgs *msgs,
+                                               char *err, size_t errlen) {
+    size_t count = 0;
+    for (int i = 0; msgs && i < msgs->len; i++) count += msgs->v[i].images.len;
+    if (count == 0) {
+        q36_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+        return true;
+    }
+    if (count > 16) {
+        snprintf(err, errlen, "too many images; at most 16 are allowed");
+        return false;
+    }
+    if (!e || !s || !q36_engine_has_vision(e)) {
+        snprintf(err, errlen, "image input requires starting q36-server with --vision FILE");
+        return false;
+    }
+
+    server_image_input **inputs = xmalloc(count * sizeof(inputs[0]));
+    q36_vision_embedding *embeddings = xmalloc(count * sizeof(embeddings[0]));
+    memset(embeddings, 0, count * sizeof(embeddings[0]));
+    size_t next = 0;
+    for (int i = 0; i < msgs->len; i++) {
+        for (size_t j = 0; j < msgs->v[i].images.len; j++)
+            inputs[next++] = &msgs->v[i].images.v[j];
+    }
+
+    bool ok = true;
+    server_inference_lock(s);
+    for (size_t i = 0; i < count; i++) {
+        if (!server_encode_image(s, inputs[i], &embeddings[i], err, errlen)) {
+            ok = false;
+            break;
+        }
+    }
+    server_inference_unlock(s);
+    if (!ok) goto done;
+
+    r->images = xmalloc(count * sizeof(r->images[0]));
+    r->image_markers = xmalloc(count * sizeof(r->image_markers[0]));
+    memset(r->images, 0, count * sizeof(r->images[0]));
+    const char *cursor = r->prompt_text;
+    for (size_t i = 0; i < count; i++) {
+        const char *marker = strstr(cursor, inputs[i]->marker);
+        if (!marker) {
+            snprintf(err, errlen, "image marker was lost while rendering the request");
+            ok = false;
+            break;
+        }
+        char *prefix = xstrndup(cursor, (size_t)(marker - cursor));
+        q36_tokenize_rendered_chat(e, prefix, &r->prompt);
+        free(prefix);
+        if (!q36_prompt_append_vision(e, &r->prompt, &r->images[i],
+                                      &embeddings[i], err, errlen)) {
+            ok = false;
+            break;
+        }
+        r->image_count++;
+        memcpy(r->image_markers[i], inputs[i]->marker, sizeof(r->image_markers[i]));
+        cursor = marker + strlen(inputs[i]->marker);
+    }
+    if (ok) {
+        q36_tokenize_rendered_chat(e, cursor, &r->prompt);
+        char *rendered = render_tokens_text(e, &r->prompt, NULL);
+        free(r->prompt_text);
+        r->prompt_text = rendered;
+    }
+
+done:
+    for (size_t i = 0; i < count; i++)
+        q36_vision_embedding_free(&embeddings[i]);
+    free(embeddings);
+    free(inputs);
+    if (!ok) {
+        q36_tokens_free(&r->prompt);
+        for (size_t i = 0; i < r->image_count; i++)
+            q36_vision_embedding_free(&r->images[i].embedding);
+        free(r->images);
+        free(r->image_markers);
+        r->image_markers = NULL;
+        r->images = NULL;
+        r->image_count = 0;
+    }
+    return ok;
+}
+
 static bool parse_chat_request(q36_engine *e, server *s, const char *body, int def_tokens,
                                int ctx_size, request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
@@ -2593,6 +3105,11 @@ static bool parse_chat_request(q36_engine *e, server *s, const char *body, int d
                 goto bad;
             }
             r->seed = v > 0.0 ? (uint64_t)v : 0;
+        } else if (!strcmp(key, "ignore_eos")) {
+            if (!json_bool(&p, &r->ignore_eos)) {
+                free(key);
+                goto bad;
+            }
         } else if (!strcmp(key, "stream")) {
             if (!json_bool(&p, &r->stream)) {
                 free(key);
@@ -2648,6 +3165,12 @@ static bool parse_chat_request(q36_engine *e, server *s, const char *body, int d
         request_free(r);
         return false;
     }
+    if (!request_validate_ignore_eos(r, err, errlen)) {
+        chat_msgs_free(&msgs);
+        free(tool_schemas);
+        request_free(r);
+        return false;
+    }
     r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
@@ -2662,7 +3185,8 @@ static bool parse_chat_request(q36_engine *e, server *s, const char *body, int d
     r->prompt_text = render_chat_prompt_text_profile(
         &msgs, active_tool_schemas, &r->tool_orders, r->think_mode,
         r->kat_coder, r->preserve_thinking);
-    q36_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+    request_note_tool_continuation(r, &msgs, active_tool_schemas);
+    if (!request_tokenize_multimodal_prompt(e, s, r, &msgs, err, errlen)) goto image_error;
     chat_msgs_free(&msgs);
     free(tool_schemas);
     return true;
@@ -2670,6 +3194,11 @@ bad:
     chat_msgs_free(&msgs);
     free(tool_schemas);
     snprintf(err, errlen, "invalid JSON request");
+    request_free(r);
+    return false;
+image_error:
+    chat_msgs_free(&msgs);
+    free(tool_schemas);
     request_free(r);
     return false;
 }
@@ -2692,7 +3221,7 @@ static bool parse_responses_input_item(const char **p, chat_msgs *msgs) {
     chat_msg msg = {0};
     tool_call call = {0};
     char *type = NULL;
-    char *output = NULL;
+    chat_msg output = {0};
     if (**p != '{') return false;
     (*p)++;
     json_ws(p);
@@ -2716,12 +3245,16 @@ static bool parse_responses_input_item(const char **p, chat_msgs *msgs) {
                 goto bad;
             }
         } else if (!strcmp(key, "content")) {
-            if (!json_content_replace(p, &msg.content)) {
+            free(msg.content);
+            msg.content = NULL;
+            server_image_inputs_free(&msg.images);
+            if (!parse_openai_content(p, &msg)) {
                 free(key);
                 goto bad;
             }
         } else if (!strcmp(key, "output")) {
-            if (!json_content_replace(p, &output)) {
+            chat_msg_free(&output);
+            if (!parse_openai_content(p, &output)) {
                 free(key);
                 goto bad;
             }
@@ -2752,34 +3285,51 @@ static bool parse_responses_input_item(const char **p, chat_msgs *msgs) {
     if (**p != '}') goto bad;
     (*p)++;
 
-    if (type && !strcmp(type, "reasoning")) goto done;
+    if (type && !strcmp(type, "reasoning")) {
+        if (msg.images.len || output.images.len) goto bad;
+        goto done;
+    }
     if (type && !strcmp(type, "function_call")) {
+        if (msg.images.len) goto bad;
+        free(msg.role);
+        free(msg.content);
         msg.role = xstrdup("assistant");
         msg.content = xstrdup("");
         if (!call.name) call.name = xstrdup("");
         if (!call.arguments) call.arguments = xstrdup("{}");
-        tool_calls_push(&msg.calls, call);
+        tool_calls *target = &msg.calls;
+        if (msgs->len && !strcmp(msgs->v[msgs->len - 1].role, "assistant"))
+            target = &msgs->v[msgs->len - 1].calls;
+        tool_calls_push(target, call);
         memset(&call, 0, sizeof(call));
-    } else if (type && !strcmp(type, "function_call_output")) {
+        if (target != &msg.calls) goto done;
+    } else if (type && (!strcmp(type, "function_call_output") || !strcmp(type, "custom_tool_call_output"))) {
+        free(msg.role);
         msg.role = xstrdup("tool");
         msg.tool_call_id = call.id ? xstrdup(call.id) : NULL;
-        msg.content = output ? xstrdup(output) : xstrdup("");
+        free(msg.content);
+        server_image_inputs_free(&msg.images);
+        msg.content = output.content;
+        msg.images = output.images;
+        memset(&output, 0, sizeof(output));
+        if (!msg.content) msg.content = xstrdup("");
     } else {
         if (!msg.role) msg.role = xstrdup("user");
         if (!msg.content) msg.content = xstrdup("");
     }
+    if (msg.images.len && strcmp(msg.role, "user") && strcmp(msg.role, "tool")) goto bad;
     chat_msgs_push(msgs, msg);
     memset(&msg, 0, sizeof(msg));
 
 done:
     free(type);
-    free(output);
+    chat_msg_free(&output);
     tool_call_free(&call);
     chat_msg_free(&msg);
     return true;
 bad:
     free(type);
-    free(output);
+    chat_msg_free(&output);
     tool_call_free(&call);
     chat_msg_free(&msg);
     return false;
@@ -2949,6 +3499,11 @@ static bool parse_responses_request(q36_engine *e, server *s, const char *body,
                 goto bad;
             }
             r->frequency_penalty = (float)v;
+        } else if (!strcmp(key, "ignore_eos")) {
+            if (!json_bool(&p, &r->ignore_eos)) {
+                free(key);
+                goto bad;
+            }
         } else if (!strcmp(key, "stream")) {
             if (!json_bool(&p, &r->stream)) {
                 free(key);
@@ -2998,6 +3553,13 @@ static bool parse_responses_request(q36_engine *e, server *s, const char *body,
         msgs.v[0] = system;
         msgs.len++;
     }
+    if (!request_validate_ignore_eos(r, err, errlen)) {
+        chat_msgs_free(&msgs);
+        free(instructions);
+        free(tool_schemas);
+        request_free(r);
+        return false;
+    }
     r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
@@ -3012,7 +3574,8 @@ static bool parse_responses_request(q36_engine *e, server *s, const char *body,
     r->prompt_text = render_chat_prompt_text_profile(
         &msgs, active_tools, &r->tool_orders, r->think_mode,
         r->kat_coder, r->preserve_thinking);
-    q36_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+    request_note_tool_continuation(r, &msgs, active_tools);
+    if (!request_tokenize_multimodal_prompt(e, s, r, &msgs, err, errlen)) goto image_error;
     chat_msgs_free(&msgs);
     free(instructions);
     free(tool_schemas);
@@ -3022,6 +3585,12 @@ bad:
     free(instructions);
     free(tool_schemas);
     snprintf(err, errlen, got_input ? "invalid JSON request" : "missing input");
+    request_free(r);
+    return false;
+image_error:
+    chat_msgs_free(&msgs);
+    free(instructions);
+    free(tool_schemas);
     request_free(r);
     return false;
 }
@@ -3168,6 +3737,11 @@ static bool parse_anthropic_request(q36_engine *e, server *s, const char *body, 
                 goto bad;
             }
             r->top_k_set = true;
+        } else if (!strcmp(key, "ignore_eos")) {
+            if (!json_bool(&p, &r->ignore_eos)) {
+                free(key);
+                goto bad;
+            }
         } else if (!strcmp(key, "stream")) {
             if (!json_bool(&p, &r->stream)) {
                 free(key);
@@ -3178,6 +3752,12 @@ static bool parse_anthropic_request(q36_engine *e, server *s, const char *body, 
                 free(key);
                 goto bad;
             }
+        } else if (!strcmp(key, "think")) {
+            if (!json_bool(&p, &thinking_enabled)) {
+                free(key);
+                goto bad;
+            }
+            got_thinking = true;
         } else if (!strcmp(key, "thinking")) {
             if (!parse_thinking_control_value(&p, &thinking_enabled)) {
                 free(key);
@@ -3231,6 +3811,13 @@ static bool parse_anthropic_request(q36_engine *e, server *s, const char *body, 
         msgs.v[0] = msg;
         msgs.len++;
     }
+    if (!request_validate_ignore_eos(r, err, errlen)) {
+        chat_msgs_free(&msgs);
+        free(system);
+        free(tool_schemas);
+        request_free(r);
+        return false;
+    }
     r->has_tools = tool_schemas && tool_schemas[0] && !tool_choice_none;
     if (!got_thinking && model_alias_disables_thinking(r->model)) thinking_enabled = false;
     if (!got_thinking && model_alias_enables_thinking(r->model)) thinking_enabled = true;
@@ -3245,7 +3832,8 @@ static bool parse_anthropic_request(q36_engine *e, server *s, const char *body, 
     r->prompt_text = render_chat_prompt_text_profile(
         &msgs, active_tool_schemas, &r->tool_orders, r->think_mode,
         r->kat_coder, r->preserve_thinking);
-    q36_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
+    request_note_tool_continuation(r, &msgs, active_tool_schemas);
+    if (!request_tokenize_multimodal_prompt(e, s, r, &msgs, err, errlen)) goto image_error;
     chat_msgs_free(&msgs);
     free(system);
     free(tool_schemas);
@@ -3255,6 +3843,12 @@ bad:
     free(system);
     free(tool_schemas);
     snprintf(err, errlen, "invalid JSON request");
+    request_free(r);
+    return false;
+image_error:
+    chat_msgs_free(&msgs);
+    free(system);
+    free(tool_schemas);
     request_free(r);
     return false;
 }
@@ -3381,6 +3975,11 @@ static bool parse_completion_request(q36_engine *e, const char *body, int def_to
                 goto bad;
             }
             r->seed = v > 0.0 ? (uint64_t)v : 0;
+        } else if (!strcmp(key, "ignore_eos")) {
+            if (!json_bool(&p, &r->ignore_eos)) {
+                free(key);
+                goto bad;
+            }
         } else if (!strcmp(key, "stream")) {
             if (!json_bool(&p, &r->stream)) {
                 free(key);
@@ -3431,6 +4030,11 @@ static bool parse_completion_request(q36_engine *e, const char *body, int def_to
     if (*p != '}') goto bad;
     if (!prompt) {
         snprintf(err, errlen, "missing prompt");
+        request_free(r);
+        return false;
+    }
+    if (!request_validate_ignore_eos(r, err, errlen)) {
+        free(prompt);
         request_free(r);
         return false;
     }
@@ -3554,21 +4158,6 @@ static const char *find_any_tool_end(const char *s) {
     return s ? strstr(s, Q36_TOOL_CALLS_END) : NULL;
 }
 
-static void observe_tool_markers(const char *scan, bool *saw_start,
-                                 bool *saw_end, bool *orphan_end) {
-    if (!scan) return;
-    bool had_start = *saw_start;
-    const char *start = find_any_tool_start(scan);
-    if (start) *saw_start = true;
-
-    const char *end_scan = had_start ? scan : (start ? start : NULL);
-    const char *end = end_scan ? find_any_tool_end(end_scan) : NULL;
-    if (end) {
-        *saw_end = true;
-    } else if (!had_start && !start && find_any_tool_end(scan)) {
-        if (orphan_end) *orphan_end = true;
-    }
-}
 
 static size_t trim_tool_separator_ws(const char *raw, size_t start, size_t limit) {
     while (limit > start && isspace((unsigned char)raw[limit - 1])) limit--;
@@ -3600,12 +4189,14 @@ static bool qwen_tool_find_tool_start(const char *raw, size_t raw_len,
                                  size_t *pos_out,
                                  const qwen_tool_syntax **syn_out);
 
+static const char *find_tool_structural_text(const char *s, const char *needle, bool last);
+
 static void split_reasoning_content(const char *text, size_t n, char **content_out, char **reasoning_out) {
     char *s = xstrndup(text ? text : "", n);
     char *body = s;
     if (!strncmp(body, "<think>", 7)) body += 7;
 
-    char *think_end = strstr(body, "</think>");
+    char *think_end = (char *)find_tool_structural_text(body, "</think>", false);
     if (think_end) {
         *think_end = '\0';
         *reasoning_out = xstrdup(body);
@@ -3646,16 +4237,26 @@ static size_t raw_skip_ascii_ws(const char *raw, size_t raw_len, size_t pos) {
     return pos;
 }
 
-static const char *find_last_substr(const char *s, const char *needle) {
-    if (!s || !needle || !needle[0]) return NULL;
-    const char *last = NULL;
-    const char *p = s;
-    while ((p = strstr(p, needle)) != NULL) {
-        last = p;
-        p++;
+/* Parameter bodies are literal data, even when they contain thinking or tool tags. */
+static const char *find_tool_structural_text(const char *s, const char *needle,
+                                            bool last) {
+    const char *found = NULL;
+    if (!s) return NULL;
+    while (*s) {
+        if (!strncmp(s, needle, strlen(needle))) {
+            found = s;
+            if (!last) return found;
+        }
+        if (!strncmp(s, Q36_PARAM_START, strlen(Q36_PARAM_START))) {
+            const char *tag = strchr(s, '>');
+            const char *end = tag ? strstr(tag + 1, Q36_PARAM_END) : NULL;
+            if (!end) return found;
+            s = end + strlen(Q36_PARAM_END);
+        } else s++;
     }
-    return last;
+    return found;
 }
+
 
 static bool qwen_tool_read_tag(const char *raw, size_t raw_len, size_t pos,
                           char **tag_out, size_t *after_out) {
@@ -3674,6 +4275,7 @@ static void qwen_tool_append_json_value(buf *out, const char *value, size_t len)
     }
     if (len && value[len - 1] == '\n') len--;
     char *raw = xstrndup(value, len);
+    q36_tool_text_unescape(raw, Q36_PARAM_END);
     if (json_raw_value_is_complete(raw)) {
         char *minified = json_minify_raw_value(raw);
         buf_puts(out, minified);
@@ -3692,7 +4294,7 @@ static bool parse_generated_message_ex(const char *text, bool thinking,
     const char *tool_search = text;
     bool recovered_unclosed_tool = false;
     if (thinking) {
-        const char *think_end = find_last_substr(text, "</think>");
+        const char *think_end = find_tool_structural_text(text, "</think>", true);
         if (!think_end) {
             const char *candidate = find_any_tool_start(text);
             if (!candidate || !find_any_tool_end(candidate)) {
@@ -4024,8 +4626,8 @@ static bool sse_usage_chunk(int fd, const request *r, const char *id,
         buf_puts(&b, ",\"choices\":[],\"usage\":");
     }
     buf_printf(&b,
-               "{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d}}\n\n",
-               prompt_tokens, completion_tokens, prompt_tokens + completion_tokens);
+               "{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d,\"prompt_tokens_details\":{\"cached_tokens\":%d}}}\n\n",
+               prompt_tokens, completion_tokens, prompt_tokens + completion_tokens, r->cached_tokens);
 
     bool ok = send_all(fd, b.ptr, b.len);
     buf_free(&b);
@@ -4295,13 +4897,6 @@ typedef struct {
     size_t pos;
 } qwen_tool_decode_tracker;
 
-static bool raw_partial_lit_min(const char *raw, size_t raw_len, size_t pos,
-                                const char *lit, size_t min_len) {
-    size_t lit_len = strlen(lit);
-    if (!raw || pos > raw_len || raw_len - pos >= lit_len) return false;
-    size_t avail = raw_len - pos;
-    return avail >= min_len && !memcmp(raw + pos, lit, avail);
-}
 
 static size_t qwen_tool_max_tool_start_len(void) {
     size_t max = 0;
@@ -4436,8 +5031,11 @@ static void qwen_tool_decode_tracker_update(qwen_tool_decode_tracker *dt,
 
     for (;;) {
         if (dt->mode == QWEN_TOOL_TRACK_DONE) {
+            size_t next = 0;
+            const qwen_tool_syntax *syn = NULL;
+            if (!qwen_tool_find_tool_start_from(raw, raw_len, dt->pos, &next, &syn)) return;
+            dt->pos = next;
             dt->mode = QWEN_TOOL_TRACK_SEARCH;
-            dt->decode = QWEN_TOOL_DECODE_OUTSIDE;
             continue;
         }
 
@@ -4464,8 +5062,9 @@ static void qwen_tool_decode_tracker_update(qwen_tool_decode_tracker *dt,
                     dt->decode = QWEN_TOOL_DECODE_STRUCTURAL;
                     goto structural;
                 }
-                if (raw_partial_lit_min(raw, raw_len, dt->pos, dt->syn->param_end, 2)) {
-                    dt->decode = QWEN_TOOL_DECODE_STRUCTURAL;
+                if (raw_partial_lit(raw, raw_len, dt->pos, dt->syn->param_end)) {
+                    dt->decode = raw_len - dt->pos >= 2 ?
+                        QWEN_TOOL_DECODE_STRUCTURAL : QWEN_TOOL_DECODE_PAYLOAD;
                     return;
                 }
                 dt->pos++;
@@ -4528,6 +5127,27 @@ structural:
             return;
         }
     }
+}
+
+static void observe_tool_markers(const qwen_tool_decode_tracker *tracker,
+                                 const char *scan, bool *saw_start,
+                                 bool *saw_end, bool *orphan_end) {
+    if (tracker->syn) *saw_start = true;
+    if (tracker->mode == QWEN_TOOL_TRACK_DONE) *saw_end = true;
+    else if (!*saw_start && scan && find_any_tool_end(scan) && orphan_end)
+        *orphan_end = true;
+}
+
+static bool complete_tool_text(const char *text) {
+    if (!text || !find_any_tool_end(text)) return false;
+    char *content = NULL, *reasoning = NULL;
+    tool_calls calls = {0};
+    bool complete = parse_generated_message_ex(text, false,
+        &content, &reasoning, &calls) && calls.len > 0;
+    free(content);
+    free(reasoning);
+    tool_calls_free(&calls);
+    return complete;
 }
 
 static bool openai_tool_emit_args_fragment(int fd, const request *r, const char *id,
@@ -4646,6 +5266,7 @@ static bool openai_tool_finish_param(int fd, const request *r, const char *id,
     }
     if (len && value[len - 1] == '\n') len--;
     char *plain = xstrndup(value, len);
+    q36_tool_text_unescape(plain, Q36_PARAM_END);
     bool json_value = json_raw_value_is_complete(plain);
     if (!openai_tool_emit_param_prefix(fd, r, id, ts, ts->param_name,
                                        !json_value)) {
@@ -4771,7 +5392,7 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
             find_any_tool_start(raw + st->emit_pos) : NULL;
         const bool tool_before_close = tool && (!close || tool < close);
         const bool complete_tool =
-            tool_before_close && find_any_tool_end(tool) != NULL;
+            tool_before_close && complete_tool_text(tool);
         size_t limit;
         if (tool_before_close) {
             limit = trim_tool_separator_ws(raw, st->emit_pos,
@@ -4937,8 +5558,8 @@ static bool final_response(int fd, const request *r, const char *id, const char 
         json_escape(&b, finish);
         buf_puts(&b, "}],\"usage\":");
     }
-    buf_printf(&b, "{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d}}\n",
-               prompt_tokens, completion_tokens, prompt_tokens + completion_tokens);
+    buf_printf(&b, "{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d,\"prompt_tokens_details\":{\"cached_tokens\":%d}}}\n",
+               prompt_tokens, completion_tokens, prompt_tokens + completion_tokens, r->cached_tokens);
     bool ok = http_response(fd, 200, "application/json", b.ptr);
     buf_free(&b);
     return ok;
@@ -4951,46 +5572,56 @@ static const char *responses_status(const char *finish) {
     return "completed";
 }
 
+enum { RESP_REASONING, RESP_MESSAGE, RESP_TOOL };
+
+static void append_responses_item(buf *b, const char *id, int kind, int call_index,
+                                  const char *text, const tool_call *call,
+                                  const char *finish) {
+    const char *status = responses_status(finish);
+    if (kind == RESP_TOOL) {
+        buf_printf(b, "{\"id\":\"fc_%s_%d\",\"type\":\"function_call\",\"status\":", id, call_index);
+        json_escape(b, status);
+        buf_puts(b, ",\"call_id\":");
+        json_escape(b, call->id ? call->id : "");
+        buf_puts(b, ",\"name\":");
+        json_escape(b, call->name ? call->name : "");
+        buf_puts(b, ",\"arguments\":");
+        json_escape(b, text ? text : "");
+    } else {
+        bool reasoning = kind == RESP_REASONING;
+        buf_printf(b, "{\"id\":\"%s_%s\",\"type\":\"%s\",\"status\":",
+                   reasoning ? "rs" : "msg", id, reasoning ? "reasoning" : "message");
+        json_escape(b, status);
+        if (!reasoning) buf_puts(b, ",\"role\":\"assistant\"");
+        buf_printf(b, ",\"%s\":[", reasoning ? "summary" : "content");
+        if (text) {
+            buf_printf(b, "{\"type\":\"%s\",\"text\":", reasoning ? "summary_text" : "output_text");
+            json_escape(b, text);
+            if (!reasoning) buf_puts(b, ",\"annotations\":[]");
+            buf_putc(b, '}');
+        }
+        buf_putc(b, ']');
+    }
+    buf_putc(b, '}');
+}
+
 static void append_responses_output(buf *b, const char *id, const char *text,
                                     const char *reasoning, const tool_calls *calls,
                                     const char *finish) {
-    const char *status = responses_status(finish);
     int output_index = 0;
     buf_putc(b, '[');
     if (reasoning && reasoning[0]) {
-        buf_puts(b, "{\"id\":\"rs_");
-        buf_puts(b, id);
-        buf_puts(b, "\",\"type\":\"reasoning\",\"status\":");
-        json_escape(b, status);
-        buf_puts(b, ",\"summary\":[{\"type\":\"summary_text\",\"text\":");
-        json_escape(b, reasoning);
-        buf_puts(b, "}]}" );
+        append_responses_item(b, id, RESP_REASONING, 0, reasoning, NULL, finish);
         output_index++;
     }
     if (text && text[0]) {
         if (output_index++) buf_putc(b, ',');
-        buf_puts(b, "{\"id\":\"msg_");
-        buf_puts(b, id);
-        buf_puts(b, "\",\"type\":\"message\",\"status\":");
-        json_escape(b, status);
-        buf_puts(b, ",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":");
-        json_escape(b, text);
-        buf_puts(b, ",\"annotations\":[]}]}" );
+        append_responses_item(b, id, RESP_MESSAGE, 0, text, NULL, finish);
     }
     for (int i = 0; calls && i < calls->len; i++) {
-        const tool_call *tc = &calls->v[i];
         if (output_index++) buf_putc(b, ',');
-        buf_puts(b, "{\"id\":\"fc_");
-        buf_printf(b, "%s_%d", id, i);
-        buf_puts(b, "\",\"type\":\"function_call\",\"status\":");
-        json_escape(b, status);
-        buf_puts(b, ",\"call_id\":");
-        json_escape(b, tc->id ? tc->id : "");
-        buf_puts(b, ",\"name\":");
-        json_escape(b, tc->name ? tc->name : "");
-        buf_puts(b, ",\"arguments\":");
-        json_escape(b, tc->arguments ? tc->arguments : "{}");
-        buf_putc(b, '}');
+        append_responses_item(b, id, RESP_TOOL, i,
+            calls->v[i].arguments ? calls->v[i].arguments : "{}", &calls->v[i], finish);
     }
     buf_putc(b, ']');
 }
@@ -5016,8 +5647,8 @@ static void append_responses_object(buf *b, const request *r, const char *id,
         buf_puts(b, ",\"incomplete_details\":null");
     }
     buf_printf(b,
-        ",\"usage\":{\"input_tokens\":%d,\"output_tokens\":%d,\"total_tokens\":%d}}",
-        prompt_tokens, completion_tokens, prompt_tokens + completion_tokens);
+        ",\"usage\":{\"input_tokens\":%d,\"output_tokens\":%d,\"total_tokens\":%d,\"input_tokens_details\":{\"cached_tokens\":%d}}}",
+        prompt_tokens, completion_tokens, prompt_tokens + completion_tokens, r->cached_tokens);
 }
 
 static bool responses_final_response(int fd, const request *r, const char *id,
@@ -5045,6 +5676,52 @@ static bool responses_sse_event(int fd, const char *type, const char *json) {
     return ok;
 }
 
+static bool responses_sse_item(int fd, const char *id, int output_index,
+                                int kind, int call_index, const char *text,
+                                const tool_call *call, const char *finish, bool done) {
+    buf b = {0};
+    const char *event = done ? "response.output_item.done" : "response.output_item.added";
+    buf_printf(&b, "{\"type\":\"%s\",\"output_index\":%d,\"item\":", event, output_index);
+    append_responses_item(&b, id, kind, call_index, done ? text : NULL,
+                           call, done ? finish : "in_progress");
+    buf_putc(&b, '}');
+    bool ok = responses_sse_event(fd, event, b.ptr);
+    buf_free(&b);
+    return ok;
+}
+
+static bool responses_sse_text(int fd, const char *id, int index, const char *text,
+                                bool reasoning, const char *finish) {
+    int kind = reasoning ? RESP_REASONING : RESP_MESSAGE;
+    if (!responses_sse_item(fd, id, index, kind, 0, NULL, NULL, finish, false)) return false;
+    const char *prefix = reasoning ? "rs" : "msg";
+    const char *part = reasoning ? "reasoning_summary_part" : "content_part";
+    const char *field = reasoning ? "summary_index" : "content_index";
+    const char *type = reasoning ? "summary_text" : "output_text";
+    const char *delta = reasoning ? "reasoning_summary_text" : "output_text";
+    for (int stage = 0; stage < 4; stage++) {
+        bool part_event = stage == 0 || stage == 3;
+        char event[80];
+        snprintf(event, sizeof(event), "response.%s.%s", part_event ? part : delta,
+                 stage == 0 ? "added" : stage == 1 ? "delta" : "done");
+        buf b = {0};
+        buf_printf(&b, "{\"type\":\"%s\",\"item_id\":\"%s_%s\",\"output_index\":%d,\"%s\":0,",
+                   event, prefix, id, index, field);
+        if (part_event) buf_printf(&b, "\"part\":{\"type\":\"%s\",\"text\":", type);
+        else buf_printf(&b, "\"%s\":", stage == 1 ? "delta" : "text");
+        json_escape(&b, stage == 0 ? "" : text);
+        if (part_event) {
+            if (!reasoning) buf_puts(&b, ",\"annotations\":[]");
+            buf_putc(&b, '}');
+        }
+        buf_putc(&b, '}');
+        bool ok = responses_sse_event(fd, event, b.ptr);
+        buf_free(&b);
+        if (!ok) return false;
+    }
+    return responses_sse_item(fd, id, index, kind, 0, text, NULL, finish, true);
+}
+
 static bool responses_sse_finish(int fd, const request *r, const char *id,
                                  const char *text, const char *reasoning,
                                  const tool_calls *calls, const char *finish,
@@ -5057,28 +5734,14 @@ static bool responses_sse_finish(int fd, const request *r, const char *id,
     buf_free(&b);
     int output_index = 0;
 
-    if (ok && reasoning && reasoning[0]) {
-        buf_printf(&b,
-            "{\"type\":\"response.reasoning_summary_text.delta\",\"item_id\":\"rs_%s\",\"output_index\":%d,\"summary_index\":0,\"delta\":",
-            id, output_index);
-        json_escape(&b, reasoning);
-        buf_putc(&b, '}');
-        ok = responses_sse_event(fd, "response.reasoning_summary_text.delta", b.ptr);
-        buf_free(&b);
-        output_index++;
-    }
-    if (ok && text && text[0]) {
-        buf_printf(&b,
-            "{\"type\":\"response.output_text.delta\",\"item_id\":\"msg_%s\",\"output_index\":%d,\"content_index\":0,\"delta\":",
-            id, output_index);
-        json_escape(&b, text);
-        buf_putc(&b, '}');
-        ok = responses_sse_event(fd, "response.output_text.delta", b.ptr);
-        buf_free(&b);
-        output_index++;
-    }
+    if (ok && reasoning && reasoning[0])
+        ok = responses_sse_text(fd, id, output_index++, reasoning, true, finish);
+    if (ok && text && text[0])
+        ok = responses_sse_text(fd, id, output_index++, text, false, finish);
     for (int i = 0; ok && calls && i < calls->len; i++, output_index++) {
         const tool_call *tc = &calls->v[i];
+        ok = responses_sse_item(fd, id, output_index, RESP_TOOL, i, NULL, tc, finish, false);
+        if (!ok) break;
         buf_printf(&b,
             "{\"type\":\"response.function_call_arguments.done\",\"item_id\":\"fc_%s_%d\",\"output_index\":%d,\"arguments\":",
             id, i, output_index);
@@ -5086,6 +5749,8 @@ static bool responses_sse_finish(int fd, const request *r, const char *id,
         buf_putc(&b, '}');
         ok = responses_sse_event(fd, "response.function_call_arguments.done", b.ptr);
         buf_free(&b);
+        if (ok) ok = responses_sse_item(fd, id, output_index, RESP_TOOL, i,
+            tc->arguments ? tc->arguments : "{}", tc, finish, true);
     }
     if (ok) {
         buf_puts(&b, "{\"type\":\"response.completed\",\"response\":");
@@ -5170,8 +5835,8 @@ static bool anthropic_final_response(int fd, const request *r, const char *id, c
     buf_puts(&b, ",\"stop_reason\":");
     json_escape(&b, anthropic_stop_reason(finish));
     buf_puts(&b, ",\"stop_sequence\":null,\"usage\":");
-    buf_printf(&b, "{\"input_tokens\":%d,\"output_tokens\":%d}}\n",
-               prompt_tokens, completion_tokens);
+    buf_printf(&b, "{\"input_tokens\":%d,\"output_tokens\":%d,\"cache_read_input_tokens\":%d}}\n",
+               prompt_tokens - r->cached_tokens, completion_tokens, r->cached_tokens);
     bool ok = http_response(fd, 200, "application/json", b.ptr);
     buf_free(&b);
     return ok;
@@ -5222,8 +5887,8 @@ static bool anthropic_sse_start_live(int fd, const request *r, const char *id,
     buf_printf(&b,
         "{\"type\":\"message_start\",\"message\":{\"id\":\"%s\",\"type\":\"message\","
         "\"role\":\"assistant\",\"model\":%s,\"content\":[],\"stop_reason\":null,"
-        "\"stop_sequence\":null,\"usage\":{\"input_tokens\":%d,\"output_tokens\":0}}}",
-        id, model_json, prompt_tokens);
+        "\"stop_sequence\":null,\"usage\":{\"input_tokens\":%d,\"output_tokens\":0,\"cache_read_input_tokens\":%d}}}",
+        id, model_json, prompt_tokens - r->cached_tokens, r->cached_tokens);
     bool ok = sse_event(fd, "message_start", b.ptr);
     buf_free(&b);
     free(model_json);
@@ -5379,7 +6044,7 @@ static bool anthropic_sse_stream_update(int fd, const request *r, const char *id
             find_any_tool_start(raw + st->emit_pos) : NULL;
         const bool tool_before_close = tool && (!close || tool < close);
         const bool complete_tool =
-            tool_before_close && find_any_tool_end(tool) != NULL;
+            tool_before_close && complete_tool_text(tool);
         size_t limit;
         if (tool_before_close) {
             limit = trim_tool_separator_ws(raw, st->emit_pos,
@@ -5642,6 +6307,7 @@ struct tool_memory_entry {
     size_t bytes;
     uint64_t stamp;
     tool_memory_source source;
+    bool empty_think;
     tool_memory_entry *prev;
     tool_memory_entry *next;
     tool_memory_entry *block_next;
@@ -5660,7 +6326,104 @@ typedef struct {
     uint64_t scan_clock;
 } tool_memory;
 
+#define SERVER_IMAGE_CACHE_ENTRIES 32
+#define SERVER_IMAGE_CACHE_BYTES (32u * 1024u * 1024u)
+
+typedef struct {
+    uint8_t *encoded;
+    size_t encoded_len;
+    q36_vision_embedding embedding;
+    size_t data_bytes;
+    uint64_t used;
+} server_image_cache_entry;
+
+typedef struct {
+    server_image_cache_entry entries[SERVER_IMAGE_CACHE_ENTRIES];
+    size_t bytes;
+    uint64_t clock;
+} server_image_cache;
+
+static void server_image_cache_remove(server_image_cache *cache,
+                                      server_image_cache_entry *entry) {
+    cache->bytes -= entry->encoded_len + entry->data_bytes;
+    free(entry->encoded);
+    q36_vision_embedding_free(&entry->embedding);
+    memset(entry, 0, sizeof(*entry));
+}
+
+static void server_image_cache_clear(server_image_cache *cache) {
+    for (size_t i = 0; i < SERVER_IMAGE_CACHE_ENTRIES; i++)
+        server_image_cache_remove(cache, &cache->entries[i]);
+    cache->clock = 0;
+}
+
+static bool server_image_cache_get(server_image_cache *cache,
+                                   const server_image_input *input,
+                                   q36_vision_embedding *out) {
+    for (size_t i = 0; i < SERVER_IMAGE_CACHE_ENTRIES; i++) {
+        server_image_cache_entry *entry = &cache->entries[i];
+        if (!entry->encoded || entry->encoded_len != input->encoded_len ||
+            memcmp(entry->encoded, input->encoded, input->encoded_len)) continue;
+        float *data = malloc(entry->data_bytes);
+        if (!data) return false;
+        memcpy(data, entry->embedding.data, entry->data_bytes);
+        *out = entry->embedding;
+        out->data = data;
+        entry->used = ++cache->clock;
+        return true;
+    }
+    return false;
+}
+
+/* Cache only successful encodes. Exact byte keys avoid trusting a client hash;
+ * callers own a copy, so each request owns its image data. */
+static void server_image_cache_put(server_image_cache *cache,
+                                   const server_image_input *input,
+                                   const q36_vision_embedding *embedding,
+                                   uint32_t dim, size_t budget) {
+    if (!embedding->data || !dim || !embedding->token_count ||
+        !input->encoded_len ||
+        embedding->token_count > budget / sizeof(float) / dim) return;
+    size_t bytes = (size_t)embedding->token_count * dim * sizeof(float);
+    if (input->encoded_len > budget - bytes) return;
+    size_t total = input->encoded_len + bytes;
+    server_image_cache_entry *dest;
+    for (;;) {
+        dest = &cache->entries[0];
+        for (size_t i = 1; i < SERVER_IMAGE_CACHE_ENTRIES; i++) {
+            if (cache->entries[i].used < dest->used) dest = &cache->entries[i];
+        }
+        if (!dest->encoded && cache->bytes <= budget - total) break;
+        if (!dest->encoded) {
+            for (size_t i = 0; i < SERVER_IMAGE_CACHE_ENTRIES; i++) {
+                server_image_cache_entry *entry = &cache->entries[i];
+                if (entry->encoded && (!dest->encoded || entry->used < dest->used))
+                    dest = entry;
+            }
+        }
+        server_image_cache_remove(cache, dest);
+    }
+    uint8_t *encoded = malloc(input->encoded_len);
+    float *data = malloc((size_t)bytes);
+    if (!encoded || !data) {
+        free(encoded);
+        free(data);
+        return;
+    }
+    memcpy(encoded, input->encoded, input->encoded_len);
+    memcpy(data, embedding->data, (size_t)bytes);
+    *dest = (server_image_cache_entry) {
+        .encoded = encoded, .encoded_len = input->encoded_len,
+        .embedding = *embedding, .data_bytes = (size_t)bytes,
+        .used = ++cache->clock,
+    };
+    dest->embedding.data = data;
+    cache->bytes += total;
+}
+
+
 struct server {
+    server_image_cache image_cache;
     q36_engine *engine;
     /* slots[0] remains the legacy session when batching is disabled. */
     q36_session *session;
@@ -5696,10 +6459,41 @@ struct server {
     uint64_t trace_seq;
 };
 
+static void server_inference_lock(server *s) {
+    pthread_mutex_lock(&s->inference_mu);
+}
+
+static void server_inference_unlock(server *s) {
+    pthread_mutex_unlock(&s->inference_mu);
+}
+
+static bool server_encode_image(server *s, const server_image_input *input,
+                                q36_vision_embedding *out,
+                                char *err, size_t errlen) {
+    if (server_image_cache_get(&s->image_cache, input, out)) {
+        server_log(Q36_LOG_KVCACHE, "q36-server: vision embedding cache hit");
+        return true;
+    }
+    if (!q36_engine_vision_encode_memory(s->engine, input->encoded,
+                                         input->encoded_len, out, err, errlen))
+        return false;
+    server_image_cache_put(&s->image_cache, input, out,
+                            (uint32_t)q36_engine_embd_dim(s->engine),
+                            SERVER_IMAGE_CACHE_BYTES);
+    server_log(Q36_LOG_KVCACHE, "q36-server: vision embedding encoded; cache=%zu bytes",
+               s->image_cache.bytes);
+    return true;
+}
+
 struct server_slot {
     server *srv;
     int id;
     q36_session *session;
+    char **pending_ids;
+    size_t pending_count;
+    int pending_pos;
+    api_style pending_api;
+    char *pending_tools;
     int continued_last_store_tokens;
     job *assigned;
     bool busy;
@@ -5711,6 +6505,31 @@ struct server_slot {
     int decode_rc;
     char decode_err[160];
 };
+
+static void slot_pending_clear(server_slot *slot) {
+    for (size_t i = 0; i < slot->pending_count; i++) free(slot->pending_ids[i]);
+    free(slot->pending_ids);
+    free(slot->pending_tools);
+    slot->pending_ids = NULL;
+    slot->pending_tools = NULL;
+    slot->pending_count = 0;
+    slot->pending_pos = 0;
+}
+
+static bool slot_pending_matches(const server_slot *slot, const request *r) {
+    if (!slot->pending_count || slot->pending_count != r->continuation_count ||
+        slot->pending_api != r->api || slot->pending_pos != q36_session_pos(slot->session) ||
+        strcmp(slot->pending_tools, r->tool_schema_key ? r->tool_schema_key : "")) return false;
+    for (size_t i = 0; i < r->continuation_count; i++) {
+        bool found = false;
+        for (size_t k = 0; k < i; k++)
+            if (!strcmp(r->continuation_ids[i], r->continuation_ids[k])) return false;
+        for (size_t k = 0; k < slot->pending_count; k++)
+            if (!strcmp(r->continuation_ids[i], slot->pending_ids[k])) found = true;
+        if (!found) return false;
+    }
+    return true;
+}
 
 /* Jobs are stack-owned by the client thread.  The worker signals completion
  * after the response has been written, so request data and the socket remain
@@ -5938,6 +6757,8 @@ static void tool_memory_remember(server *s, const tool_calls *calls) {
     for (int i = 0; i < calls->len; i++) {
         tool_memory_put_locked(&s->tool_mem, calls->v[i].id, calls->raw_tool_text,
                                TOOL_MEMORY_RAM);
+        tool_memory_entry *entry = tool_memory_find_entry_locked(&s->tool_mem, calls->v[i].id);
+        if (entry) entry->empty_think = calls->replay_empty_think;
     }
     pthread_mutex_unlock(&s->tool_mu);
 }
@@ -5990,9 +6811,11 @@ static void tool_memory_attach_to_messages(server *s, chat_msgs *msgs,
         if (calls->len == 0 || calls->raw_tool_text) continue;
         tool_memory_block *matched = NULL;
         tool_memory_source matched_source = TOOL_MEMORY_DISK;
-        bool exact = true;
+        bool exact = true, empty_think = true;
         int missing = 0;
         for (int j = 0; j < calls->len; j++) {
+            tool_memory_entry *entry = tool_memory_find_entry_locked(&s->tool_mem, calls->v[j].id);
+            if (!entry || !entry->empty_think) empty_think = false;
             tool_memory_source source = TOOL_MEMORY_DISK;
             tool_memory_block *block = NULL;
             const char *tool_text =
@@ -6013,6 +6836,7 @@ static void tool_memory_attach_to_messages(server *s, chat_msgs *msgs,
         }
         if (exact && matched) {
             calls->raw_tool_text = xstrdup(matched->qwen_tool);
+            calls->replay_empty_think = empty_think;
             if (stats) {
                 if (matched_source == TOOL_MEMORY_RAM) stats->mem++;
                 else stats->disk++;
@@ -6951,7 +7775,7 @@ static bool kv_cache_store_live_prefix(server *s, server_slot *slot,
                                        const q36_tokens *tokens,
                                        int store_len, const char *reason) {
     kv_disk_cache *kc = &s->kv;
-    if (!kc->enabled) return false;
+    if (!kc->enabled || q36_session_has_vision_state(slot->session)) return false;
     if (!tokens || store_len < kc->opt.min_tokens) return false;
     const int original_len = tokens->len;
 
@@ -7705,7 +8529,7 @@ static bool complete_tool_call_inside_thinking(const char *text, size_t len,
         return false;
     }
     *scan_from = (size_t)(start - text);
-    return find_any_tool_end(start) != NULL;
+    return complete_tool_text(start);
 }
 
 static int server_eval_token(server *s, server_slot *slot, int token,
@@ -7715,6 +8539,9 @@ static bool should_canonicalize_thinking_checkpoint(const request *r,
                                                     const thinking_state *thinking,
                                                     const char *finish) {
     if (!r || r->kind != REQ_CHAT) return false;
+    if (!r->kat_coder && !q36_think_mode_enabled(r->think_mode))
+        return !finish || (!strcmp(finish, "stop") &&
+                           (!thinking || !thinking->inside));
     if (r->has_tools && !r->kat_coder) return false;
     if (r->prompt_preserves_reasoning) return false;
     if (!q36_think_mode_enabled(r->think_mode)) return false;
@@ -7840,6 +8667,45 @@ static int server_session_sync(server *s, server_slot *slot,
         if (done >= prompt->len) return 0;
         if (done < target) {
             if (err && errlen) snprintf(err, errlen, "prefill made no progress");
+            return 1;
+        }
+    }
+    return g_stop_requested ? Q36_SESSION_SYNC_INTERRUPTED : 0;
+}
+
+/* Yield between text chunks, but never cut a visual token block in half. */
+static int server_session_sync_multimodal(server *s, server_slot *slot,
+                                          const q36_tokens *prompt,
+                                          const q36_vision_span *images, size_t count,
+                                          char *err, size_t errlen) {
+    if (!count) return server_session_sync(s, slot, prompt, err, errlen);
+    int live = q36_session_pos(slot->session);
+    int common = q36_session_common_prefix(slot->session, prompt);
+    int done = common == live && prompt->len >= live &&
+               q36_session_vision_prefix_matches(slot->session, images, count) ? live : 0;
+    bool called = false;
+    while (!g_stop_requested && (!called || done < prompt->len)) {
+        int quantum = s->batched_mode ? server_prefill_quantum(s) : prompt->len;
+        int target = done > prompt->len - quantum ? prompt->len : done + quantum;
+        for (size_t i = 0; i < count; i++) {
+            int start = (int)images[i].token_start - 1;
+            int end = (int)(images[i].token_start + images[i].embedding.token_count + 1);
+            if (target > start && target < end) target = end;
+        }
+        size_t n = 0;
+        while (n < count && (uint64_t)images[n].token_start +
+               images[n].embedding.token_count < (uint64_t)target) n++;
+        q36_tokens prefix = *prompt;
+        prefix.len = target;
+        if (!server_prefill_enter(s, slot)) return Q36_SESSION_SYNC_INTERRUPTED;
+        int rc = n ? q36_session_sync_vision(slot->session, &prefix, images, n, err, errlen) :
+                     q36_session_sync(slot->session, &prefix, err, errlen);
+        if (!rc) done = q36_session_pos(slot->session);
+        server_prefill_leave(s);
+        called = true;
+        if (rc) return rc;
+        if (done < target) {
+            if (err && errlen) snprintf(err, errlen, "multimodal prefill made no progress");
             return 1;
         }
     }
@@ -8081,11 +8947,14 @@ static char *build_tool_checkpoint_suffix(const request *r, const char *content,
 static void canonicalize_thinking_checkpoint(server *s, server_slot *slot,
                                              const job *j, const char *ctx,
                                              uint64_t trace_id, const char *content) {
+    for (size_t i = 0; i < j->req.image_count; i++)
+        if (!j->req.images[i].embedding.data) return;
+
     if (!j->req.prompt_text) return;
-    if (!q36_think_mode_enabled(j->req.think_mode)) return;
 
     size_t pt_len = strlen(j->req.prompt_text);
-    const char *think_tag = "<think>\n";
+    const char *think_tag = q36_think_mode_enabled(j->req.think_mode) ?
+        "<think>\n" : "<think>\n\n</think>\n\n";
     size_t tag_len = strlen(think_tag);
     if (pt_len < tag_len ||
         memcmp(j->req.prompt_text + pt_len - tag_len, think_tag, tag_len) != 0) {
@@ -8116,6 +8985,12 @@ static void canonicalize_thinking_checkpoint(server *s, server_slot *slot,
     }
 
     char err[160] = {0};
+    if (j->req.image_count) {
+        if (server_session_sync_multimodal(s, slot, &canonical, j->req.images,
+                                            j->req.image_count, err, sizeof(err)) != 0)
+            trace_event(s, trace_id, "vision checkpoint rebuild failed: %s", err);
+        goto done;
+    }
     q36_session_rewrite_result rr =
         q36_session_rewrite_from_common(slot->session, &canonical, common,
                                         err, sizeof(err));
@@ -8186,12 +9061,24 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
                                          const job *j, const char *ctx,
                                          uint64_t trace_id, const char *content,
                                          const char *reasoning, const tool_calls *calls) {
+    for (size_t i = 0; i < j->req.image_count; i++)
+        if (!j->req.images[i].embedding.data) return;
+
     if (!calls || calls->len == 0 || !j->req.prompt_text) return;
 
     char *suffix_text = build_tool_checkpoint_suffix(&j->req, content, reasoning, calls);
 
     buf rendered = {0};
-    buf_puts(&rendered, j->req.prompt_text);
+    size_t prefix_len = strlen(j->req.prompt_text);
+    const char *empty_think = "<think>\n\n</think>\n\n";
+    size_t empty_len = strlen(empty_think);
+    bool strip_empty = !calls->replay_empty_think && !j->req.kat_coder &&
+                       !q36_think_mode_enabled(j->req.think_mode) &&
+                       prefix_len >= empty_len &&
+                       !memcmp(j->req.prompt_text + prefix_len - empty_len,
+                               empty_think, empty_len);
+    if (strip_empty) prefix_len -= empty_len;
+    buf_append(&rendered, j->req.prompt_text, prefix_len);
     buf_puts(&rendered, suffix_text);
 
     q36_tokens canonical = {0};
@@ -8213,7 +9100,16 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
     }
     free(live_text);
 
-    if (common < j->req.prompt.len) {
+    int stable_len = j->req.prompt.len;
+    if (strip_empty) {
+        q36_tokens stable = {0};
+        char *prefix = xstrndup(j->req.prompt_text, prefix_len);
+        q36_tokenize_rendered_chat(s->engine, prefix, &stable);
+        stable_len = stable.len;
+        free(prefix);
+        q36_tokens_free(&stable);
+    }
+    if (common < stable_len) {
         trace_event(s, trace_id,
                     "tool checkpoint canonicalization skipped: common=%d prompt=%d live=%d canonical=%d",
                     common, j->req.prompt.len, live_len, canonical.len);
@@ -8221,6 +9117,12 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
     }
 
     char err[160] = {0};
+    if (j->req.image_count) {
+        if (server_session_sync_multimodal(s, slot, &canonical, j->req.images,
+                                            j->req.image_count, err, sizeof(err)) != 0)
+            trace_event(s, trace_id, "vision checkpoint rebuild failed: %s", err);
+        goto done;
+    }
     q36_session_rewrite_result rr =
         q36_session_rewrite_from_common(slot->session, &canonical, common,
                                         err, sizeof(err));
@@ -8284,6 +9186,67 @@ done:
     free(suffix_text);
 }
 
+/* Exact pending call IDs bind a tool-only request to one live image context.
+ * Historical spans carry identities only; they cannot rebuild a cold graph. */
+static bool request_continue_vision(server *s, server_slot *slot, request *r) {
+    if (!slot_pending_matches(slot, r)) return false;
+    size_t old_count = 0;
+    const q36_vision_span *old = q36_session_vision_spans(slot->session, &old_count);
+    if (!old_count || old_count + r->image_count > 16) return false;
+    const char *suffix = strstr(r->prompt_text, "<|im_start|>user\n<tool_response>\n");
+    if (!suffix) return false;
+    const q36_tokens *live = q36_session_tokens(slot->session);
+    q36_tokens next = {0};
+    q36_tokens_copy(&next, live);
+    q36_tokenize_rendered_chat(s->engine, suffix, &next);
+    int delta = next.len - r->prompt.len;
+    size_t count = old_count + r->image_count;
+    q36_vision_span *images = xmalloc(count * sizeof(*images));
+    memcpy(images, old, old_count * sizeof(*images));
+    for (size_t i = 0; i < r->image_count; i++) {
+        images[old_count + i] = r->images[i];
+        images[old_count + i].token_start = (uint32_t)((int)r->images[i].token_start + delta);
+    }
+    if (!q36_session_vision_prefix_matches(slot->session, images, count)) {
+        free(images);
+        q36_tokens_free(&next);
+        return false;
+    }
+    free(r->images);
+    r->images = images;
+    r->image_count = count;
+    free(r->prompt_text);
+    r->prompt_text = render_tokens_text(s->engine, &next, NULL);
+    q36_tokens_free(&r->prompt);
+    r->prompt = next;
+    return true;
+}
+
+static void slot_remember_vision_tools(server *s, server_slot *slot,
+                                       const request *r, const tool_calls *calls) {
+    if (!r->image_count || !calls->len || calls->len > 16) return;
+    q36_tokens closed = {0};
+    const q36_tokens *live = q36_session_tokens(slot->session);
+    if (!live || !q36_session_vision_prefix_matches(slot->session, r->images, r->image_count)) return;
+    q36_tokens_copy(&closed, live);
+    char *text = render_tokens_text(s->engine, live, NULL);
+    size_t len = strlen(text), end_len = strlen("<|im_end|>\n");
+    if (len < end_len || strcmp(text + len - end_len, "<|im_end|>\n"))
+        q36_tokenize_rendered_chat(s->engine, "<|im_end|>\n", &closed);
+    free(text);
+    char err[160] = {0};
+    int rc = server_session_sync_multimodal(s, slot, &closed, r->images,
+                                           r->image_count, err, sizeof(err));
+    q36_tokens_free(&closed);
+    if (rc) return;
+    slot->pending_ids = xmalloc((size_t)calls->len * sizeof(char *));
+    for (int i = 0; i < calls->len; i++)
+        slot->pending_ids[slot->pending_count++] = xstrdup(calls->v[i].id);
+    slot->pending_pos = q36_session_pos(slot->session);
+    slot->pending_api = r->api;
+    slot->pending_tools = xstrdup(r->tool_schema_key ? r->tool_schema_key : "");
+}
+
 /* Execute one request on the worker-owned session.
  *
  * Clients resend full prompts as text.  The worker first tries the old exact
@@ -8298,6 +9261,20 @@ done:
 static void generate_job(server *s, server_slot *slot, job *j) {
     char err[160];
     err[0] = '\0';
+    bool continued_vision = request_continue_vision(s, slot, &j->req);
+    slot_pending_clear(slot);
+    if (continued_vision && request_exceeds_context(&j->req, q36_session_ctx(slot->session))) {
+        http_error_context_length_exceeded(j->fd, &j->req, j->req.prompt.len,
+                                           q36_session_ctx(slot->session));
+        return;
+    }
+    const bool multimodal = j->req.image_count != 0;
+    if ((multimodal || q36_session_has_vision_state(slot->session)) &&
+        !q36_session_vision_prefix_matches(slot->session, j->req.images, j->req.image_count)) {
+        pthread_mutex_lock(&s->inference_mu);
+        q36_session_invalidate(slot->session);
+        pthread_mutex_unlock(&s->inference_mu);
+    }
     const int old_pos = q36_session_pos(slot->session);
     const int common = q36_session_common_prefix(slot->session, &j->req.prompt);
     trace_cache_diag cache_diag = {0};
@@ -8316,17 +9293,22 @@ static void generate_job(server *s, server_slot *slot, job *j) {
         if (text_cached > 0) {
             cached = text_cached;
             cache_source = "memory-text";
+            int delta = effective_prompt.len - j->req.prompt.len;
+            for (size_t i = 0; i < j->req.image_count; i++) {
+                if (j->req.images[i].token_start >= (uint32_t)cached)
+                    j->req.images[i].token_start = (uint32_t)((int)j->req.images[i].token_start + delta);
+            }
             prompt_for_sync = &effective_prompt;
         }
     }
     if (cached == 0) slot->continued_last_store_tokens = 0;
-    if (s->kv.enabled && cached == 0 && old_pos >= s->kv.opt.min_tokens) {
+    if (!multimodal && s->kv.enabled && cached == 0 && old_pos >= s->kv.opt.min_tokens) {
         /* Loading a disk snapshot replaces the resident slot. Persist the
          * current checkpoint first, otherwise a cache hit for an older prefix
          * would silently discard the newer conversation state. */
         server_kv_store_current(s, slot, "evict");
     }
-    if (cached == 0) {
+    if (!multimodal && cached == 0) {
         disk_cached = server_kv_try_load(s, slot, &j->req, &effective_prompt,
                                         &disk_cache_path);
         if (disk_cached > 0) {
@@ -8336,6 +9318,7 @@ static void generate_job(server *s, server_slot *slot, job *j) {
         }
     }
     const int prompt_tokens = prompt_for_sync->len;
+    j->req.cached_tokens = cached;
     const double t0 = now_sec();
     uint64_t trace_id = trace_begin(s, j, cached, prompt_tokens, &cache_diag,
                                     cache_source, disk_cached, disk_cache_path);
@@ -8363,7 +9346,7 @@ static void generate_job(server *s, server_slot *slot, job *j) {
     q36_session_set_progress(slot->session, server_progress_cb, &progress);
 
     int cold_store_len = 0;
-    if (cached == 0 &&
+    if (!multimodal && cached == 0 &&
         s->kv.enabled &&
         prompt_for_sync->len >= s->kv.opt.min_tokens &&
         s->kv.opt.cold_max_tokens > 0 &&
@@ -8392,7 +9375,8 @@ static void generate_job(server *s, server_slot *slot, job *j) {
         q36_tokens_free(&prefix);
     }
 
-    if (server_session_sync(s, slot, prompt_for_sync, err, sizeof(err)) != 0) {
+    if (server_session_sync_multimodal(s, slot, prompt_for_sync,
+                                       j->req.images, j->req.image_count, err, sizeof(err)) != 0) {
         q36_tokens_free(&effective_prompt);
         q36_session_set_progress(slot->session, NULL, NULL);
         trace_event(s, trace_id, "prefill failed: %s", err);
@@ -8490,9 +9474,10 @@ static void generate_job(server *s, server_slot *slot, job *j) {
         float temperature, top_p, min_p;
         int top_k;
         request_sampling(&j->req, &temperature, &top_k, &top_p, &min_p);
-        if (in_tool_call && !qwen_tool_decode_state_uses_payload_sampling(qwen_tool_state)) {
-            temperature = 0.0f;
-        }
+        const float payload_temperature = temperature;
+        const bool greedy_tool_syntax = in_tool_call &&
+            !qwen_tool_decode_state_uses_payload_sampling(qwen_tool_state);
+        if (greedy_tool_syntax) temperature = 0.0f;
         float presence_penalty = j->req.presence_penalty;
         float frequency_penalty = j->req.frequency_penalty;
         if (in_tool_call && !qwen_tool_decode_state_uses_payload_sampling(qwen_tool_state)) {
@@ -8503,7 +9488,15 @@ static void generate_job(server *s, server_slot *slot, job *j) {
             slot->session, temperature, top_k, top_p, min_p,
             generated_tokens.v, generated_tokens.len,
             presence_penalty, frequency_penalty, &rng);
-        token = q36_session_eos_to_think_close(slot->session, token);
+        if (j->req.ignore_eos && token == q36_token_eos(s->engine))
+            token = q36_session_argmax_penalized_excluding(slot->session, q36_token_eos(s->engine),
+                generated_tokens.v, generated_tokens.len, presence_penalty, frequency_penalty);
+        else token = q36_session_eos_to_think_close(slot->session, token);
+        if (token < 0) {
+            finish = "error";
+            snprintf(err, sizeof(err), "failed to select a token");
+            break;
+        }
         if (token == q36_token_eos(s->engine)) {
             finish = "stop";
             break;
@@ -8511,7 +9504,8 @@ static void generate_job(server *s, server_slot *slot, job *j) {
 
         int toks[17];
         int ntok = 0;
-        if (!s->batched_mode && temperature <= 0.0f &&
+        const int block_start = q36_session_pos(slot->session);
+        if (!multimodal && !s->batched_mode && temperature <= 0.0f &&
             presence_penalty == 0.0f && frequency_penalty == 0.0f &&
             q36_engine_mtp_draft_tokens(s->engine) > 1 &&
             getenv("Q36_MTP_SPEC_DISABLE") == NULL)
@@ -8537,10 +9531,17 @@ static void generate_job(server *s, server_slot *slot, job *j) {
             ntok = 1;
         }
 
-        bool stop_decode = false;
+        if (!ntok) {
+            finish = "error";
+            snprintf(err, sizeof(err), "decode returned no tokens");
+            break;
+        }
+        bool stop_decode = false, text_stop = false;
+        int kept = 0;
         for (int ti = 0; ti < ntok && completion < max_tokens; ti++) {
             token = toks[ti];
             if (token == q36_token_eos(s->engine)) {
+                if (j->req.ignore_eos) break;
                 finish = "stop";
                 stop_decode = true;
                 break;
@@ -8549,13 +9550,25 @@ static void generate_job(server *s, server_slot *slot, job *j) {
             size_t piece_len = 0;
             char *piece = q36_token_text(s->engine, token, &piece_len);
             completion++;
+            kept++;
             q36_tokens_push(&generated_tokens, token);
 
             trace_piece(s, trace_id, piece, piece_len);
             buf_append(&text, piece, piece_len);
-            thinking_state_feed(&thinking, piece, piece_len);
+            bool was_thinking = thinking.inside;
+            if (!qwen_tool_decode_state_is_tool(qwen_tool_tracker.decode))
+                thinking_state_feed(&thinking, piece, piece_len);
             if (j->req.kind == REQ_CHAT && j->req.has_tools) {
-                qwen_tool_decode_tracker_update(&qwen_tool_tracker, text.ptr, text.len);
+                if (thinking.inside) {
+                    qwen_tool_decode_tracker_init(&qwen_tool_tracker);
+                    qwen_tool_tracker.pos = text.len;
+                } else {
+                    if (was_thinking) {
+                        const char *end = find_tool_structural_text(text.ptr, "</think>", true);
+                        qwen_tool_tracker.pos = end ? (size_t)(end + 8 - text.ptr) : text.len;
+                    }
+                    qwen_tool_decode_tracker_update(&qwen_tool_tracker, text.ptr, text.len);
+                }
             }
 
             size_t stop_pos = 0, stop_len = 0;
@@ -8607,6 +9620,17 @@ static void generate_job(server *s, server_slot *slot, job *j) {
             }
             free(piece);
 
+            if (hit_stop) {
+                (void)stop_len;
+                finish = "stop";
+                text.len = stop_pos;
+                text.ptr[text.len] = '\0';
+                q36_session_invalidate(slot->session);
+                text_stop = true;
+                stop_decode = true;
+                break;
+            }
+
             if (j->req.kind == REQ_CHAT && j->req.has_tools) {
                 if (thinking_gates_tool_markers && thinking.inside) {
                     if (complete_tool_call_inside_thinking(
@@ -8629,7 +9653,7 @@ static void generate_job(server *s, server_slot *slot, job *j) {
                     tool_scan_from = text.len;
                 } else {
                     if (tool_scan_waiting_for_think_close) {
-                        const char *think_end = find_last_substr(text.ptr, "</think>");
+                        const char *think_end = find_tool_structural_text(text.ptr, "</think>", true);
                         tool_scan_from = think_end ?
                             (size_t)((think_end + strlen("</think>")) - text.ptr) : text.len;
                         if (tool_scan_from > text.len) tool_scan_from = text.len;
@@ -8640,7 +9664,7 @@ static void generate_job(server *s, server_slot *slot, job *j) {
                     bool orphan_end = false;
                     bool old_start = saw_tool_start;
                     bool old_end = saw_tool_end;
-                    observe_tool_markers(tool_scan, &saw_tool_start, &saw_tool_end, &orphan_end);
+                    observe_tool_markers(&qwen_tool_tracker, tool_scan, &saw_tool_start, &saw_tool_end, &orphan_end);
                     if (orphan_end && !saw_orphan_tool_end) {
                         saw_orphan_tool_end = true;
                         server_log(Q36_LOG_WARNING,
@@ -8680,16 +9704,23 @@ static void generate_job(server *s, server_slot *slot, job *j) {
                 next_decode_log += 50;
             }
 
-            if (hit_stop) {
-                (void)stop_len;
-                finish = "stop";
-                text.len = stop_pos;
-                text.ptr[text.len] = '\0';
-                q36_session_invalidate(slot->session);
-                stop_decode = true;
-                break;
-            }
 
+
+            bool next_greedy = qwen_tool_decode_state_is_tool(qwen_tool_tracker.decode) &&
+                !qwen_tool_decode_state_uses_payload_sampling(qwen_tool_tracker.decode);
+            if (ti + 1 < ntok && payload_temperature > 0.0f &&
+                next_greedy != greedy_tool_syntax) break;
+        }
+        if (kept < ntok && !text_stop && strcmp(finish, "error")) {
+            pthread_mutex_lock(&s->inference_mu);
+            q36_session_rewind(slot->session, block_start + kept);
+            bool ok = q36_session_pos(slot->session) == block_start + kept;
+            pthread_mutex_unlock(&s->inference_mu);
+            if (!ok) {
+                finish = "error";
+                snprintf(err, sizeof(err), "failed to restore speculative boundary");
+                stop_decode = true;
+            }
         }
         if (stop_decode) break;
     }
@@ -8700,15 +9731,9 @@ static void generate_job(server *s, server_slot *slot, job *j) {
         snprintf(err, sizeof(err), "shutdown requested");
     }
 
-    if (j->req.kind == REQ_CHAT && j->req.has_tools &&
-        saw_tool_start && !saw_tool_end && strcmp(finish, "error") != 0)
-    {
-        /* A partial streamed tool call cannot be retracted.  If the model ends
-         * before closing the QWEN_TOOL block, fail the turn instead of letting clients
-         * execute an incomplete `{}` or partially parsed argument object. */
-        finish = "error";
-        snprintf(err, sizeof(err), "unterminated tool call");
-    }
+    if (saw_tool_start && !saw_tool_end && strcmp(finish, "error"))
+        trace_event(s, trace_id, "incomplete tool: finish=%s generated=%d limit=%d context_room=%d",
+                    finish, completion, j->req.max_tokens, room);
 
     if (completion > last_decode_log_completion) {
         log_decode_progress(j->req.kind, ctx_span, completion,
@@ -8757,6 +9782,10 @@ static void generate_job(server *s, server_slot *slot, job *j) {
         if (parsed_calls.len) {
             if (openai_live_chat) apply_openai_stream_tool_ids(&parsed_calls, &openai_live);
             assign_tool_call_ids(s, &parsed_calls, j->req.api);
+            /* Known tool IDs can replay Qwen's empty thinking prelude exactly,
+             * preserving recurrent and vision state without a full rebuild. */
+            parsed_calls.replay_empty_think = !s->disable_exact_tool_replay &&
+                !j->req.kat_coder && !q36_think_mode_enabled(j->req.think_mode);
             tool_memory_remember(s, &parsed_calls);
             final_finish = "tool_calls";
         }
@@ -8777,6 +9806,8 @@ static void generate_job(server *s, server_slot *slot, job *j) {
         canonicalize_thinking_checkpoint(s, slot, j, ctx_span, trace_id,
                                          parsed_content ? parsed_content : "");
     }
+
+    slot_remember_vision_tools(s, slot, &j->req, &parsed_calls);
 
     if (j->req.stream) {
         bool response_ok = true;
@@ -8906,6 +9937,7 @@ static int job_slot_score_values(bool busy, bool assigned,
 static int job_slot_score(server_slot *slot, const job *j) {
     if (!slot || !j) return INT_MIN;
     if (slot->busy || slot->assigned) return INT_MIN;
+    if (slot_pending_matches(slot, &j->req)) return INT_MAX;
     return job_slot_score_values(
             false, false,
             q36_session_common_prefix(slot->session, &j->req.prompt),
@@ -9137,6 +10169,7 @@ static void append_model_json_profile(buf *b, int ctx, int default_tokens,
             "\"top_p\","
             "\"top_k\","
             "\"min_p\","
+            "\"ignore_eos\","
             "\"presence_penalty\","
             "\"frequency_penalty\","
             "\"stop\","
@@ -9413,10 +10446,13 @@ static void server_close_resources(server *s) {
         fclose(s->trace);
         s->trace = NULL;
     }
+    server_image_cache_clear(&s->image_cache);
     kv_cache_close(&s->kv);
     tool_memory_free(&s->tool_mem);
-    for (int i = 0; i < s->slot_count; i++)
+    for (int i = 0; i < s->slot_count; i++) {
+        slot_pending_clear(&s->slots[i]);
         q36_session_free(s->slots[i].session);
+    }
     free(s->slot_threads);
     free(s->slots);
     pthread_mutex_destroy(&s->tool_mu);
@@ -9483,6 +10519,8 @@ static void usage(FILE *fp) {
         "      Select Metal on Apple Silicon, Vulkan on Linux, or CPU.\n"
         "\n"
         "HTTP API:\n"
+        "  --vision FILE\n"
+        "      Accept PNG/JPEG images using a disk-streamed Vulkan vision sidecar.\n"
         "  --host HOST\n"
         "      Bind address. Default: 127.0.0.1\n"
         "  --port N\n"
@@ -9497,6 +10535,7 @@ static void usage(FILE *fp) {
         "      Add Access-Control-Allow-* headers and answer browser preflight requests.\n"
         "\n"
         "Thinking and sampling:\n"
+        "  ignore_eos=true requires explicit temperature=0; stop strings and context limits still apply.\n"
         "  Chat requests default to thinking mode with high effort.\n"
         "  Only reasoning_effort=max or output_config.effort=max requests Think Max.\n"
         "  Think Max requires --ctx >= 98304; smaller contexts use high.\n"
@@ -9592,6 +10631,8 @@ static server_config parse_options(int argc, char **argv) {
             exit(0);
         } else if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--vision")) {
+            c.engine.vision_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
             c.engine.mtp_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-draft")) {
@@ -9751,6 +10792,8 @@ int main(int argc, char **argv) {
     }
 
     q36_engine *engine = NULL;
+    cfg.engine.context_size = cfg.ctx_size;
+    cfg.engine.session_count = cfg.batched_sessions > 0 ? cfg.batched_sessions : 1;
     if (q36_engine_open(&engine, &cfg.engine) != 0) return 1;
 
     const int slot_count = cfg.batched_sessions > 0 ? cfg.batched_sessions : 1;
@@ -10697,6 +11740,8 @@ static void test_explicit_sampling_wins_in_thinking_mode(void) {
 
 static void test_reasoning_effort_mapping(void) {
     q36_think_mode mode = Q36_THINK_NONE;
+    TEST_ASSERT(parse_reasoning_effort_name("none", &mode) && mode == Q36_THINK_NONE);
+    TEST_ASSERT(think_mode_from_enabled(true, mode) == Q36_THINK_NONE);
     TEST_ASSERT(parse_reasoning_effort_name("low", &mode) && mode == Q36_THINK_HIGH);
     TEST_ASSERT(parse_reasoning_effort_name("medium", &mode) && mode == Q36_THINK_HIGH);
     TEST_ASSERT(parse_reasoning_effort_name("high", &mode) && mode == Q36_THINK_HIGH);
@@ -10727,6 +11772,9 @@ static void test_api_thinking_controls_parse(void) {
     mode = Q36_THINK_HIGH;
     TEST_ASSERT(parse_reasoning_effort_value(&openai_effort, &mode));
     TEST_ASSERT(mode == Q36_THINK_HIGH);
+    const char *responses_effort = "{\"effort\":\"none\"}";
+    TEST_ASSERT(parse_responses_reasoning(&responses_effort, &mode));
+    TEST_ASSERT(mode == Q36_THINK_NONE);
 }
 
 static void test_render_think_max_prompt_prefix(void) {
@@ -11249,6 +12297,50 @@ static void test_tool_memory_replays_sampled_qwen_tool(void) {
     pthread_mutex_destroy(&s.tool_mu);
 }
 
+static void test_tool_memory_preserves_empty_think_per_id(void) {
+    const char *generated =
+        "<tool_call>\n<function=bash>\n<parameter=command>pwd</parameter>\n"
+        "</function>\n</tool_call>";
+    server s = {0};
+    pthread_mutex_init(&s.tool_mu, NULL);
+    tool_calls sampled = {0};
+    char *content = NULL, *reasoning = NULL;
+    TEST_ASSERT(parse_generated_message(generated, &content, &reasoning, &sampled));
+    TEST_ASSERT(sampled.len == 1);
+    for (int i = 0; i < 2; i++) {
+        free(sampled.v[0].id);
+        sampled.v[0].id = xstrdup(i ? "call_thinking" : "call_empty");
+        sampled.replay_empty_think = i == 0;
+        tool_memory_remember(&s, &sampled);
+    }
+    /* Identical tool text shares a block, but each ID retains its own prelude. */
+    const char *ids[] = {"call_empty", "call_thinking", "call_unknown"};
+    for (int i = 0; i < 3; i++) {
+        chat_msgs msgs = {0};
+        chat_msg assistant = {.role = xstrdup("assistant")};
+        tool_call call = {.id = xstrdup(ids[i]), .name = xstrdup("bash"),
+                          .arguments = xstrdup("{\"command\":\"pwd\"}")};
+        tool_calls_push(&assistant.calls, call);
+        chat_msgs_push(&msgs, assistant);
+        tool_memory_attach_to_messages(&s, &msgs, NULL);
+        TEST_ASSERT(msgs.v[0].calls.replay_empty_think == (i == 0));
+        char *prompt = render_chat_prompt_text(&msgs, NULL, NULL, Q36_THINK_HIGH);
+        const char *start = strstr(prompt, "<|im_start|>assistant\n");
+        TEST_ASSERT(start != NULL);
+        if (start) {
+            start += strlen("<|im_start|>assistant\n");
+            TEST_ASSERT((strncmp(start, "<think>\n\n</think>\n\n", 19) == 0) == (i == 0));
+        }
+        free(prompt);
+        chat_msgs_free(&msgs);
+    }
+    free(content);
+    free(reasoning);
+    tool_calls_free(&sampled);
+    tool_memory_free(&s.tool_mem);
+    pthread_mutex_destroy(&s.tool_mu);
+}
+
 static void test_exact_tool_replay_can_be_disabled(void) {
     const char *tool_text =
         "\n\n<tool_call>\n"
@@ -11757,35 +12849,25 @@ static void test_thinking_checkpoint_canonicalization_gate(void) {
     TEST_ASSERT(!should_canonicalize_thinking_checkpoint(&r, &st, "stop"));
     r.has_tools = false;
     r.think_mode = Q36_THINK_NONE;
-    TEST_ASSERT(!should_canonicalize_thinking_checkpoint(&r, &st, "stop"));
+    TEST_ASSERT(should_canonicalize_thinking_checkpoint(&r, &st, "stop"));
+    TEST_ASSERT(!should_canonicalize_thinking_checkpoint(&r, &st, "length"));
 
     request_free(&r);
 }
 
 static void test_tool_marker_state_ignores_orphan_end(void) {
-    bool saw_start = false;
-    bool saw_end = false;
-    bool orphan_end = false;
-
-    observe_tool_markers("reasoning\n" Q36_PARAM_END "\n" Q36_INVOKE_END "\n" Q36_TOOL_CALLS_END,
-                         &saw_start, &saw_end, &orphan_end);
-    TEST_ASSERT(!saw_start);
-    TEST_ASSERT(!saw_end);
-    TEST_ASSERT(orphan_end);
-
-    orphan_end = false;
-    observe_tool_markers(Q36_TOOL_CALLS_START "\n" Q36_INVOKE_START "bash>",
-                         &saw_start, &saw_end, &orphan_end);
-    TEST_ASSERT(saw_start);
-    TEST_ASSERT(!saw_end);
-    TEST_ASSERT(!orphan_end);
-
-    observe_tool_markers(Q36_INVOKE_END "\n" Q36_TOOL_CALLS_END,
-                         &saw_start, &saw_end, &orphan_end);
-    TEST_ASSERT(saw_start);
-    TEST_ASSERT(saw_end);
+    bool start = false, end = false, orphan = false;
+    qwen_tool_decode_tracker tracker;
+    qwen_tool_decode_tracker_init(&tracker);
+    observe_tool_markers(&tracker, "reasoning </tool_call>", &start, &end, &orphan);
+    TEST_ASSERT(!start && !end && orphan);
+    const char *raw = "<tool_call><function=bash></function></tool_call>";
+    for (size_t n = 1; n <= strlen(raw); n++)
+        qwen_tool_decode_tracker_update(&tracker, raw, n);
+    orphan = false;
+    observe_tool_markers(&tracker, raw, &start, &end, &orphan);
+    TEST_ASSERT(start && end && !orphan);
 }
-
 static void test_canonical_rewrite_rebuilds_when_live_tail_changes(void) {
     /* Regression for the first canonical-KV rewrite attempt: replacing a small
      * live suffix looks tempting because the raw SWA ring may still contain the
@@ -12769,6 +13851,19 @@ static void test_responses_input_parses_qwen_tool_continuation(void) {
     TEST_ASSERT(msgs.len > 2 && !strcmp(msgs.v[2].tool_call_id, "call_1"));
     TEST_ASSERT(msgs.len > 2 && !strcmp(msgs.v[2].content, "contents"));
     chat_msgs_free(&msgs);
+
+    p = "[{\"role\":\"assistant\",\"content\":\"Reading both files.\"},"
+        "{\"type\":\"function_call\",\"call_id\":\"call_a\",\"name\":\"read\",\"arguments\":\"{}\"},"
+        "{\"type\":\"function_call\",\"call_id\":\"call_b\",\"name\":\"read\",\"arguments\":\"{}\"},"
+        "{\"type\":\"function_call_output\",\"call_id\":\"call_a\",\"output\":\"a\"},"
+        "{\"type\":\"function_call_output\",\"call_id\":\"call_b\",\"output\":\"b\"}]";
+    TEST_ASSERT(parse_responses_input(&p, &msgs));
+    TEST_ASSERT(msgs.len == 3);
+    TEST_ASSERT(msgs.v[0].calls.len == 2);
+    TEST_ASSERT(!strcmp(msgs.v[0].content, "Reading both files."));
+    TEST_ASSERT(!strcmp(msgs.v[0].calls.v[0].id, "call_a"));
+    TEST_ASSERT(!strcmp(msgs.v[0].calls.v[1].id, "call_b"));
+    chat_msgs_free(&msgs);
 }
 
 static void test_responses_output_is_protocol_native(void) {
@@ -12820,6 +13915,53 @@ static void test_responses_stream_uses_responses_events(void) {
     TEST_ASSERT(strstr(out, "event: response.completed") != NULL);
     TEST_ASSERT(strstr(out, "chat.completion") == NULL);
     free(out);
+    request_free(&r);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+static void test_responses_stream_item_lifecycle(void) {
+    int sv[2] = {-1, -1};
+    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    if (sv[0] < 0 || sv[1] < 0) return;
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    tool_calls calls = {0};
+    for (int i = 0; i < 2; i++) {
+        tool_call call = {.id = xstrdup(i ? "call_second" : "call_first"),
+                          .name = xstrdup("read"),
+                          .arguments = xstrdup("{\"path\":\"text.png\"}")};
+        tool_calls_push(&calls, call);
+    }
+    TEST_ASSERT(responses_sse_finish(sv[0], &r, "resp_items", "hello", "why",
+                                     &calls, "tool_calls", 4, 1));
+    shutdown(sv[0], SHUT_WR);
+    char *out = read_socket_text(sv[1]);
+    const char *cursor = out;
+    for (int i = 0; i < 4; i++) {
+        const char *added = strstr(cursor, "event: response.output_item.added\n");
+        TEST_ASSERT(added != NULL);
+        if (!added) break;
+        const char *done = strstr(added, "event: response.output_item.done\n");
+        TEST_ASSERT(done != NULL);
+        if (!done) break;
+        const char *payload = strstr(added, i < 2 ? "text.delta\"" : "arguments.done\"");
+        TEST_ASSERT(payload && payload < done);
+        char index[40];
+        snprintf(index, sizeof(index), "\"output_index\":%d,", i);
+        const char *position = strstr(added, index);
+        TEST_ASSERT(position && position < done);
+        cursor = done + 1;
+    }
+    TEST_ASSERT(strstr(cursor, "event: response.completed\n") != NULL);
+    TEST_ASSERT(strstr(out, "\"call_id\":\"call_first\"") != NULL);
+    TEST_ASSERT(strstr(out, "\"call_id\":\"call_second\"") != NULL);
+    for (const char *p = out; (p = strstr(p, "\ndata: ")); ) {
+        p += 7;
+        TEST_ASSERT(json_skip_value(&p));
+    }
+    free(out);
+    tool_calls_free(&calls);
     request_free(&r);
     close(sv[0]);
     close(sv[1]);
@@ -12935,7 +14077,229 @@ static void test_batched_decode_cancellation(void) {
     pthread_cond_destroy(&s.model_cv);
 }
 
+static const char test_inline_png_base64[] =
+    "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAAFUlEQVR4nGP8z8DQwMDAwMAEIkAYABglAYOd/VRoAAAAAElFTkSuQmCC";
+
+static void test_openai_inline_image_content(void) {
+    buf json = {0};
+    buf_puts(&json,
+        "[{\"role\":\"user\",\"content\":[{\"type\":\"input_text\","
+        "\"text\":\"describe \"},{\"type\":\"image_url\","
+        "\"image_url\":{\"url\":\"data:image/png;base64,");
+    buf_puts(&json, test_inline_png_base64);
+    buf_puts(&json, "\"}},{\"type\":\"text\",\"text\":\" please\"}]}]");
+    const char *p = json.ptr;
+    chat_msgs msgs = {0};
+    TEST_ASSERT(parse_messages(&p, &msgs));
+    TEST_ASSERT(msgs.len == 1);
+    TEST_ASSERT(msgs.v[0].images.len == 1);
+    TEST_ASSERT(strstr(msgs.v[0].content, "describe ") == msgs.v[0].content);
+    TEST_ASSERT(strstr(msgs.v[0].content, " please") != NULL);
+    TEST_ASSERT(msgs.v[0].images.v[0].encoded_len >= 8);
+    TEST_ASSERT(!memcmp(msgs.v[0].images.v[0].encoded, "\x89PNG\r\n\x1a\n", 8));
+    chat_msgs_free(&msgs);
+    buf_free(&json);
+}
+
+static void test_http_image_paths_and_urls_are_rejected(void) {
+    const char *cases[] = {
+        "[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\","
+        "\"image_url\":{\"url\":\"https://example.com/a.png\"}}]}]",
+        "[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\","
+        "\"image_url\":{\"url\":\"/tmp/a.png\"}}]}]",
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const char *p = cases[i];
+        chat_msgs msgs = {0};
+        TEST_ASSERT(!parse_messages(&p, &msgs));
+        chat_msgs_free(&msgs);
+    }
+}
+
+static void test_anthropic_inline_image_content(void) {
+    buf json = {0};
+    buf_puts(&json,
+        "[{\"role\":\"user\",\"content\":[{\"type\":\"image\","
+        "\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\","
+        "\"data\":\"");
+    buf_puts(&json, test_inline_png_base64);
+    buf_puts(&json, "\"}},{\"type\":\"text\",\"text\":\"describe\"}]}]");
+    const char *p = json.ptr;
+    chat_msgs msgs = {0};
+    TEST_ASSERT(parse_anthropic_messages(&p, &msgs));
+    TEST_ASSERT(msgs.len == 1);
+    TEST_ASSERT(msgs.v[0].images.len == 1);
+    TEST_ASSERT(strstr(msgs.v[0].content, "describe") != NULL);
+    chat_msgs_free(&msgs);
+    buf_free(&json);
+}
+
+static void test_responses_inline_image_content(void) {
+    buf json = {0};
+    buf_puts(&json, "[{\"type\":\"input_text\",\"text\":\"describe \"},"
+                   "{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,");
+    buf_puts(&json, test_inline_png_base64);
+    buf_puts(&json, "\"}]");
+    const char *p = json.ptr;
+    chat_msg msg = {0};
+    TEST_ASSERT(parse_openai_content(&p, &msg));
+    TEST_ASSERT(msg.images.len == 1);
+    TEST_ASSERT(strstr(msg.content, "describe ") == msg.content);
+    chat_msg_free(&msg);
+    buf_free(&json);
+}
+
+static void test_anthropic_tool_image_output(void) {
+    buf json = {0};
+    buf_puts(&json, "[{\"content\":[{\"type\":\"tool_result\","
+                    "\"tool_use_id\":\"tool_test\",\"content\":["
+                    "{\"type\":\"text\",\"text\":\"read image\"},"
+                    "{\"type\":\"image\",\"source\":{\"type\":\"base64\","
+                    "\"media_type\":\"image/png\",\"data\":\"");
+    buf_puts(&json, test_inline_png_base64);
+    buf_puts(&json, "\"}}]}],\"role\":\"user\"}]");
+    const char *p = json.ptr;
+    chat_msgs msgs = {0};
+    TEST_ASSERT(parse_anthropic_messages(&p, &msgs));
+    TEST_ASSERT(msgs.len == 1 && msgs.v[0].images.len == 1);
+    TEST_ASSERT(strstr(msgs.v[0].content, "<tool_response>\nread image") != NULL);
+    TEST_ASSERT(strstr(msgs.v[0].content, msgs.v[0].images.v[0].marker) != NULL);
+    chat_msgs_free(&msgs);
+    buf_free(&json);
+    const char *invalid[] = {
+        "[{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"content\":["
+        "{\"type\":\"tool_use\",\"name\":\"bash\",\"input\":{}}]}]}]",
+        "[{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"content\":["
+        "{\"type\":\"tool_result\",\"content\":\"nested\"}]}]}]",
+    };
+    for (size_t i = 0; i < 2; i++) {
+        p = invalid[i];
+        TEST_ASSERT(!parse_anthropic_messages(&p, &msgs));
+        chat_msgs_free(&msgs);
+    }
+}
+
+static void test_responses_tool_image_output(void) {
+    const char *types[] = {"function_call_output", "custom_tool_call_output", "reasoning"};
+    for (size_t i = 0; i < 3; i++) {
+        buf json = {0};
+        buf_puts(&json, "[{\"type\":\"");
+        buf_puts(&json, types[i]);
+        buf_puts(&json, "\",\"call_id\":\"call_test\",\"output\":["
+                       "{\"type\":\"input_text\",\"text\":\"read image\"},"
+                       "{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,");
+        buf_puts(&json, test_inline_png_base64);
+        buf_puts(&json, "\"}]}]");
+        const char *p = json.ptr;
+        chat_msgs msgs = {0};
+        bool ok = parse_responses_input(&p, &msgs);
+        TEST_ASSERT(ok == (i < 2));
+        if (ok) {
+            TEST_ASSERT(msgs.len == 1 && !strcmp(msgs.v[0].role, "tool"));
+            TEST_ASSERT(msgs.v[0].images.len == 1);
+            TEST_ASSERT(strstr(msgs.v[0].content, msgs.v[0].images.v[0].marker) != NULL);
+        }
+        chat_msgs_free(&msgs);
+        buf_free(&json);
+    }
+}
+
+static void test_tool_only_continuation_binding(void) {
+    const char *p = "[{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"call-secret\",\"content\":\"done\"}]}]";
+    chat_msgs msgs = {0};
+    TEST_ASSERT(parse_anthropic_messages(&p, &msgs));
+    request r = {.api = API_ANTHROPIC};
+    request_note_tool_continuation(&r, &msgs, "tools");
+    TEST_ASSERT(r.continuation_count == 1);
+    TEST_ASSERT(!strcmp(r.continuation_ids[0], "call-secret"));
+    char *ids[] = {"call-secret"};
+    server_slot slot = {.pending_ids = ids, .pending_count = 1,
+                        .pending_api = API_ANTHROPIC, .pending_tools = "tools"};
+    TEST_ASSERT(slot_pending_matches(&slot, &r));
+    slot.pending_pos = 1;
+    TEST_ASSERT(!slot_pending_matches(&slot, &r));
+    slot.pending_pos = 0;
+    slot.pending_tools = "different tools";
+    TEST_ASSERT(!slot_pending_matches(&slot, &r));
+    slot.pending_tools = "tools";
+    ids[0] = "other-call";
+    TEST_ASSERT(!slot_pending_matches(&slot, &r));
+    request_free(&r);
+    chat_msgs_free(&msgs);
+
+    p = "[{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"call-secret\",\"content\":\"done\"},\"new user instruction\"]}]";
+    TEST_ASSERT(parse_anthropic_messages(&p, &msgs));
+    r.api = API_ANTHROPIC;
+    request_note_tool_continuation(&r, &msgs, "tools");
+    TEST_ASSERT(r.continuation_count == 0);
+    request_free(&r);
+    chat_msgs_free(&msgs);
+
+    p = "[{\"role\":\"user\",\"content\":\"<tool_response>call-secret</tool_response>\"}]";
+    TEST_ASSERT(parse_anthropic_messages(&p, &msgs));
+    r.api = API_ANTHROPIC;
+    request_note_tool_continuation(&r, &msgs, "tools");
+    TEST_ASSERT(r.continuation_count == 0);
+    request_free(&r);
+    chat_msgs_free(&msgs);
+}
+
+static void test_server_image_embedding_cache(void) {
+    server_image_cache cache = {0};
+    uint8_t key = 1;
+    float data[2] = {1.25f, -2.5f};
+    server_image_input input = {.encoded = &key, .encoded_len = 1};
+    q36_vision_embedding src = {.data = data, .token_count = 1,
+                               .width = 42, .fingerprint = {7}};
+    q36_vision_embedding out = {0};
+    const size_t budget = 2 * (sizeof(data) + 1);
+    TEST_ASSERT(!server_image_cache_get(&cache, &input, &out));
+    server_image_cache_put(&cache, &input, &src, 2, budget);
+    TEST_ASSERT(server_image_cache_get(&cache, &input, &out));
+    TEST_ASSERT(out.data != data && !memcmp(out.data, data, sizeof(data)));
+    TEST_ASSERT(out.width == 42 && out.fingerprint[0] == 7);
+    out.data[0] = 99;
+    q36_vision_embedding_free(&out);
+    key = 2;
+    TEST_ASSERT(!server_image_cache_get(&cache, &input, &out));
+    server_image_cache_put(&cache, &input, &src, 2, budget);
+    key = 1;
+    TEST_ASSERT(server_image_cache_get(&cache, &input, &out));
+    TEST_ASSERT(out.data[0] == data[0]);
+    q36_vision_embedding_free(&out);
+    key = 3;
+    server_image_cache_put(&cache, &input, &src, 2, budget);
+    TEST_ASSERT(cache.bytes == budget);
+    key = 2;
+    TEST_ASSERT(!server_image_cache_get(&cache, &input, &out));
+    key = 1;
+    TEST_ASSERT(server_image_cache_get(&cache, &input, &out));
+    q36_vision_embedding_free(&out);
+    server_image_cache_clear(&cache);
+    TEST_ASSERT(cache.bytes == 0 && cache.clock == 0);
+    for (key = 1; key <= SERVER_IMAGE_CACHE_ENTRIES + 1; key++)
+        server_image_cache_put(&cache, &input, &src, 2, 4096);
+    TEST_ASSERT(cache.bytes == SERVER_IMAGE_CACHE_ENTRIES * (sizeof(data) + 1));
+    key = 1;
+    TEST_ASSERT(!server_image_cache_get(&cache, &input, &out));
+    server_image_cache_clear(&cache);
+    src.token_count = UINT32_MAX;
+    server_image_cache_put(&cache, &input, &src, UINT32_MAX, SIZE_MAX);
+    TEST_ASSERT(cache.bytes == 0);
+    src.token_count = 1;
+    server_image_cache_put(&cache, &input, &src, 2, sizeof(data));
+    TEST_ASSERT(cache.bytes == 0);
+}
+
 static void q36_server_unit_tests_run(void) {
+    test_openai_inline_image_content();
+    test_http_image_paths_and_urls_are_rejected();
+    test_anthropic_inline_image_content();
+    test_responses_inline_image_content();
+    test_anthropic_tool_image_output();
+    test_responses_tool_image_output();
+    test_server_image_embedding_cache();
+    test_tool_only_continuation_binding();
     test_batched_prefill_round_robin();
     test_batched_slot_scoring();
     test_batched_decode_cancellation();
@@ -12952,6 +14316,7 @@ static void q36_server_unit_tests_run(void) {
     test_responses_input_parses_qwen_tool_continuation();
     test_responses_output_is_protocol_native();
     test_responses_stream_uses_responses_events();
+    test_responses_stream_item_lifecycle();
     test_context_length_error_uses_protocol_standard_shape();
     test_cors_headers_are_opt_in();
     test_server_streaming_options();
@@ -12977,6 +14342,7 @@ static void q36_server_unit_tests_run(void) {
     test_tool_checkpoint_suffix_is_future_prompt_canonical();
     test_tool_checkpoint_minifies_json_parameters();
     test_tool_memory_replays_sampled_qwen_tool();
+    test_tool_memory_preserves_empty_think_per_id();
     test_exact_tool_replay_can_be_disabled();
     test_qwen_tool_decode_state_separates_structure_and_payload();
     test_tool_memory_max_ids_prunes_oldest();

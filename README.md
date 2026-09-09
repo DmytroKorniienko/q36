@@ -172,7 +172,15 @@ in RAM or VRAM, and streamed pages are released after each dispatch.
 At the interactive prompt, `/read photo.jpg` and `/read image.png` submit an
 image turn. JPEG and PNG decoding is built in. The sidecar output dimension is
 validated against the selected standard or dense language model before use.
-Vision prompt execution currently requires Vulkan.
+Vision prompt execution currently requires Vulkan. `q36-agent --vision FILE`
+exposes `view_image` for local files. `q36-server --vision FILE` accepts OpenAI
+image URLs containing PNG/JPEG data URIs, Responses image blocks, and Anthropic
+base64 images, including images returned by tools. Remote image URLs are rejected.
+The server caches at most 32 MiB of decoded image embeddings and encoded keys;
+the projector weights remain streamed from disk. Prefix reuse checks the image
+fingerprints and geometry, so replacing pixels with the same number of image
+pads rebuilds the context. Vision sessions currently cannot be saved as agent
+sessions or disk KV checkpoints.
 
 The 2 bit quants use a very asymmetrical quantization: only the routed MoE
 experts are quantized, up/gate at `IQ2_XXS`, down at `Q2_K`. They are the
@@ -295,9 +303,13 @@ comparing changes.
 ## Running Models Larger Than Available Memory
 
 Metal and Vulkan SSD streaming keep non-routed weights resident and load
-selected routed experts into a bounded backend cache. Without an explicit
-cache size, Q36 uses the GPU's recommended working set, subtracts non-routed
-weights, and targets 80% of the reported budget:
+selected routed experts into a bounded backend cache. The planner reserves memory
+for the configured context, prefill scratch, planned server sessions, and a staging
+margin before assigning the remaining model budget to static weights and experts.
+Explicit cache sizes are targets capped by the same budget. Creating a larger or
+additional session reduces the expert cache when necessary; it fails cleanly if
+static weights and the minimum working cache leave insufficient room. Startup
+logs show the resolved context and model budgets.
 
 ```sh
 ./q36 --metal --ssd-streaming -p "Explain radix trees."
@@ -306,7 +318,8 @@ weights, and targets 80% of the reported budget:
 ```
 
 `NGB` is a routed-expert byte budget. Q36 converts it to the number of expert
-slots that fit the release GGUF. A plain integer is an exact expert-slot count.
+slots that fit the release GGUF. A plain integer requests an expert-slot count;
+both forms are capped to leave room for the configured contexts.
 Non-routed weights, KV cache, activations, and graph scratch need additional
 memory. Startup prints the resolved slot count and actual cache allocation.
 
@@ -428,6 +441,21 @@ agent opens a private prompt with input hidden. Type the password there;
 Ctrl+C cancels the command. Password input is sent directly to the command,
 without entering chat history, traces, or captured tool output. Other command
 stdin reads receive EOF; `--non-interactive` cannot prompt for passwords.
+
+Use `/hints on` for occasional short explanations of programming concepts behind
+the current work, rendered as teal blockquotes. `/hints off` disables them. This
+setting lasts for the current process and is reapplied after context compaction.
+
+Both `q36` and `q36-agent` accept `--prefix-file FILE`. The file contains alternating
+`USER:` and `ASSISTANT:` lines, starting with a user and ending with an assistant.
+Turn content may span multiple lines. The CLI prefills this conversation before
+the first interactive prompt; the agent keeps it through reset and compaction.
+For example:
+
+```text
+USER: Our project uses C99 and has no external dependencies.
+ASSISTANT: I will follow those constraints.
+```
 
 Sessions are stored in `~/.q36/kvcache`. Use `/save` to persist the current
 session, `/list` to show saved sessions, and `/switch <sha>` to resume one.
@@ -1257,3 +1285,17 @@ a first answer:
 The QwarkStar logo is an AI-edited version of the DwarfStar logo.
 DwarfStar is designed by hand by Salvatore Sanfilippo, made more
 graphical with AI, and manually reworked by Ben Gnomino, whose human touch made it rock. As always, all credits go to Salvatore.
+
+## Extended evaluation and regression checks
+
+`q36-eval --suite hard-smoke` selects 12 harder cases; `--suite hard` selects all
+50. The original 92 cases remain the default `core` suite. Use `--list-cases`,
+`--validate-cases`, and `--source`, `--domain`, or `--case-id` to inspect or filter
+cases. `--retry-incomplete` retries answers that hit their output limit.
+[EVAL_DATA.md](EVAL_DATA.md) records sources and licenses.
+
+Server requests may set `ignore_eos: true` with an explicit `temperature: 0` for
+fixed-length greedy generation. Context limits, stop strings, and client stops
+still apply. Cache usage is reported in each API's usage fields.
+
+See [tests/REGRESSIONS.md](tests/REGRESSIONS.md) for serial model and client checks.

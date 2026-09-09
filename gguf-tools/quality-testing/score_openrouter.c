@@ -3,6 +3,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <math.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -333,35 +334,56 @@ static bool api_parse_pos(const char **pp, api_pos *pos) {
     }
 }
 
-static bool api_ref_load(const char *path, api_ref *ref) {
-    memset(ref, 0, sizeof(*ref));
-    if (!path || !path[0]) return false;
-    char *json = read_file(path);
-    const char *p = strstr(json, "\"logprobs\"");
-    if (p) p = strstr(p, "\"content\"");
-    if (p) p = strchr(p, '[');
-    if (!p) {
-        free(json);
-        return false;
+static const char *json_member(const char *p, const char *name) {
+    if (!p || *(p = json_ws(p)) != '{') return NULL;
+    p++;
+    while (*p) {
+        char key[64];
+        if (!json_key(&p, key, sizeof(key))) return NULL;
+        p = json_ws(p);
+        if (*p++ != ':') return NULL;
+        p = json_ws(p);
+        if (!strcmp(key, name)) return p;
+        const char *end = json_skip_value(p);
+        if (end == p) return NULL;
+        p = json_ws(end);
+        if (*p++ != ',') return NULL;
     }
+    return NULL;
+}
+
+static bool api_ref_parse(const char *json, api_ref *ref) {
+    memset(ref, 0, sizeof(*ref));
+    const char *p = json_member(json, "choices");
+    if (!p || *p != '[') return false;
+    p = json_member(json_ws(p + 1), "logprobs");
+    p = json_member(p, "content");
+    if (!p || *p != '[') return false;
     p++;
     while (1) {
         p = json_ws(p);
         if (*p == ']') {
-            free(json);
             return ref->n_pos > 0;
         }
         api_pos pos = {0};
-        if (!api_parse_pos(&p, &pos)) {
+        if (!api_parse_pos(&p, &pos) || !isfinite(pos.logprob)) {
             api_pos_free(&pos);
             api_ref_free(ref);
-            free(json);
             return false;
         }
         api_ref_add_pos(ref, &pos);
         p = json_ws(p);
         if (*p == ',') p++;
     }
+}
+
+static bool api_ref_load(const char *path, api_ref *ref) {
+    memset(ref, 0, sizeof(*ref));
+    if (!path || !path[0]) return false;
+    char *json = read_file(path);
+    bool ok = api_ref_parse(json, ref);
+    free(json);
+    return ok;
 }
 
 static int api_alt_token_id(q36_engine *engine, const api_alt *alt) {
@@ -393,14 +415,15 @@ static int api_alt_token_id(q36_engine *engine, const api_alt *alt) {
 static bool local_logits(q36_session *session, float *logits, int n_vocab,
                          double *logsum, int *argmax) {
     int got = 0;
-    const float *src = q36_session_logits(session, &got);
-    if (!src || got != n_vocab) return false;
-    memcpy(logits, src, (size_t)n_vocab * sizeof(logits[0]));
+    const float *frontier = q36_session_logits(session, &got);
+    if (!frontier || got != n_vocab) return false;
+    memcpy(logits, frontier, (size_t)n_vocab * sizeof(*logits));
     float max_logit = -INFINITY;
     int best = -1;
     for (int i = 0; i < n_vocab; i++) {
         const float v = logits[i];
-        if (isfinite(v) && (best < 0 || v > max_logit)) {
+        if (!isfinite(v)) return false;
+        if (best < 0 || v > max_logit) {
             max_logit = v;
             best = i;
         }
@@ -408,12 +431,31 @@ static bool local_logits(q36_session *session, float *logits, int n_vocab,
     if (best < 0) return false;
     double sum = 0.0;
     for (int i = 0; i < n_vocab; i++) {
-        const float v = logits[i];
-        if (isfinite(v)) sum += exp((double)v - (double)max_logit);
+        sum += exp((double)logits[i] - (double)max_logit);
     }
     *logsum = (double)max_logit + log(sum);
     *argmax = best;
     return true;
+}
+
+static bool dump_logits(const char *path, const char *case_id, int target,
+                        int greedy, const float *logits, int n_vocab) {
+    FILE *fp = fopen(path, "wb");
+    if (!fp) {
+        fprintf(stderr, "open %s: %s\n", path, strerror(errno));
+        return false;
+    }
+    bool ok = fprintf(fp,
+                      "# q36 first logits v1\n"
+                      "# case=%s target=%d greedy=%d vocab=%d\n"
+                      "token\tlogit\n",
+                      case_id, target, greedy, n_vocab) >= 0;
+    for (int i = 0; ok && i < n_vocab; i++) {
+        ok = fprintf(fp, "%d\t%a\n", i, (double)logits[i]) >= 0;
+    }
+    if (fclose(fp) != 0) ok = false;
+    if (!ok) fprintf(stderr, "write %s failed\n", path);
+    return ok;
 }
 
 static double local_logprob(const float *logits, int n_vocab, int token, double logsum) {
@@ -489,7 +531,10 @@ static void usage(const char *argv0) {
             "  --ssd-streaming\n"
             "  --ssd-streaming-cache-experts N|NGB\n"
             "  --ssd-streaming-cold\n"
-            "  --quality\n",
+            "  --quality\n"
+            "  --rendered-prompt\n"
+            "  --dump-first-logits PATH\n"
+            "  --max-cases N\n",
             argv0);
 }
 
@@ -503,6 +548,9 @@ int main(int argc, char **argv) {
     const char *manifest_path = argv[2];
     const char *out_path = argv[3];
     int ctx_size = 4096;
+    bool rendered_prompt = false;
+    const char *first_logits_path = NULL;
+    int max_cases = 0;
     int argi = 4;
     if (argi < argc && argv[argi][0] != '-') {
         ctx_size = atoi(argv[argi++]);
@@ -523,6 +571,17 @@ int main(int argc, char **argv) {
             opt.backend = Q36_BACKEND_VULKAN;
         } else if (!strcmp(a, "--cpu")) {
             opt.backend = Q36_BACKEND_CPU;
+        } else if (!strcmp(a, "--rendered-prompt")) {
+            rendered_prompt = true;
+        } else if (!strcmp(a, "--dump-first-logits")) {
+            if (argi == argc) die("--dump-first-logits requires an argument");
+            first_logits_path = argv[argi++];
+        } else if (!strcmp(a, "--max-cases")) {
+            if (argi == argc) die("--max-cases requires an argument");
+            char *end;
+            long n = strtol(argv[argi++], &end, 10);
+            if (*end || n <= 0 || n > INT_MAX) die("invalid --max-cases value");
+            max_cases = (int)n;
         } else if (!strcmp(a, "--quality")) {
             opt.quality = true;
         } else if (!strcmp(a, "--ssd-streaming")) {
@@ -546,6 +605,7 @@ int main(int argc, char **argv) {
     }
 
     q36_engine *engine = NULL;
+    opt.context_size = ctx_size;
     if (q36_engine_open(&engine, &opt) != 0) die("failed to open model");
     q36_session *session = NULL;
     if (q36_session_create(&session, engine, ctx_size) != 0) die("failed to create session");
@@ -586,6 +646,8 @@ int main(int argc, char **argv) {
         strip_newline(line);
         if (!line[0] || line[0] == '#') continue;
 
+        if (max_cases && case_n >= max_cases) break;
+
         char *id = strtok(line, "\t");
         char *prompt_path = strtok(NULL, "\t");
         char *cont_path = strtok(NULL, "\t");
@@ -601,7 +663,10 @@ int main(int argc, char **argv) {
 
         q36_tokens prompt = {0};
         q36_tokens target = {0};
-        q36_encode_chat_prompt(engine, NULL, prompt_text, Q36_THINK_NONE, &prompt);
+        if (rendered_prompt)
+            q36_tokenize_rendered_chat(engine, prompt_text, &prompt);
+        else
+            q36_encode_chat_prompt(engine, NULL, prompt_text, Q36_THINK_NONE, &prompt);
         q36_tokenize_text(engine, cont_text, &target);
 
         if (prompt.len + target.len + 1 >= ctx_size) {
@@ -635,9 +700,12 @@ int main(int argc, char **argv) {
             double logsum = 0.0;
             int greedy = -1;
             if (!local_logits(session, logits, n_vocab, &logsum, &greedy)) {
-                fprintf(stderr, "%s logits failed at target token %d\n", id, i);
+                fprintf(stderr, "%s logits copy failed or returned a non-finite value at target token %d\n", id, i);
                 return 1;
             }
+            if (first_logits_path && case_n == 0 && i == 0 &&
+                !dump_logits(first_logits_path, id, target.v[i], greedy, logits, n_vocab))
+                return 1;
             if (i == 0) first_match = (greedy == target.v[i]);
             if (still_matching && greedy == target.v[i]) lcp++;
             else still_matching = false;
