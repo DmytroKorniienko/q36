@@ -463,6 +463,9 @@ The session ID remains stable across later saves. `/del <sha>` removes a saved
 session. `/strip <sha>` keeps its transcript and title but removes the KV
 payload; switching to a stripped session rebuilds the KV cache by prefilling
 the saved text. `/compact` compacts the current context immediately.
+Exiting during generation stops the worker before asking whether to save.
+Sessions containing images cannot be saved yet; declining to exit after a save
+failure returns to the current chat.
 
 ## Benchmarking
 

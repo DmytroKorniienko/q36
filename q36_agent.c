@@ -160,6 +160,8 @@ typedef struct {
     bool stop;
     bool interrupt;
     bool initialized;
+    bool active;
+    bool paused;
     bool save_requested;
     bool compact_requested;
     bool power_requested;
@@ -4653,7 +4655,7 @@ static bool agent_request_password(agent_worker *w,
     w->password_answered = false;
     w->password_result = false;
     agent_wake_locked(w);
-    while (!w->stop && !w->password_answered)
+    while (!w->stop && !w->interrupt && !w->password_answered)
         pthread_cond_wait(&w->cond, &w->mu);
     bool ok = w->password_answered && w->password_result;
     w->password_pending = false;
@@ -4693,7 +4695,7 @@ static char *worker_request_queued_user_drain(agent_worker *w) {
     w->queued_user_drain_text = NULL;
     agent_wake_locked(w);
     pthread_cond_signal(&w->cond);
-    while (!w->stop && !w->queued_user_drain_answered)
+    while (!w->stop && !w->interrupt && !w->queued_user_drain_answered)
         pthread_cond_wait(&w->cond, &w->mu);
     char *text = w->queued_user_drain_text;
     w->queued_user_drain_text = NULL;
@@ -9433,7 +9435,6 @@ static void worker_set_greedy_sampling(agent_worker *w, bool greedy) {
 static int worker_run_turn(agent_worker *w, const char *user_text) {
     agent_config *cfg = w->cfg;
     pthread_mutex_lock(&w->mu);
-    w->interrupt = false;
     w->status.error[0] = '\0';
     agent_wake_locked(w);
     pthread_mutex_unlock(&w->mu);
@@ -9940,16 +9941,16 @@ static void worker_request_power(agent_worker *w, int power) {
 
 static bool worker_take_save_requested(agent_worker *w) {
     pthread_mutex_lock(&w->mu);
-    bool requested = w->save_requested;
-    w->save_requested = false;
+    bool requested = w->save_requested && !w->paused;
+    if (requested) w->save_requested = false;
     pthread_mutex_unlock(&w->mu);
     return requested;
 }
 
 static bool worker_take_compact_requested(agent_worker *w) {
     pthread_mutex_lock(&w->mu);
-    bool requested = w->compact_requested;
-    w->compact_requested = false;
+    bool requested = w->compact_requested && !w->paused;
+    if (requested) w->compact_requested = false;
     pthread_mutex_unlock(&w->mu);
     return requested;
 }
@@ -10021,6 +10022,23 @@ static void worker_run_deferred_compact(agent_worker *w) {
     }
 }
 
+/* Status can become IDLE before the worker finishes deferred operations.
+ * Publish ownership separately so the UI can safely save or switch sessions. */
+static bool worker_wait_for_work(agent_worker *w) {
+    pthread_mutex_lock(&w->mu);
+    w->active = false;
+    pthread_cond_broadcast(&w->cond);
+    agent_wake_locked(w);
+    while (!w->stop && !w->cmd_text &&
+           (w->paused || (!w->save_requested && !w->compact_requested &&
+                          !w->power_requested)))
+        pthread_cond_wait(&w->cond, &w->mu);
+    bool run = !w->stop;
+    w->active = run;
+    pthread_mutex_unlock(&w->mu);
+    return run;
+}
+
 /* Worker thread entry point.  The UI thread submits plain user text; this
  * thread owns all Q36 session mutation, tool execution, and compaction. */
 static void *worker_main(void *arg) {
@@ -10040,11 +10058,8 @@ static void *worker_main(void *arg) {
     agent_wake_locked(w);
     pthread_mutex_unlock(&w->mu);
 
-    while (true) {
+    while (worker_wait_for_work(w)) {
         pthread_mutex_lock(&w->mu);
-        while (!w->stop && !w->cmd_text && !w->save_requested &&
-               !w->compact_requested && !w->power_requested)
-            pthread_cond_wait(&w->cond, &w->mu);
         if (w->stop) {
             pthread_mutex_unlock(&w->mu);
             break;
@@ -10119,8 +10134,11 @@ static void drain_wake_fd(int fd) {
  * the UI can keep the typed text editable instead of silently queueing it. */
 static bool worker_submit(agent_worker *w, const char *text) {
     pthread_mutex_lock(&w->mu);
-    bool ok = w->initialized && w->status.state == AGENT_WORKER_IDLE && !w->cmd_text;
+    bool ok = w->initialized && !w->active && !w->paused &&
+        w->status.state == AGENT_WORKER_IDLE && !w->cmd_text &&
+        !w->save_requested && !w->compact_requested && !w->power_requested;
     if (ok) {
+        w->interrupt = false;
         w->cmd_text = xstrdup(text);
         /* A submitted turn is no longer idle, even if the worker thread has
          * not yet reached its real prefill accounting.  Non-interactive mode
@@ -10150,6 +10168,7 @@ static int worker_status_power_locked(agent_worker *w) {
 static void worker_interrupt(agent_worker *w) {
     pthread_mutex_lock(&w->mu);
     w->interrupt = true;
+    pthread_cond_broadcast(&w->cond);
     pthread_mutex_unlock(&w->mu);
 }
 
@@ -10157,7 +10176,27 @@ static void worker_interrupt(agent_worker *w) {
 static void worker_stop(agent_worker *w) {
     pthread_mutex_lock(&w->mu);
     w->stop = true;
-    pthread_cond_signal(&w->cond);
+    pthread_cond_broadcast(&w->cond);
+    pthread_mutex_unlock(&w->mu);
+}
+
+/* Finish an interrupted turn, including any accepted prompt, before asking
+ * about exit. Condition waits also release workers awaiting UI responses. */
+static void worker_pause(agent_worker *w) {
+    pthread_mutex_lock(&w->mu);
+    w->paused = true;
+    if (w->active || w->cmd_text) w->interrupt = true;
+    pthread_cond_broadcast(&w->cond);
+    while (w->active || w->cmd_text)
+        pthread_cond_wait(&w->cond, &w->mu);
+    w->interrupt = false;
+    pthread_mutex_unlock(&w->mu);
+}
+
+static void worker_resume(agent_worker *w) {
+    pthread_mutex_lock(&w->mu);
+    w->paused = false;
+    pthread_cond_broadcast(&w->cond);
     pthread_mutex_unlock(&w->mu);
 }
 
@@ -10191,7 +10230,9 @@ static void worker_get_status(agent_worker *w, agent_status *status) {
 
 static bool worker_is_idle(agent_worker *w) {
     pthread_mutex_lock(&w->mu);
-    bool idle = w->initialized &&
+    bool idle = w->initialized && !w->active && !w->cmd_text &&
+        (w->paused || (!w->save_requested && !w->compact_requested &&
+                       !w->power_requested)) &&
         (w->status.state == AGENT_WORKER_IDLE ||
          w->status.state == AGENT_WORKER_ERROR);
     pthread_mutex_unlock(&w->mu);
@@ -11475,6 +11516,7 @@ static int agent_worker_init(agent_worker *w, q36_engine *engine, agent_config *
     pthread_mutex_init(&w->mu, NULL);
     pthread_cond_init(&w->cond, NULL);
     w->status.state = AGENT_WORKER_IDLE;
+    w->active = true;
     if (pipe(w->wake_fd) != 0) return -1;
     int old_flags;
     set_nonblock(w->wake_fd[0], true, &old_flags);
@@ -11728,13 +11770,15 @@ typedef enum {
  * restored, declining the save can terminate immediately and let the OS reclaim
  * model/runtime resources instead of waiting for orderly teardown. */
 static agent_exit_save_result agent_maybe_save_before_exiting(agent_worker *w) {
+    worker_pause(w);
     if (!agent_worker_needs_save(w)) return AGENT_EXIT_CLEAN;
     if (!agent_prompt_yes_no("Save current session? (y/n) ")) return AGENT_EXIT_NOW;
     char err[160] = {0};
     if (agent_worker_save_session(w, err, sizeof(err))) return AGENT_EXIT_CLEAN;
     printf("save failed: %s\n", err);
-    return agent_prompt_yes_no("Continue anyway? (y/n) ") ?
-        AGENT_EXIT_NOW : AGENT_EXIT_CANCEL;
+    if (agent_prompt_yes_no("Continue anyway? (y/n) ")) return AGENT_EXIT_NOW;
+    worker_resume(w);
+    return AGENT_EXIT_CANCEL;
 }
 
 /* ============================================================================
@@ -11967,6 +12011,7 @@ static int run_agent(q36_engine *engine, agent_config *cfg) {
     bool show_welcome_after_restart = false;
     bool force_status_redraw_after_restart = false;
     char *restore_line = NULL;
+resume_editor:
     while (running) {
         /* If a bash child process changed the terminal mode (e.g., from raw
          * to cooked), restore raw mode so linenoise continues to work. */
@@ -12249,10 +12294,6 @@ static int run_agent(q36_engine *engine, agent_config *cfg) {
                     } else if (exit_save == AGENT_EXIT_CLEAN) {
                         exit_save_handled = true;
                         running = false;
-                    } else {
-                        /* AGENT_EXIT_CANCEL: user declined to proceed after a
-                         * save failure.  Reopen the editor and continue. */
-                        editor_start(&editor, prompt, statusline, NULL);
                     }
                 } else if (!strcmp(cmd, "/new")) {
                     editor_restore_terminal_layout(&editor);
@@ -12375,18 +12416,23 @@ static int run_agent(q36_engine *engine, agent_config *cfg) {
         }
     }
 
-    free(initial_pending);
-    free(restore_line);
-    agent_prompt_queue_free(&queue);
     editor_stop(&editor);
     editor_restore_terminal_layout(&editor);
-    linenoiseSetCompletionCallback(NULL);
-    agent_completion_worker = NULL;
     if (!exit_save_handled) {
         agent_exit_save_result exit_save =
             agent_maybe_save_before_exiting(&worker);
         if (exit_save == AGENT_EXIT_NOW) exit(0);
+        if (exit_save == AGENT_EXIT_CANCEL) {
+            running = true;
+            editor_start(&editor, prompt, statusline, NULL);
+            goto resume_editor;
+        }
     }
+    free(initial_pending);
+    free(restore_line);
+    agent_prompt_queue_free(&queue);
+    linenoiseSetCompletionCallback(NULL);
+    agent_completion_worker = NULL;
     agent_worker_free(&worker);
     return 0;
 }
