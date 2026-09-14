@@ -7702,6 +7702,21 @@ static bool q36_forward_recurrent_vulkan(q36_session *s,
             return false;
         }
     }
+    bool front=false;
+#ifndef Q36_METAL
+    if (!e->quality && !e->ssd_streaming && n_tok==1u && rt->recur_conv_fused &&
+        Q36_N_SSM_STATE==128u && Q36_N_SSM_CONV==4u &&
+        l->ssm_alpha->type==Q36_TENSOR_Q8_0 && l->ssm_beta->type==Q36_TENSOR_Q8_0) {
+        const uint64_t offsets[5]={l->ssm_conv1d->abs_offset,l->ssm_alpha->abs_offset,
+            l->ssm_beta->abs_offset,l->ssm_dt->abs_offset,l->ssm_a->abs_offset};
+        front=q36_gpu_gdn_front_tensor(cache->conv,rt->recur_qkv,inp,
+            rt->recur_q,rt->recur_k,rt->recur_v,rt->recur_gb,
+            e->model.map,e->model.size,offsets,Q36_N_EMBD,Q36_N_SSM_GROUP,Q36_N_SSM_DT_RANK,
+            q36_tensor_scalar_or(&e->model,l->ssm_alpha_scale,1.0f),
+            q36_tensor_scalar_or(&e->model,l->ssm_beta_scale,1.0f),Q36_RMS_EPS)!=0;
+    }
+#endif
+    if (front) goto recurrent_update;
     {
         if (!rt->recur_conv_fused) {
             if (!q36_gpu_recurrent_conv_step_tensor(cache->conv, rt->recur_qkv,
@@ -7781,6 +7796,7 @@ static bool q36_forward_recurrent_vulkan(q36_session *s,
             l->ssm_a->abs_offset, Q36_N_SSM_DT_RANK, n_tok)) {
         return false;
     }
+recurrent_update:
     if (e->quality && !q36_gpu_tensor_all_finite(rt->recur_gb, n_tok * Q36_N_SSM_DT_RANK * 2u)) {
         fprintf(stderr, "q36: recurrent gate non-finite at layer=%u\n", il);
         return false;

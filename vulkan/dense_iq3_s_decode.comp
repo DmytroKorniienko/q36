@@ -60,6 +60,13 @@ vec4 unpack_i8(uint v) {
                 float(bitfieldExtract(int(v), 24, 8)));
 }
 
+#ifdef Q36_INT_DOT
+uint signed_grid(uint grid, uint signs) {
+    uint mask = (((signs & 15u) * 0x00204081u) & 0x01010101u) * 255u;
+    return (grid ^ mask) + (mask & 0x01010101u);
+}
+#endif
+
 void main(void) {
     uint lid = gl_LocalInvocationID.x;
     uint itid = lid & 7u;
@@ -72,8 +79,13 @@ void main(void) {
 
     for (uint b = lid >> 3u; b < pc.blocks; b += 8u) {
         uint qbase = b * Q8K_WORDS + 2u + 8u * itid;
+#ifdef Q36_INT_DOT
+        uint qv[8];
+        for (uint l = 0u; l < 8u; l++) qv[l] = q8[qbase + l];
+#else
         vec4 qv[8];
         for (uint l = 0u; l < 8u; l++) qv[l] = unpack_i8(q8[qbase + l]);
+#endif
         float yd = uintBitsToFloat(q8[b * Q8K_WORDS]);
 
         for (uint r = 0u; r < ROWS; r++) {
@@ -94,6 +106,12 @@ void main(void) {
                                       ((qh << (8u - 2u * l)) & 256u)];
                 uint grid1 = grid_lut[((qs >> 8u) & 255u) |
                                       ((qh << (7u - 2u * l)) & 256u)];
+#ifdef Q36_INT_DOT
+                /* These integer sums fit exactly in float32. Keep the
+                 * scale and outer accumulation identical to decode. */
+                sum += float(dotPacked4x8EXT(int(signed_grid(grid0, signs)), int(qv[2u*l])) +
+                             dotPacked4x8EXT(int(signed_grid(grid1, signs >> 4u)), int(qv[2u*l+1u])));
+#else
                 vec4 weight0 = unpack_i8(grid0) * vec4(
                     (signs & 1u) != 0u ? -1.0 : 1.0,
                     (signs & 2u) != 0u ? -1.0 : 1.0,
@@ -114,6 +132,7 @@ void main(void) {
                       fma(weight1.y, q1.y,
                       fma(weight1.z, q1.z,
                       fma(weight1.w, q1.w, sum))))))));
+#endif
             }
             uint sc = load_u8(base + 106u + (itid >> 1u));
             int ls = 2 * int((itid & 1u) == 0u ? sc & 15u : sc >> 4u) + 1;
