@@ -73,10 +73,6 @@ VULKAN_SHADERS := \
 	vulkan/delta_gates.spv \
 	vulkan/quantize_q8_0.spv \
 	vulkan/quantize_q8_k.spv \
-	vulkan/dense_iq3_s_dot.spv \
-	vulkan/dense_iq3_s_dot_full.spv \
-	vulkan/dense_iq3_s_dot_r4.spv \
-	vulkan/dense_iq3_s_dot_r1.spv \
 	vulkan/predequant_b16.spv \
 	vulkan/matmul_q8_0.spv \
 	vulkan/matmul_q8_0_q36.spv \
@@ -163,18 +159,6 @@ vulkan/recur_norm_gate.spv: vulkan/recur_norm_gate.comp
 
 vulkan/recur_norm_gate_q8_k.spv: vulkan/recur_norm_gate_q8_k.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
-
-vulkan/dense_iq3_s_dot.spv: vulkan/dense_iq3_s_decode.comp
-	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_INT_DOT=1 -o $@ $<
-
-vulkan/dense_iq3_s_dot_full.spv: vulkan/dense_iq3_s_decode.comp
-	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_INT_DOT=1 -DQ36_BOUNDS=0 -o $@ $<
-
-vulkan/dense_iq3_s_dot_r4.spv: vulkan/dense_iq3_s_decode.comp
-	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_INT_DOT=1 -DQ36_ROWS=4 -DQ36_BOUNDS=0 -o $@ $<
-
-vulkan/dense_iq3_s_dot_r1.spv: vulkan/dense_iq3_s_decode.comp
-	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_INT_DOT=1 -DQ36_ROWS=1 -DQ36_BOUNDS=0 -o $@ $<
 
 vulkan/swiglu_q8_k.spv: vulkan/swiglu_q8_k.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<

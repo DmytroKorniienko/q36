@@ -88,7 +88,6 @@ typedef struct q36_vk_weight {
     struct q36_vk_weight *next;
 } q36_vk_weight;
 
-static q36_vk_kernel q36_iq3_dot[4];
 static q36_vk_kernel q36_gdn_front;
 
 typedef struct q36_vk_packed_weight {
@@ -2806,10 +2805,6 @@ int q36_gpu_init(void) {
      * the open batch. */
     q36_vk.matmul_f16 = Q36_VK_KERNEL("vulkan/matmul_f16.spv", 3, 16, 1u << 2);
     q36_gdn_front = Q36_VK_KERNEL("vulkan/gdn_front.spv", 12, 24, 1u | (15u << 8));
-    q36_iq3_dot[0] = Q36_VK_KERNEL("vulkan/dense_iq3_s_dot.spv", 4, 16, 4);
-    q36_iq3_dot[1] = Q36_VK_KERNEL("vulkan/dense_iq3_s_dot_full.spv", 4, 16, 4);
-    q36_iq3_dot[2] = Q36_VK_KERNEL("vulkan/dense_iq3_s_dot_r4.spv", 4, 16, 4);
-    q36_iq3_dot[3] = Q36_VK_KERNEL("vulkan/dense_iq3_s_dot_r1.spv", 4, 16, 4);
     q36_vk.vision_matmul_f16 = Q36_VK_KERNEL("vulkan/vision_matmul_f16.spv", 3, 16, 1u << 2);
     q36_vk.vision_attention = Q36_VK_KERNEL("vulkan/vision_attention.spv", 2, 4, 1u << 1);
     q36_vk.matmul_f32 = Q36_VK_KERNEL("vulkan/matmul_f32.spv", 3, 16, 1u << 2);
@@ -3283,7 +3278,6 @@ void q36_gpu_cleanup(void) {
     q36_vk_kernel_destroy(&q36_vk.ffn_tail);
     q36_vk_kernel_destroy(&q36_vk.top2);
     q36_vk_kernel_destroy(&q36_gdn_front);
-    for (unsigned i = 0; i < 4; i++) q36_vk_kernel_destroy(&q36_iq3_dot[i]);
     q36_vk_kernel_destroy(&q36_vk.recur_norm_gate);
     q36_vk_kernel_destroy(&q36_vk.recur_norm_gate_q8_k);
     q36_vk_kernel_destroy(&q36_vk.moe_reduce);
@@ -3718,10 +3712,6 @@ static void q36_vk_prepare_dense_kernels(void) {
     pthread_mutex_lock(&q36_vk_mu);
     for (uint32_t i = 0; i < sizeof(kernels) / sizeof(kernels[0]); i++) {
         if (!q36_vk_kernel_init(kernels[i])) break;
-    }
-    if (q36_vk.have_int_dot) {
-        for (unsigned i = 0; i < 4; i++)
-            if (!q36_vk_kernel_init(&q36_iq3_dot[i])) break;
     }
     pthread_mutex_unlock(&q36_vk_mu);
 }
@@ -7771,9 +7761,6 @@ int q36_gpu_matmul_iq_quant_q8_scaled_tensor(q36_gpu_tensor *out,
                      rows4 ? &q36_vk.dense_iq3_s_decode_r4 :
                      full_rows5 ? &q36_vk.dense_iq3_s_decode_full :
                                   &q36_vk.dense_iq3_s_decode);
-                if (q36_gpu_dense_model && weight_type == Q36_VK_TENSOR_IQ3_S &&
-                    q36_vk_env_default_on("Q36_VK_IQ3S_DOT"))
-                    kernel = &q36_iq3_dot[rows1 ? 3 : rows4 ? 2 : full_rows5 ? 1 : 0];
                 const char *op = q36_vk_prof_iq3_shape(
                     weight_type, (uint32_t)n_tok, (uint32_t)in_dim,
                     (uint32_t)out_dim,
