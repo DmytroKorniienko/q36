@@ -2916,6 +2916,82 @@ static void test_vulkan_kquant_matvec(void) {
 #endif
 }
 
+static void test_vulkan_iq3_xxs_tiles(void) {
+#if defined(Q36_NO_GPU) || defined(Q36_METAL)
+    test_skip("vulkan-iq3-xxs-tiles", "Vulkan-only test");
+#else
+    /* Cross both tile edges with an odd number of 98-byte weight blocks.
+     * Splitting the prompt selects the existing 32-row kernel as the oracle. */
+    enum { in_dim = 768, out_dim = 67, tokens = 131, row_bytes = 3 * 98 };
+    const size_t x_bytes = (size_t)tokens * in_dim * sizeof(float);
+    const size_t y_bytes = (size_t)tokens * out_dim * sizeof(float);
+    const size_t weight_bytes = (size_t)test_round_up_u64(
+        (uint64_t)out_dim * row_bytes, (uint64_t)getpagesize());
+    uint8_t *weights = NULL;
+    float *input = malloc(x_bytes), *got = malloc(y_bytes), *want = malloc(y_bytes);
+    q36_gpu_tensor *x = NULL, *out = NULL, *ref = NULL;
+    TEST_ASSERT(posix_memalign((void **)&weights, (size_t)getpagesize(), weight_bytes) == 0);
+    TEST_ASSERT(weights && input && got && want);
+    if (!weights || !input || !got || !want) goto cleanup;
+    memset(weights, 0, weight_bytes);
+    for (uint32_t row = 0; row < out_dim; row++) {
+        for (uint32_t block = 0; block < 3; block++) {
+            uint8_t *p = weights + row * row_bytes + block * 98;
+            uint16_t d = test_float_to_f16(0.0001f * (float)(1 + row % 7 + block));
+            memcpy(p, &d, sizeof(d));
+            for (uint32_t i = 2; i < 98; i++)
+                p[i] = (uint8_t)(row * 29u + block * 71u + i * 13u);
+        }
+    }
+    for (uint32_t i = 0; i < tokens * in_dim; i++)
+        input[i] = sinf((float)i * 0.031f) * (0.25f + (float)(i % 11) * 0.03125f);
+    TEST_ASSERT(q36_gpu_init() != 0);
+    q36_gpu_set_quality(false);
+    q36_gpu_set_dense_model(true);
+    x = q36_gpu_tensor_alloc(x_bytes);
+    out = q36_gpu_tensor_alloc(y_bytes);
+    ref = q36_gpu_tensor_alloc(y_bytes);
+    TEST_ASSERT(x && out && ref);
+    if (!x || !out || !ref) goto cleanup;
+    TEST_ASSERT(q36_gpu_set_model_map(weights, weight_bytes) != 0);
+    TEST_ASSERT(q36_gpu_tensor_write(x, 0, input, x_bytes) != 0);
+    TEST_ASSERT(q36_gpu_matmul_iq_quant_scaled_tensor(
+        out, weights, weight_bytes, 0, 18, in_dim, out_dim, x, tokens, 0.75f) != 0);
+    for (uint32_t first = 0; first < tokens; first += 128) {
+        uint32_t n = tokens - first < 128 ? tokens - first : 128;
+        q36_gpu_tensor *xv = q36_gpu_tensor_view(
+            x, (uint64_t)first * in_dim * sizeof(float), (uint64_t)n * in_dim * sizeof(float));
+        q36_gpu_tensor *yv = q36_gpu_tensor_view(
+            ref, (uint64_t)first * out_dim * sizeof(float), (uint64_t)n * out_dim * sizeof(float));
+        TEST_ASSERT(xv && yv);
+        if (xv && yv)
+            TEST_ASSERT(q36_gpu_matmul_iq_quant_scaled_tensor(
+                yv, weights, weight_bytes, 0, 18, in_dim, out_dim, xv, n, 0.75f) != 0);
+        q36_gpu_tensor_free(xv);
+        q36_gpu_tensor_free(yv);
+    }
+    TEST_ASSERT(q36_gpu_tensor_read(out, 0, got, y_bytes) != 0);
+    TEST_ASSERT(q36_gpu_tensor_read(ref, 0, want, y_bytes) != 0);
+    bool nonzero = false;
+    for (uint32_t i = 0; i < tokens * out_dim; i++) {
+        TEST_ASSERT(isfinite(got[i]) && isfinite(want[i]));
+        nonzero = nonzero || got[i] != 0.0f;
+    }
+    TEST_ASSERT(nonzero);
+    TEST_ASSERT(memcmp(got, want, y_bytes) == 0);
+cleanup:
+    q36_gpu_tensor_free(x);
+    q36_gpu_tensor_free(out);
+    q36_gpu_tensor_free(ref);
+    q36_gpu_set_dense_model(false);
+    q36_gpu_cleanup();
+    free(weights);
+    free(input);
+    free(got);
+    free(want);
+#endif
+}
+
 #ifndef Q36_NO_GPU
 static const char *test_dense_quant_type_name(uint32_t type) {
     static const char *names[] = {
@@ -3982,6 +4058,7 @@ static void test_vulkan_kernels(void) {
     test_vulkan_swiglu_add();
     test_vulkan_directional_steering();
     test_vulkan_attn_decode_fused();
+    test_vulkan_iq3_xxs_tiles();
 }
 
 static char *test_read_file(const char *path) {
