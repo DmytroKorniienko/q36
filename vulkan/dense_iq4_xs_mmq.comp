@@ -18,8 +18,17 @@ layout(push_constant) uniform Push {
     float scale;
 } pc;
 
-const uint BM = 32u;
-const uint BN = 128u;
+#ifndef Q36_BN
+#define Q36_BN 128
+#endif
+#if Q36_BN <= 8
+#define Q36_BM (256 / Q36_BN)
+#endif
+#ifndef Q36_BM
+#define Q36_BM 32
+#endif
+const uint BM = Q36_BM;
+const uint BN = Q36_BN;
 const uint BK = 32u;
 const uint STRIDE = BK / 2u + 1u;
 const uint Q8K_WORDS = 74u;
@@ -66,6 +75,12 @@ void main(void) {
     uint lid = gl_LocalInvocationID.x;
     uint row0 = gl_WorkGroupID.x * BM;
     uint tok0 = gl_WorkGroupID.y * BN;
+#if Q36_BN <= 8
+    /* Each lane owns one row and two tokens; the dot keeps the large tile's K order. */
+    uint lr_out = lid % BM;
+    uint tok_pair = 2u * (lid / BM);
+    f16vec2 sum = f16vec2(0.0);
+#else
     uint wave = gl_SubgroupID;
     uint lane = gl_SubgroupInvocationID;
     uint warp_row = 0u;
@@ -74,6 +89,7 @@ void main(void) {
     uint thread_tok = lane >> 2u;
     f16vec2 sum[16];
     [[unroll]] for (uint i = 0u; i < 16u; i++) sum[i] = f16vec2(0.0);
+#endif
     if (lid < 16u) value_lut[lid] = float(values[lid]);
     barrier();
 
@@ -144,6 +160,15 @@ void main(void) {
             }
             barrier();
 
+#if Q36_BN <= 8
+            [[unroll]] for (uint k = 0u; k < BK / 2u; k++) {
+                f16vec2 av = buf_a[lr_out * STRIDE + k];
+                f16vec2 b0 = buf_b[tok_pair * STRIDE + k];
+                f16vec2 b1 = buf_b[(tok_pair + 1u) * STRIDE + k];
+                sum = fma(f16vec2(av.x), f16vec2(b0.x, b1.x),
+                          fma(f16vec2(av.y), f16vec2(b0.y, b1.y), sum));
+            }
+#else
             [[unroll]] for (uint k = 0u; k < BK / 2u; k++) {
                 f16vec2 av[8];
                 f16vec2 bv[4];
@@ -163,10 +188,19 @@ void main(void) {
                                 f16vec2(bv[2u * tp].y, bv[2u * tp + 1u].y),
                                 sum[tp * 8u + rr]));
             }
+#endif
             barrier();
         }
     }
 
+#if Q36_BN <= 8
+    uint row = row0 + lr_out;
+    uint tok = tok0 + tok_pair;
+    if (row < pc.out_dim) {
+        if (tok < pc.n_tok) y[tok * pc.out_dim + row] = float(sum.x);
+        if (tok + 1u < pc.n_tok) y[(tok + 1u) * pc.out_dim + row] = float(sum.y);
+    }
+#else
     [[unroll]] for (uint tt = 0u; tt < 4u; tt++) {
         uint tok = tok0 + warp_tok * 32u + (tt >> 1u) * 16u +
                    thread_tok * 2u + (tt & 1u);
@@ -180,4 +214,5 @@ void main(void) {
                     sum[(tt >> 1u) * 8u + rr].y);
         }
     }
+#endif
 }

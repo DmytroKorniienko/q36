@@ -2916,6 +2916,93 @@ static void test_vulkan_kquant_matvec(void) {
 #endif
 }
 
+#if !defined(Q36_NO_GPU) && !defined(Q36_METAL)
+static void test_vulkan_iq_small_one(uint32_t type, uint32_t block_bytes,
+                                    uint32_t out_dim) {
+    /* Nine tokens select the large tile as an independent oracle. Odd block
+     * counts and row counts cross alignment and every small tile boundary. */
+    enum { in_dim = 768, tokens = 9 };
+    const uint32_t row_bytes = 3u * block_bytes;
+    const size_t x_bytes = (size_t)tokens * in_dim * sizeof(float);
+    const size_t y_bytes = (size_t)tokens * out_dim * sizeof(float);
+    const size_t weight_bytes = (size_t)test_round_up_u64(
+        (uint64_t)out_dim * row_bytes, (uint64_t)getpagesize());
+    uint8_t *weights = NULL;
+    float *input = malloc(x_bytes), *got = malloc(y_bytes), *want = malloc(y_bytes);
+    q36_gpu_tensor *x = NULL, *out = NULL, *ref = NULL;
+    TEST_ASSERT(posix_memalign((void **)&weights, (size_t)getpagesize(), weight_bytes) == 0);
+    TEST_ASSERT(weights && input && got && want);
+    if (!weights || !input || !got || !want) goto cleanup;
+    memset(weights, 0, weight_bytes);
+    for (uint32_t row = 0; row < out_dim; row++) {
+        for (uint32_t block = 0; block < 3; block++) {
+            uint8_t *p = weights + row * row_bytes + block * block_bytes;
+            uint16_t d = test_float_to_f16(0.0001f * (float)(1 + row % 7 + block));
+            memcpy(p, &d, sizeof(d));
+            for (uint32_t i = 2; i < block_bytes; i++)
+                p[i] = (uint8_t)(row * 29u + block * 71u + i * 13u);
+        }
+    }
+    for (uint32_t i = 0; i < tokens * in_dim; i++)
+        input[i] = sinf((float)i * 0.031f) * (0.25f + (float)(i % 11) * 0.03125f);
+    TEST_ASSERT(q36_gpu_init() != 0);
+    q36_gpu_set_quality(false);
+    q36_gpu_set_dense_model(true);
+    x = q36_gpu_tensor_alloc(x_bytes);
+    out = q36_gpu_tensor_alloc(y_bytes);
+    ref = q36_gpu_tensor_alloc(y_bytes);
+    TEST_ASSERT(x && out && ref);
+    if (!x || !out || !ref) goto cleanup;
+    TEST_ASSERT(q36_gpu_set_model_map(weights, weight_bytes) != 0);
+    TEST_ASSERT(q36_gpu_tensor_write(x, 0, input, x_bytes) != 0);
+    const float scales[] = {0.75f, -0.5f};
+    for (unsigned s = 0; s < sizeof(scales) / sizeof(scales[0]); s++) {
+        TEST_ASSERT(q36_gpu_matmul_iq_quant_scaled_tensor(
+            ref, weights, weight_bytes, 0, type, in_dim, out_dim, x, tokens, scales[s]) != 0);
+        TEST_ASSERT(q36_gpu_tensor_read(ref, 0, want, y_bytes) != 0);
+        for (uint32_t n = 2; n <= 8; n++) {
+            const size_t bytes = (size_t)n * out_dim * sizeof(float);
+            for (uint32_t i = 0; i < tokens * out_dim; i++) got[i] = 12345.0f;
+            TEST_ASSERT(q36_gpu_tensor_write(out, 0, got, y_bytes) != 0);
+            TEST_ASSERT(q36_gpu_matmul_iq_quant_scaled_tensor(
+                out, weights, weight_bytes, 0, type, in_dim, out_dim, x, n, scales[s]) != 0);
+            TEST_ASSERT(q36_gpu_tensor_read(out, 0, got, y_bytes) != 0);
+            bool nonzero = false;
+            for (uint32_t i = 0; i < n * out_dim; i++) {
+                TEST_ASSERT(isfinite(got[i]) && isfinite(want[i]));
+                nonzero = nonzero || got[i] != 0.0f;
+            }
+            TEST_ASSERT(nonzero);
+            TEST_ASSERT(memcmp(got, want, bytes) == 0);
+            for (uint32_t i = n * out_dim; i < tokens * out_dim; i++)
+                TEST_ASSERT(got[i] == 12345.0f);
+        }
+    }
+cleanup:
+    q36_gpu_tensor_free(x);
+    q36_gpu_tensor_free(out);
+    q36_gpu_tensor_free(ref);
+    q36_gpu_set_dense_model(false);
+    q36_gpu_cleanup();
+    free(weights);
+    free(input);
+    free(got);
+    free(want);
+}
+#endif
+
+static void test_vulkan_iq_small_tiles(void) {
+#if defined(Q36_NO_GPU) || defined(Q36_METAL)
+    test_skip("vulkan-iq-small-tiles", "Vulkan-only test");
+#else
+    const uint32_t types[] = {18, 21, 23}, bytes[] = {98, 110, 136};
+    for (unsigned i = 0; i < sizeof(types) / sizeof(types[0]); i++) {
+        test_vulkan_iq_small_one(types[i], bytes[i], 131);
+        test_vulkan_iq_small_one(types[i], bytes[i], 48);
+    }
+#endif
+}
+
 static void test_vulkan_iq3_xxs_tiles(void) {
 #if defined(Q36_NO_GPU) || defined(Q36_METAL)
     test_skip("vulkan-iq3-xxs-tiles", "Vulkan-only test");
@@ -4059,6 +4146,7 @@ static void test_vulkan_kernels(void) {
     test_vulkan_directional_steering();
     test_vulkan_attn_decode_fused();
     test_vulkan_iq3_xxs_tiles();
+    test_vulkan_iq_small_tiles();
 }
 
 static char *test_read_file(const char *path) {
