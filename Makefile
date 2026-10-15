@@ -81,6 +81,7 @@ VULKAN_SHADERS := \
 	vulkan/shared_gate_up_decode.spv \
 	vulkan/shared_down_tail_decode.spv \
 	vulkan/matmul_q8_0_mm.spv \
+	vulkan/matmul_q8_0_mm_small.spv \
 	vulkan/matmul_q8_0_mm_f16.spv \
 	vulkan/matmul_q8_0_mm_f16_out32.spv \
 	vulkan/matmul_q8_0_f32b_nx.spv \
@@ -146,13 +147,20 @@ VULKAN_SHADERS := \
 	vulkan/dense_iq4_xs.spv \
 	vulkan/dense_iq4_xs_decode.spv \
 	vulkan/dense_iq4_xs_mmq.spv \
+	vulkan/dense_iq4_xs_bm64_mmq.spv \
 	vulkan/dense_iq4_xs_mmq_n2.spv \
 	vulkan/dense_iq4_xs_mmq_n4.spv \
 	vulkan/dense_iq4_xs_mmq_n8.spv \
 	vulkan/dense_iq1_m.spv \
 	vulkan/dense_extra_decode.spv \
 	vulkan/dense_extra_mmq.spv \
+	vulkan/dense_extra_mmq_n2.spv \
+	vulkan/dense_extra_mmq_n4.spv \
+	vulkan/dense_extra_mmq_n8.spv \
 	vulkan/dense_kquant_mmq.spv \
+	vulkan/dense_kquant_mmq_n2.spv \
+	vulkan/dense_kquant_mmq_n4.spv \
+	vulkan/dense_kquant_mmq_n8.spv \
 	vulkan/dense_kquant_decode.spv \
 	vulkan/dense_q4k_decode.spv \
 	vulkan/dense_q5k_decode.spv \
@@ -219,6 +227,9 @@ vulkan/dense_iq4_xs.spv: vulkan/dense_iq4_xs.comp
 vulkan/dense_iq4_xs_decode.spv: vulkan/dense_iq4_xs_decode.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_BOUNDS=0 -o $@ $<
 
+vulkan/dense_iq4_xs_bm64_mmq.spv: vulkan/dense_iq4_xs_mmq.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_BM=64 -o $@ $<
+
 vulkan/dense_iq4_xs_mmq.spv: vulkan/dense_iq4_xs_mmq.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
@@ -231,11 +242,17 @@ vulkan/dense_iq1_m.spv: vulkan/dense_iq1_m.comp
 vulkan/dense_extra_decode.spv: vulkan/dense_extra_decode.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
+vulkan/dense_extra_mmq_n%.spv: vulkan/dense_extra_mmq.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_BN=$* -o $@ $<
+
 vulkan/dense_extra_mmq.spv: vulkan/dense_extra_mmq.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
 vulkan/predequant_b16.spv: vulkan/predequant_b16.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
+
+vulkan/dense_kquant_mmq_n%.spv: vulkan/dense_kquant_mmq.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_BN=$* -o $@ $<
 
 vulkan/dense_kquant_mmq.spv: vulkan/dense_kquant_mmq.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
@@ -260,6 +277,9 @@ vulkan/shared_gate_up_decode.spv: vulkan/shared_gate_up_decode.comp
 
 vulkan/shared_down_tail_decode.spv: vulkan/shared_down_tail_decode.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
+
+vulkan/matmul_q8_0_mm_small.spv: vulkan/matmul_q8_0_mm.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_SMALL=1 -o $@ $<
 
 vulkan/matmul_q8_0_mm.spv: vulkan/matmul_q8_0_mm.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<

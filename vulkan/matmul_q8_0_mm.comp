@@ -9,7 +9,11 @@
  * reuses them, instead of the matvec path re-reading the row bytes for
  * every 4 tokens. Each thread accumulates a 4x4 register tile. */
 
+#ifdef Q36_SMALL
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+#else
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+#endif
 
 layout(set = 0, binding = 0) readonly buffer Weights {
     uint16_t wb16[];
@@ -31,6 +35,29 @@ layout(push_constant) uniform Push {
     float scale;
 } pc;
 
+#ifdef Q36_SMALL
+/* Narrow projections need more row groups and no shared-memory barriers.
+ * Each lane keeps the original sequential f32 accumulation order. */
+void main(void) {
+    uint row = gl_WorkGroupID.x * 8u + gl_LocalInvocationID.x % 8u;
+    uint tok = gl_WorkGroupID.y * 8u + gl_LocalInvocationID.x / 8u;
+    if (row >= pc.out_dim || tok >= pc.n_tok) return;
+    float sum = 0.0;
+    for (uint b = 0u; b < pc.blocks; b++) {
+        uint off = (row * pc.blocks + b) * 17u;
+        float d = unpackHalf2x16(uint(wb16[off])).x;
+        uint xi = (tok * pc.blocks + b) * 32u;
+        for (uint k = 0u; k < 16u; k++) {
+            uint q = uint(wb16[off + 1u + k]);
+            float w0 = float(bitfieldExtract(int(q), 0, 8)) * d;
+            float w1 = float(bitfieldExtract(int(q), 8, 8)) * d;
+            sum = fma(w0, xv[xi + 2u * k], sum);
+            sum = fma(w1, xv[xi + 2u * k + 1u], sum);
+        }
+    }
+    y[tok * pc.out_dim + row] = sum * pc.scale;
+}
+#else
 /* One Q8_0 block is 17 uint16 words: [d_f16][16 x 2 qs bytes]. */
 const uint Q8_0_U16 = 17u;
 const uint BM = 64u;
@@ -125,3 +152,4 @@ void main(void) {
         }
     }
 }
+#endif
