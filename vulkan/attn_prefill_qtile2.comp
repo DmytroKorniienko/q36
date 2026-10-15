@@ -4,7 +4,7 @@
 #extension GL_KHR_shader_subgroup_clustered : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 
-/* Two 64-lane row groups serve two tokens and eight GQA heads. Each group
+/* Two 64-lane row groups serve two tokens and their GQA heads. Each group
  * owns one token; each lane owns four output dimensions. */
 
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
@@ -47,10 +47,13 @@ layout(push_constant) uniform Push {
 #define TILE 64u
 #define SPAN 512u
 #define SPAN_GROUP 8u
-#define HQ 8u
+#ifndef Q36_GQA_HEADS
+#define Q36_GQA_HEADS 8
+#endif
+#define HQ Q36_GQA_HEADS
 #define QT 2u
 #define HD 256u
-#define ROWS 8u
+#define ROWS HQ
 #define VD 4u
 #define K_HEAD_BYTES 272u
 #define V_HEAD_BYTES 144u
@@ -91,15 +94,16 @@ void main(void) {
     uint span_limit = min(span_first + SPAN_GROUP, max_spans);
     if (span_first >= max_spans) return;
 
-    uint h0 = kvh * HQ;
+    uint heads = pc.n_head / pc.n_head_kv;
+    uint h0 = kvh * heads;
     float scale = 1.0 / sqrt(float(HD));
 
     for (uint e = tid; e < QT * HQ * HD; e += 128u) {
         uint r = e / HD;
         uint ti = r / HQ;
-        uint j = r & (HQ - 1u);
+        uint j = r % HQ;
         uint d = e & (HD - 1u);
-        sh_q[e] = ti < tn ?
+        sh_q[e] = ti < tn && j < heads ?
             q[((tok0 + ti) * pc.n_head + h0 + j) * HD + d] : 0.0;
     }
     barrier();
@@ -123,8 +127,8 @@ void main(void) {
         for (uint rr = 0u; rr < ROWS; rr++) {
             uint r = r0 + rr;
             uint ti = r / HQ;
-            uint j = r & (HQ - 1u);
-            m[rr] = span == 0u && pc.has_sinks != 0u && ti < tn ?
+            uint j = r % HQ;
+            m[rr] = span == 0u && pc.has_sinks != 0u && ti < tn && j < heads ?
                 sinks[h0 + j] : -3.402823466e38;
             l[rr] = 0.0;
             for (uint v = 0u; v < VD; v++) acc[rr][v] = 0.0;
@@ -265,11 +269,11 @@ void main(void) {
     for (uint rr = 0u; rr < ROWS; rr++) {
         uint r = r0 + rr;
         uint ti = r / HQ;
-        uint j = r & (HQ - 1u);
+        uint j = r % HQ;
         uint tok = tok0 + ti;
         uint n_kv = pc.pos0 + tok + 1u;
         uint row_spans = (n_kv + SPAN - 1u) / SPAN;
-        if (ti >= tn || span_first >= row_spans) continue;
+        if (ti >= tn || j >= heads || span_first >= row_spans) continue;
         uint pbase = (((local0 + ti) * pc.n_head + h0 + j) *
                       pc.n_spans + group) * (HD + 2u);
         for (uint v = 0u; v < VD; v++)

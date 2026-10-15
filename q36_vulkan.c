@@ -202,6 +202,7 @@ typedef struct {
     q36_vk_kernel attn_decode_split;
     q36_vk_kernel attn_prefill_qtile;
     q36_vk_kernel attn_prefill_qtile2;
+    q36_vk_kernel attn_prefill_qtile2_gqa6;
     q36_vk_kernel attn_combine;
     q36_vk_kernel moe_gate_up;
     q36_vk_kernel router_topk;
@@ -2869,6 +2870,7 @@ int q36_gpu_init(void) {
     q36_vk.attn_decode_split = Q36_VK_KERNEL("vulkan/attn_decode_split.spv", 5, 40, 1u << 4);
     q36_vk.attn_prefill_qtile = Q36_VK_KERNEL("vulkan/attn_prefill_qtile.spv", 5, 48, 1u << 4);
     q36_vk.attn_prefill_qtile2 = Q36_VK_KERNEL("vulkan/attn_prefill_qtile2.spv", 5, 48, 1u << 4);
+    q36_vk.attn_prefill_qtile2_gqa6 = Q36_VK_KERNEL("vulkan/attn_prefill_qtile2_gqa6.spv", 5, 48, 1u << 4);
     q36_vk.attn_combine = Q36_VK_KERNEL("vulkan/attn_combine.spv", 4, 32, 1u << 3);
     q36_vk.moe_gate_up = Q36_VK_KERNEL("vulkan/moe_gate_up.spv", 8, 28, 1u << 6);
     q36_vk.router_topk = Q36_VK_KERNEL("vulkan/router_topk.spv", 3, 16, (1u << 1) | (1u << 2));
@@ -3322,6 +3324,7 @@ void q36_gpu_cleanup(void) {
     q36_vk_kernel_destroy(&q36_vk.attn_decode_split);
     q36_vk_kernel_destroy(&q36_vk.attn_prefill_qtile);
     q36_vk_kernel_destroy(&q36_vk.attn_prefill_qtile2);
+    q36_vk_kernel_destroy(&q36_vk.attn_prefill_qtile2_gqa6);
     q36_vk_kernel_destroy(&q36_vk.attn_combine);
     q36_vk_kernel_destroy(&q36_vk.attn_reduce);
     q36_vk_kernel_destroy(&q36_vk.attn_post);
@@ -6652,10 +6655,13 @@ int q36_gpu_attn_decode_tensor(q36_gpu_tensor *out,
                 cpush.tok0 = tok0;
                 const q36_gpu_tensor *qbind[5] = { q, k_cache, v_cache, sinks_t, part };
                 bool qt2 = q36_vk_use_attn_qtile2() &&
-                           head_dim == 256u && n_head / n_head_kv == 8u &&
+                           head_dim == 256u &&
+                           (n_head / n_head_kv == 6u || n_head / n_head_kv == 8u) &&
                            k_cache_type == 1u && v_cache_type == 2u;
                 ok = q36_vk_run_unlocked(qt2 ? "attn_prefill_qtile2" : "attn_prefill_qtile",
-                                         qt2 ? &q36_vk.attn_prefill_qtile2 : &q36_vk.attn_prefill_qtile,
+                                         qt2 ? (n_head / n_head_kv == 6u ? &q36_vk.attn_prefill_qtile2_gqa6 :
+                                                                         &q36_vk.attn_prefill_qtile2) :
+                                               &q36_vk.attn_prefill_qtile,
                                          qbind, &qpush, sizeof(qpush),
                                          n_head_kv, qt2 ? (chunk + 1u) / 2u : chunk, n_groups);
                 if (!ok) break;
