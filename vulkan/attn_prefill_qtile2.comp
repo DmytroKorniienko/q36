@@ -204,9 +204,12 @@ void main(void) {
                     nm[rr] = m[rr];
                     continue;
                 }
+                /* Reduce only the maximum; keep the softmax sum order below.
+                 * 32-lane clusters also fit both wave32 and wave64 devices. */
                 float tmax = -3.402823466e38;
-                for (uint t = 0u; t < row_tile_n; t++)
+                for (uint t = gl_SubgroupInvocationID & 31u; t < row_tile_n; t += 32u)
                     tmax = max(tmax, sh_w[r * TILE + t]);
+                tmax = subgroupClusteredMax(tmax, 32u);
                 float n = max(m[rr], tmax);
                 float rs = exp(m[rr] - n);
                 l[rr] *= rs;

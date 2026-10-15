@@ -202,7 +202,9 @@ void main(void) {
             barrier();
 
             float tmax = -3.402823466e38;
-            for (uint t = 0u; t < tile_n; t++) tmax = max(tmax, sh_w[t]);
+            for (uint t = gl_SubgroupInvocationID & 31u; t < tile_n; t += 32u)
+                tmax = max(tmax, sh_w[t]);
+            tmax = subgroupClusteredMax(tmax, 32u);
             float nm = max(m, tmax);
             float r = exp(m - nm);
             l *= r;
@@ -281,7 +283,9 @@ void main(void) {
             barrier();
 
             float tmax = -3.402823466e38;
-            for (uint t = 0u; t < tile_n; t++) tmax = max(tmax, sh_w[t]);
+            for (uint t = gl_SubgroupInvocationID & 31u; t < tile_n; t += 32u)
+                tmax = max(tmax, sh_w[t]);
+            tmax = subgroupClusteredMax(tmax, 32u);
             float nm = max(m, tmax);
             float r = exp(m - nm);
             l *= r;
@@ -363,7 +367,9 @@ void main(void) {
         /* Online softmax update, executed redundantly by every thread so
          * l stays a single fixed-order f32 sequence per token. */
         float tmax = -3.402823466e38;
-        for (uint t = 0u; t < tile_n; t++) tmax = max(tmax, sh_w[t]);
+        for (uint t = gl_SubgroupInvocationID & 31u; t < tile_n; t += 32u)
+            tmax = max(tmax, sh_w[t]);
+        tmax = subgroupClusteredMax(tmax, 32u);
         float nm = max(m, tmax);
         float r = exp(m - nm);
         l *= r;
