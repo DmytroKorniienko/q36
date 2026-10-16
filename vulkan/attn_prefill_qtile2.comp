@@ -4,10 +4,13 @@
 #extension GL_KHR_shader_subgroup_clustered : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 
-/* Two 64-lane row groups serve two tokens and their GQA heads. Each group
- * owns one token; each lane owns four output dimensions. */
+/* Each 64-lane group owns one token and its GQA heads; each lane owns
+ * four output dimensions. One group avoids cross-wave barriers on BC-250. */
 
-layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+#ifndef Q36_QT
+#define Q36_QT 2
+#endif
+layout(local_size_x = (64 * Q36_QT), local_size_y = 1, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) readonly buffer Qbuf {
     float q[];
@@ -51,7 +54,7 @@ layout(push_constant) uniform Push {
 #define Q36_GQA_HEADS 8
 #endif
 #define HQ Q36_GQA_HEADS
-#define QT 2u
+#define QT Q36_QT
 #define HD 256u
 #define ROWS HQ
 #define VD 4u
@@ -98,7 +101,7 @@ void main(void) {
     uint h0 = kvh * heads;
     float scale = 1.0 / sqrt(float(HD));
 
-    for (uint e = tid; e < QT * HQ * HD; e += 128u) {
+    for (uint e = tid; e < QT * HQ * HD; e += 64u * QT) {
         uint r = e / HD;
         uint ti = r / HQ;
         uint j = r % HQ;

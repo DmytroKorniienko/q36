@@ -32,10 +32,15 @@ const uint Q6_K = 14u;
 #ifndef Q36_BOUNDS
 #define Q36_BOUNDS 1
 #endif
-const uint ROWS = 4u;
+#ifndef Q36_ROWS
+#define Q36_ROWS 4
+#endif
+const uint ROWS = Q36_ROWS;
 const uint Q8K_WORDS = 74u;
 
-#ifdef Q36_Q4K_ONLY
+#ifdef Q36_Q3K_ONLY
+#define QTYPE Q3_K
+#elif defined(Q36_Q4K_ONLY)
 #define QTYPE Q4_K
 #elif defined(Q36_Q5K_ONLY)
 #define QTYPE Q5_K

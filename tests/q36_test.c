@@ -2993,6 +2993,84 @@ static void test_vulkan_kquant_matvec(void) {
 }
 
 #if !defined(Q36_NO_GPU) && !defined(Q36_METAL)
+static void test_vulkan_decode_one(uint32_t type, uint32_t block_bytes,
+                                  uint32_t in_dim) {
+    /* An odd padded row count selects the existing generic decode kernel.
+     * The first 1024 rows must be identical, including negative scales. */
+    enum { tokens = 1, out_dim = 1024, ref_rows = 1027 };
+    const uint32_t blocks = in_dim / (type == 20 ? 32u : 256u);
+    const size_t ref_bytes = (size_t)tokens * ref_rows * sizeof(float);
+    const uint32_t row_bytes = blocks * block_bytes;
+    const size_t x_bytes = (size_t)tokens * in_dim * sizeof(float);
+    const size_t y_bytes = (size_t)(out_dim + 1u) * sizeof(float);
+    const size_t weight_bytes = (size_t)test_round_up_u64(
+        (uint64_t)ref_rows * row_bytes, (uint64_t)getpagesize());
+    uint8_t *weights = NULL;
+    float *input = malloc(x_bytes), *got = malloc(y_bytes), *want = malloc(ref_bytes);
+    q36_gpu_tensor *x = NULL, *out = NULL, *ref = NULL;
+    TEST_ASSERT(posix_memalign((void **)&weights, (size_t)getpagesize(), weight_bytes) == 0);
+    TEST_ASSERT(weights && input && got && want);
+    if (!weights || !input || !got || !want) goto cleanup;
+    memset(weights, 0, weight_bytes);
+    for (uint32_t row = 0; row < ref_rows; row++) {
+        for (uint32_t block = 0; block < blocks; block++) {
+            uint8_t *p = weights + row * row_bytes + block * block_bytes;
+            uint16_t d = test_float_to_f16(0.0001f * (float)(1 + row % 7 + block));
+            for (uint32_t i = 0; i < block_bytes; i++)
+                p[i] = (uint8_t)(row * 29u + block * 71u + i * 13u);
+            uint32_t d_off = type == 10 ? 80 : type == 11 ? 108 : type == 14 ? 208 : 0;
+            if ((row + block) & 1u) d ^= 0x8000u;
+            memcpy(p + d_off, &d, sizeof(d));
+            if (type == 10 || type == 12 || type == 13)
+                memcpy(p + d_off + 2, &d, sizeof(d));
+        }
+    }
+    for (uint32_t i = 0; i < tokens * in_dim; i++)
+        input[i] = sinf((float)i * 0.031f) * (0.25f + (float)(i % 11) * 0.03125f);
+    TEST_ASSERT(q36_gpu_init() != 0);
+    q36_gpu_set_quality(false);
+    q36_gpu_set_dense_model(true);
+    x = q36_gpu_tensor_alloc(x_bytes);
+    out = q36_gpu_tensor_alloc(y_bytes);
+    ref = q36_gpu_tensor_alloc(ref_bytes);
+    TEST_ASSERT(x && out && ref);
+    if (!x || !out || !ref) goto cleanup;
+    TEST_ASSERT(q36_gpu_set_model_map(weights, weight_bytes) != 0);
+    TEST_ASSERT(q36_gpu_tensor_write(x, 0, input, x_bytes) != 0);
+    int (*matmul)(q36_gpu_tensor *, const void *, uint64_t, uint64_t,
+                  uint32_t, uint64_t, uint64_t, const q36_gpu_tensor *, uint64_t, float) =
+        type < 16 ? q36_gpu_matmul_k_quant_scaled_tensor : q36_gpu_matmul_iq_quant_scaled_tensor;
+    const float scales[] = {0.75f, -0.5f};
+    for (unsigned si = 0; si < sizeof(scales) / sizeof(scales[0]); si++) {
+        for (uint32_t i = 0; i <= out_dim; i++) got[i] = 12345.0f;
+        TEST_ASSERT(q36_gpu_tensor_write(out, 0, got, y_bytes) != 0);
+        TEST_ASSERT(matmul(ref, weights, weight_bytes, 0, type,
+                           in_dim, ref_rows, x, 1, scales[si]) != 0);
+        TEST_ASSERT(matmul(out, weights, weight_bytes, 0, type,
+                           in_dim, out_dim, x, 1, scales[si]) != 0);
+        TEST_ASSERT(q36_gpu_tensor_read(ref, 0, want, ref_bytes) != 0);
+        TEST_ASSERT(q36_gpu_tensor_read(out, 0, got, y_bytes) != 0);
+        bool nonzero = false;
+        for (uint32_t i = 0; i < out_dim; i++) {
+            TEST_ASSERT(isfinite(got[i]) && isfinite(want[i]));
+            TEST_ASSERT(memcmp(got + i, want + i, sizeof(float)) == 0);
+            nonzero = nonzero || got[i] != 0.0f;
+        }
+        TEST_ASSERT(nonzero);
+        TEST_ASSERT(got[out_dim] == 12345.0f);
+    }
+cleanup:
+    q36_gpu_tensor_free(x);
+    q36_gpu_tensor_free(out);
+    q36_gpu_tensor_free(ref);
+    q36_gpu_set_dense_model(false);
+    q36_gpu_cleanup();
+    free(weights);
+    free(input);
+    free(got);
+    free(want);
+}
+
 static void test_vulkan_small_one(uint32_t type, uint32_t block_bytes,
                                   uint32_t out_dim) {
     /* Nine tokens select the large tile as an independent oracle. Odd block
@@ -3100,17 +3178,20 @@ static void test_vulkan_small_tiles(void) {
 #endif
 }
 
-static void test_vulkan_wide_tiles(uint32_t type, uint32_t block_bytes) {
+static void test_vulkan_wide_tiles(uint32_t type, uint32_t block_bytes,
+                                    uint32_t tokens, uint32_t out_dim) {
 #if defined(Q36_NO_GPU) || defined(Q36_METAL)
     (void)type;
     (void)block_bytes;
+    (void)tokens;
+    (void)out_dim;
     test_skip("vulkan-wide-tiles", "Vulkan-only test");
 #else
     /* Cross both tile edges with an odd number of weight blocks.
-     * Splitting the prompt selects the existing 32-row kernel as the oracle. */
-    enum { in_dim = 768, tokens = 131 };
-    const uint32_t out_dim = type < 16 ? 4163 : 67;
-    const uint32_t blocks = type == 20 ? 24 : 3;
+     * Split into batches of 128 plus three tokens to keep the F16 prefill
+     * arithmetic throughout; a one-token remainder would select F32 decode. */
+    const uint32_t in_dim = tokens >= 512 ? 4352 : 768;
+    const uint32_t blocks = in_dim / (type == 20 ? 32 : 256);
     const uint32_t row_bytes = blocks * block_bytes;
     const size_t x_bytes = (size_t)tokens * in_dim * sizeof(float);
     const size_t y_bytes = (size_t)tokens * out_dim * sizeof(float);
@@ -4239,7 +4320,49 @@ static void test_vulkan_attn_decode_fused(void) {
 #endif
 }
 
+static void test_vulkan_host_overwrite(void) {
+#if !defined(Q36_NO_GPU) && !defined(Q36_METAL)
+    const float input[] = {3, -5, 7, 11}, zero[4] = {0};
+    float got[4];
+    q36_gpu_tensor *root = q36_gpu_tensor_alloc(256 + sizeof(input));
+    q36_gpu_tensor *src = q36_gpu_tensor_alloc(sizeof(input));
+    q36_gpu_tensor *dst = q36_gpu_tensor_alloc(sizeof(input));
+    q36_gpu_tensor *z = q36_gpu_tensor_alloc(sizeof(zero));
+    q36_gpu_tensor *view = q36_gpu_tensor_view(root, 256, sizeof(input));
+    TEST_ASSERT(root && src && dst && z && view);
+    if (!root || !src || !dst || !z || !view) goto done;
+    TEST_ASSERT(q36_gpu_tensor_write(src, 0, input, sizeof(input)) != 0);
+    TEST_ASSERT(q36_gpu_tensor_write(z, 0, zero, sizeof(zero)) != 0);
+    for (int use_view = 0; use_view < 2; use_view++) {
+        q36_gpu_tensor *a = use_view ? view : root;
+        for (int copy = 0; copy < 2; copy++) {
+            for (int count = 1; count <= 129; count += 128) {
+                TEST_ASSERT(q36_gpu_tensor_copy(a, 0, src, 0, sizeof(input)) != 0);
+                TEST_ASSERT(q36_gpu_tensor_read(a, 0, got, sizeof(got)) != 0);
+                /* The earlier write is complete. The host must still wait
+                 * for new readers, in both open and eagerly submitted batches. */
+                for (int i = 0; i < count; i++) {
+                    int ok = copy ? q36_gpu_tensor_copy(dst, 0, a, 0, sizeof(input))
+                                  : q36_gpu_add_tensor(dst, a, z, 4);
+                    TEST_ASSERT(ok != 0);
+                }
+                TEST_ASSERT(q36_gpu_tensor_write(a, 0, zero, sizeof(zero)) != 0);
+                TEST_ASSERT(q36_gpu_tensor_read(dst, 0, got, sizeof(got)) != 0);
+                TEST_ASSERT(memcmp(got, input, sizeof(input)) == 0);
+            }
+        }
+    }
+done:
+    q36_gpu_tensor_free(view);
+    q36_gpu_tensor_free(root);
+    q36_gpu_tensor_free(src);
+    q36_gpu_tensor_free(dst);
+    q36_gpu_tensor_free(z);
+#endif
+}
+
 static void test_vulkan_kernels(void) {
+    test_vulkan_host_overwrite();
     test_metal_f16_matvec_fast_nr0_4();
     test_vulkan_f32_matvec();
     test_vulkan_rms_norm();
@@ -4260,7 +4383,17 @@ static void test_vulkan_kernels(void) {
     const uint32_t wide_types[] = {10, 11, 12, 13, 16, 17, 18, 19, 20, 22, 23},
                    wide_bytes[] = {84, 110, 144, 176, 66, 74, 98, 50, 18, 82, 136};
     for (unsigned i = 0; i < sizeof(wide_types) / sizeof(wide_types[0]); i++)
-        test_vulkan_wide_tiles(wide_types[i], wide_bytes[i]);
+        test_vulkan_wide_tiles(wide_types[i], wide_bytes[i], 131, wide_types[i] < 16 ? 4163 : 67);
+    test_vulkan_wide_tiles(18, 98, 515, 8355);
+    test_vulkan_wide_tiles(21, 110, 515, 8355);
+#if !defined(Q36_NO_GPU) && !defined(Q36_METAL)
+    const uint32_t decode_types[] = {11, 12, 13, 14, 20, 22},
+                   decode_bytes[] = {110, 144, 176, 210, 18, 82};
+    for (unsigned i = 0; i < sizeof(decode_types) / sizeof(decode_types[0]); i++) {
+        test_vulkan_decode_one(decode_types[i], decode_bytes[i], 768);
+        test_vulkan_decode_one(decode_types[i], decode_bytes[i], 5120);
+    }
+#endif
     test_vulkan_small_tiles();
 }
 

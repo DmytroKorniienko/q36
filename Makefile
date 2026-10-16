@@ -109,6 +109,7 @@ VULKAN_SHADERS := \
 	vulkan/attn_decode_split.spv \
 	vulkan/attn_prefill_qtile.spv \
 	vulkan/attn_prefill_qtile2.spv \
+	vulkan/attn_prefill_qtile1_gqa6.spv \
 	vulkan/attn_prefill_qtile2_gqa6.spv \
 	vulkan/attn_combine.spv \
 	vulkan/moe_gate_up.spv \
@@ -131,6 +132,7 @@ VULKAN_SHADERS := \
 	vulkan/dense_iq3_xxs_decode.spv \
 	vulkan/dense_iq3_xxs_decode_r4.spv \
 	vulkan/dense_iq3_xxs_mmq.spv \
+	vulkan/dense_iq3_xxs_bm96_mmq.spv \
 	vulkan/dense_iq3_xxs_mmq_n2.spv \
 	vulkan/dense_iq3_xxs_mmq_n4.spv \
 	vulkan/dense_iq3_xxs_mmq_n8.spv \
@@ -140,6 +142,7 @@ VULKAN_SHADERS := \
 	vulkan/dense_iq3_s_decode_r4.spv \
 	vulkan/dense_iq3_s_decode_r1.spv \
 	vulkan/dense_iq3_s_mmq.spv \
+	vulkan/dense_iq3_s_bm96_mmq.spv \
 	vulkan/dense_iq3_s_mmq_n2.spv \
 	vulkan/dense_iq3_s_mmq_n4.spv \
 	vulkan/dense_iq3_s_mmq_n8.spv \
@@ -155,6 +158,8 @@ VULKAN_SHADERS := \
 	vulkan/dense_iq4_xs_mmq_n8.spv \
 	vulkan/dense_iq1_m.spv \
 	vulkan/dense_extra_decode.spv \
+	vulkan/dense_iq4_nl_decode.spv \
+	vulkan/dense_iq2_s_decode.spv \
 	vulkan/dense_extra_mmq.spv \
 	vulkan/dense_extra_bm64_mmq.spv \
 	vulkan/dense_extra_mmq_n2.spv \
@@ -166,6 +171,10 @@ VULKAN_SHADERS := \
 	vulkan/dense_kquant_mmq_n4.spv \
 	vulkan/dense_kquant_mmq_n8.spv \
 	vulkan/dense_kquant_decode.spv \
+	vulkan/dense_kquant_decode_r2.spv \
+	vulkan/dense_q5k_decode_r1.spv \
+	vulkan/dense_q4k_decode_r1.spv \
+	vulkan/dense_q3k_decode.spv \
 	vulkan/dense_q4k_decode.spv \
 	vulkan/dense_q5k_decode.spv \
 	vulkan/moe_reduce.spv \
@@ -192,6 +201,9 @@ vulkan/dense_iq3_xxs_decode.spv: vulkan/dense_iq3_xxs_decode.comp
 vulkan/dense_iq3_xxs_decode_r4.spv: vulkan/dense_iq3_xxs_decode.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_ROWS=4 -DQ36_BOUNDS=0 -o $@ $<
 
+vulkan/dense_iq3_xxs_bm96_mmq.spv: vulkan/dense_iq3_xxs_mmq.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_BM=96 -o $@ $<
+
 vulkan/dense_iq3_xxs_mmq.spv: vulkan/dense_iq3_xxs_mmq.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
@@ -212,6 +224,9 @@ vulkan/dense_iq3_s_decode_r4.spv: vulkan/dense_iq3_s_decode.comp q36_iq3s_grid_v
 
 vulkan/dense_iq3_s_decode_r1.spv: vulkan/dense_iq3_s_decode.comp q36_iq3s_grid_values.inc
 	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_ROWS=1 -DQ36_BOUNDS=0 -o $@ $<
+
+vulkan/dense_iq3_s_bm96_mmq.spv: vulkan/dense_iq3_s_mmq.comp q36_iq3s_grid_values.inc
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_BM=96 -o $@ $<
 
 vulkan/dense_iq3_s_mmq.spv: vulkan/dense_iq3_s_mmq.comp q36_iq3s_grid_values.inc
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
@@ -246,6 +261,12 @@ vulkan/dense_iq4_xs_mmq_n%.spv: vulkan/dense_iq4_xs_mmq.comp
 vulkan/dense_iq1_m.spv: vulkan/dense_iq1_m.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
+vulkan/dense_iq2_s_decode.spv: vulkan/dense_extra_decode.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_TYPE=22 -o $@ $<
+
+vulkan/dense_iq4_nl_decode.spv: vulkan/dense_extra_decode.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_TYPE=20 -DQ36_ROWS=1 -o $@ $<
+
 vulkan/dense_extra_decode.spv: vulkan/dense_extra_decode.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
@@ -269,6 +290,18 @@ vulkan/dense_kquant_bm64_mmq.spv: vulkan/dense_kquant_mmq.comp
 
 vulkan/dense_kquant_mmq.spv: vulkan/dense_kquant_mmq.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
+
+vulkan/dense_q3k_decode.spv: vulkan/dense_kquant_decode.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_Q3K_ONLY -DQ36_BOUNDS=0 -o $@ $<
+
+vulkan/dense_q4k_decode_r1.spv: vulkan/dense_kquant_decode.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_Q4K_ONLY -DQ36_BOUNDS=0 -DQ36_ROWS=1 -o $@ $<
+
+vulkan/dense_q5k_decode_r1.spv: vulkan/dense_kquant_decode.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_Q5K_ONLY -DQ36_BOUNDS=0 -DQ36_ROWS=1 -o $@ $<
+
+vulkan/dense_kquant_decode_r2.spv: vulkan/dense_kquant_decode.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_ROWS=2 -o $@ $<
 
 vulkan/dense_kquant_decode.spv: vulkan/dense_kquant_decode.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
@@ -350,6 +383,9 @@ vulkan/attn_decode_split.spv: vulkan/attn_decode_split.comp
 
 vulkan/attn_prefill_qtile.spv: vulkan/attn_prefill_qtile.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
+
+vulkan/attn_prefill_qtile1_gqa6.spv: vulkan/attn_prefill_qtile2.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_QT=1 -DQ36_GQA_HEADS=6 -o $@ $<
 
 vulkan/attn_prefill_qtile2.spv: vulkan/attn_prefill_qtile2.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<

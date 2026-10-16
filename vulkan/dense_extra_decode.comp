@@ -21,12 +21,21 @@ layout(push_constant) uniform Push {
     float scale;
 } pc;
 
+#ifdef Q36_TYPE
+#define QTYPE Q36_TYPE
+#else
+#define QTYPE pc.type
+#endif
+
 const uint IQ2_XXS = 16u;
 const uint IQ2_XS = 17u;
 const uint IQ1_S = 19u;
 const uint IQ4_NL = 20u;
 const uint IQ2_S = 22u;
-const uint ROWS = 4u;
+#ifndef Q36_ROWS
+#define Q36_ROWS 4
+#endif
+const uint ROWS = Q36_ROWS;
 const uint Q8K_WORDS = 74u;
 const uint TAB_IQ2XXS = 0u;
 const uint TAB_KSIGNS_BYTES = 2048u;
@@ -81,7 +90,7 @@ vec4 dequant_word(uint row, uint qb, uint word) {
     uint base = row * pc.row_bytes;
     float d;
 
-    if (pc.type == IQ2_XXS) {
+    if (QTYPE == IQ2_XXS) {
         base += qb * 66u;
         uint packed = load_u32(base + 6u + 8u * group);
         uint entry = load_u8(base + 2u + 8u * group + l);
@@ -90,7 +99,7 @@ vec4 dequant_word(uint row, uint qb, uint word) {
             (0.5 + float(packed >> 28u)) * 0.25;
         return d * signed_grid(tables[TAB_IQ2XXS + entry * 2u + part], signs, part * 4u);
     }
-    if (pc.type == IQ2_XS) {
+    if (QTYPE == IQ2_XS) {
         base += qb * 74u;
         uint qs = load_u16(base + 2u + 8u * group + 2u * l);
         uint sc = load_u8(base + 66u + group);
@@ -101,7 +110,7 @@ vec4 dequant_word(uint row, uint qb, uint word) {
         return d * signed_grid(tables[TAB_IQ2XS + (qs & 511u) * 2u + part],
                                signs, part * 4u);
     }
-    if (pc.type == IQ2_S) {
+    if (QTYPE == IQ2_S) {
         base += qb * 82u;
         uint qh = load_u8(base + 66u + group);
         uint entry = load_u8(base + 2u + 4u * group + l) |
@@ -113,7 +122,7 @@ vec4 dequant_word(uint row, uint qb, uint word) {
             (0.5 + float(nibble)) * 0.25;
         return d * signed_grid(tables[TAB_IQ2S + entry * 2u + part], signs, part * 4u);
     }
-    if (pc.type == IQ1_S) {
+    if (QTYPE == IQ1_S) {
         base += qb * 50u;
         uint qh = load_u16(base + 34u + 2u * group);
         uint entry = load_u8(base + 2u + 4u * group + l) |
@@ -147,7 +156,7 @@ float block_dot(uint row, uint qb, uint group, vec4 qv[8]) {
     uint base = row * pc.row_bytes;
     float sum = 0.0;
     float d;
-    if (pc.type == IQ2_XXS) {
+    if (QTYPE == IQ2_XXS) {
         base += qb * 66u;
         uint packed = load_u32(base + 6u + 8u * group);
         d = unpackHalf2x16(load_u16(base)).x *
@@ -160,7 +169,7 @@ float block_dot(uint row, uint qb, uint group, vec4 qv[8]) {
         }
         return d * sum;
     }
-    if (pc.type == IQ2_XS) {
+    if (QTYPE == IQ2_XS) {
         base += qb * 74u;
         float wd = unpackHalf2x16(load_u16(base)).x * 0.25;
         uint sc = load_u8(base + 66u + group);
@@ -173,7 +182,7 @@ float block_dot(uint row, uint qb, uint group, vec4 qv[8]) {
         }
         return sum;
     }
-    if (pc.type == IQ2_S) {
+    if (QTYPE == IQ2_S) {
         base += qb * 82u;
         float wd = unpackHalf2x16(load_u16(base)).x * 0.25;
         uint qh = load_u8(base + 66u + group);
@@ -188,7 +197,7 @@ float block_dot(uint row, uint qb, uint group, vec4 qv[8]) {
         }
         return sum;
     }
-    if (pc.type == IQ1_S) {
+    if (QTYPE == IQ1_S) {
         base += qb * 50u;
         uint qh = load_u16(base + 34u + 2u * group);
         d = unpackHalf2x16(load_u16(base)).x *
