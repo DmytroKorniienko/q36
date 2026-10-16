@@ -35,6 +35,7 @@ const uint IQ2_S = 22u;
 #define Q36_BM 32
 #endif
 const uint BM = Q36_BM;
+const uint ROWS_PER_LANE = BM / 4u;
 const uint BN = Q36_BN;
 const uint BK = 32u;
 const uint STRIDE = BK / 2u + 1u;
@@ -169,8 +170,8 @@ void main(void) {
     uint lane = gl_SubgroupInvocationID;
     uint lane_row = lane & 3u;
     uint lane_tok = lane >> 2u;
-    f16vec2 sum[16];
-    [[unroll]] for (uint i = 0u; i < 16u; i++) sum[i] = f16vec2(0.0);
+    f16vec2 sum[2u * ROWS_PER_LANE];
+    [[unroll]] for (uint i = 0u; i < 2u * ROWS_PER_LANE; i++) sum[i] = f16vec2(0.0);
 
 #endif
 
@@ -301,23 +302,28 @@ void main(void) {
             }
 #else
             [[unroll]] for (uint k = 0u; k < BK / 2u; k++) {
-                f16vec2 av[8];
+                f16vec2 av[ROWS_PER_LANE];
                 f16vec2 bv[4];
+#if Q36_BM == 32
                 [[unroll]] for (uint sr = 0u; sr < 2u; sr++)
                     [[unroll]] for (uint r = 0u; r < 4u; r++)
                         av[sr * 4u + r] = buf_a[(sr * 16u +
                             lane_row * 4u + r) * STRIDE + k];
+#else
+                [[unroll]] for (uint r = 0u; r < ROWS_PER_LANE; r++)
+                    av[r] = buf_a[(lane_row * ROWS_PER_LANE + r) * STRIDE + k];
+#endif
                 [[unroll]] for (uint st = 0u; st < 2u; st++)
                     [[unroll]] for (uint t = 0u; t < 2u; t++)
                         bv[st * 2u + t] = buf_b[(wave * 32u + st * 16u +
                             lane_tok * 2u + t) * STRIDE + k];
                 [[unroll]] for (uint tp = 0u; tp < 2u; tp++)
-                    [[unroll]] for (uint r = 0u; r < 8u; r++)
-                        sum[tp * 8u + r] = fma(f16vec2(av[r].x),
+                    [[unroll]] for (uint r = 0u; r < ROWS_PER_LANE; r++)
+                        sum[tp * ROWS_PER_LANE + r] = fma(f16vec2(av[r].x),
                             f16vec2(bv[2u * tp].x, bv[2u * tp + 1u].x),
                             fma(f16vec2(av[r].y),
                                 f16vec2(bv[2u * tp].y, bv[2u * tp + 1u].y),
-                                sum[tp * 8u + r]));
+                                sum[tp * ROWS_PER_LANE + r]));
             }
 #endif
             barrier();
@@ -336,12 +342,16 @@ void main(void) {
         uint tok = tok0 + wave * 32u + (t >> 1u) * 16u +
                    lane_tok * 2u + (t & 1u);
         if (tok >= pc.n_tok) continue;
-        [[unroll]] for (uint r = 0u; r < 8u; r++) {
+        [[unroll]] for (uint r = 0u; r < ROWS_PER_LANE; r++) {
+#if Q36_BM == 32
             uint row = row0 + (r >> 2u) * 16u + lane_row * 4u + (r & 3u);
+#else
+            uint row = row0 + lane_row * ROWS_PER_LANE + r;
+#endif
             if (row < pc.out_dim)
                 y[tok * pc.out_dim + row] = float((t & 1u) == 0u ?
-                    sum[(t >> 1u) * 8u + r].x :
-                    sum[(t >> 1u) * 8u + r].y);
+                    sum[(t >> 1u) * ROWS_PER_LANE + r].x :
+                    sum[(t >> 1u) * ROWS_PER_LANE + r].y);
         }
     }
 #endif

@@ -7301,7 +7301,8 @@ static bool q36_forward_ffn_vulkan_model(q36_vulkan_runtime *rt,
                                          uint32_t n_tok,
                                          const q36_gpu_tensor *inp,
                                          q36_gpu_tensor *out,
-                                         bool session_batch) {
+                                         bool session_batch,
+                                         bool inp_q8_ready) {
     q36_gpu_moe_weight gate;
     q36_gpu_moe_weight up;
     q36_gpu_moe_weight down;
@@ -7310,7 +7311,7 @@ static bool q36_forward_ffn_vulkan_model(q36_vulkan_runtime *rt,
     float *outp;
     if (!rt || !m || !l || !inp || !out) return false;
     if (Q36_MODEL_DENSE) {
-        if (!q36_gpu_quantize_q8_k_tensor(
+        if (!inp_q8_ready && !q36_gpu_quantize_q8_k_tensor(
                 rt->inp_q8, inp, Q36_N_EMBD, n_tok)) {
             return false;
         }
@@ -7505,7 +7506,8 @@ static bool q36_forward_ffn_vulkan(q36_session *s,
                                    uint32_t il,
                                    uint32_t n_tok,
                                    const q36_gpu_tensor *inp,
-                                   q36_gpu_tensor *out) {
+                                   q36_gpu_tensor *out,
+                                   bool inp_q8_ready) {
     q36_engine *e;
     if (!s) return false;
     e = s->engine;
@@ -7517,7 +7519,7 @@ static bool q36_forward_ffn_vulkan(q36_session *s,
                                         n_tok,
                                         inp,
                                         out,
-                                        false);
+                                        false, inp_q8_ready);
 }
 
 /* RoPE stays on the host even on the Vulkan path: the rotated values feed KV
@@ -7991,12 +7993,21 @@ static bool q36_forward_tokens_vulkan_into(q36_session *s,
                     pos0, il, l->kind == Q36_LAYER_FULL_ATTN ? "full" : "recurrent");
             return false;
         }
-        if (!q36_gpu_add_rms_norm_tensor(rt->norm, rt->next_hidden, rt->next_hidden, rt->hidden,
+        bool norm_q8 = false;
+#ifndef Q36_METAL
+        if (Q36_MODEL_DENSE && n_tok == 1u && !e->quality) {
+            norm_q8 = q36_gpu_add_rms_norm_q8_k_tensor(
+                rt->norm, rt->next_hidden, rt->next_hidden, rt->hidden,
+                e->model.map, e->model.size, l->post_attention_norm->abs_offset,
+                Q36_N_EMBD, n_tok, Q36_RMS_EPS, rt->inp_q8) != 0;
+        }
+#endif
+        if (!norm_q8 && !q36_gpu_add_rms_norm_tensor(rt->norm, rt->next_hidden, rt->next_hidden, rt->hidden,
                                          e->model.map, e->model.size, l->post_attention_norm->abs_offset,
                                          Q36_N_EMBD, n_tok, Q36_RMS_EPS)) {
             return false;
         }
-        if (!q36_forward_ffn_vulkan(s, l, il, n_tok, rt->norm, rt->hidden)) {
+        if (!q36_forward_ffn_vulkan(s, l, il, n_tok, rt->norm, rt->hidden, norm_q8)) {
             fprintf(stderr, "q36: ffn block failed at pos=%u layer=%u\n", pos0, il);
             return false;
         }
@@ -8335,7 +8346,7 @@ static bool q36_sessions_eval_batch_vulkan(q36_decode_item *items, int count) {
         if (ok) {
             ok = q36_forward_ffn_vulkan_model(
                     rt, &e->model, l, e->expert_weights_scale, il,
-                    rows, rt->norm, rt->hidden, true);
+                    rows, rt->norm, rt->hidden, true, false);
         }
         if (ok && e->directional_steering_ffn_scale != 0.0f) {
             ok = q36_gpu_directional_steering_project_tensor(
@@ -8615,7 +8626,7 @@ static bool q36_mtp_eval_vulkan(q36_session *s,
                                       1,
                                       rt->norm,
                                       rt->mtp_cur,
-                                      false)) return false;
+                                      false, false)) return false;
     if (!q36_gpu_add_tensor(rt->mtp_cur, rt->mtp_next, rt->mtp_cur, Q36_N_EMBD)) return false;
     if (!q36_gpu_rms_norm_weight_rows_tensor(rt->mtp_head,
                                              rt->mtp_cur,

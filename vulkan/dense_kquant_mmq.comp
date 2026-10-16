@@ -36,6 +36,7 @@ const uint Q6_K = 14u;
 #define Q36_BM 32
 #endif
 const uint BM = Q36_BM;
+const uint ROWS_PER_LANE = BM / 8u;
 const uint BN = Q36_BN;
 const uint BK = 32u;
 const uint STRIDE = BK / 2u + 1u;
@@ -221,10 +222,10 @@ void main(void) {
     uint lane = gl_SubgroupInvocationID;
     uint lane_row = lane & 7u;
     uint lane_tok = lane >> 3u;
-    uint out_row0 = row0 + lane_row * 4u;
+    uint out_row0 = row0 + lane_row * ROWS_PER_LANE;
     uint out_tok0 = tok0 + wave * 32u + lane_tok * 8u;
-    f16vec2 sum[16];
-    [[unroll]] for (uint i = 0u; i < 16u; i++) sum[i] = f16vec2(0.0);
+    f16vec2 sum[4u * ROWS_PER_LANE];
+    [[unroll]] for (uint i = 0u; i < 4u * ROWS_PER_LANE; i++) sum[i] = f16vec2(0.0);
 
 #endif
 
@@ -302,13 +303,13 @@ void main(void) {
             }
 #else
             [[unroll]] for (uint k = 0u; k < BK / 2u; k++) {
-                f16vec2 av[4];
+                f16vec2 av[ROWS_PER_LANE];
                 f16vec2 bv[8];
-                [[unroll]] for (uint r = 0u; r < 4u; r++)
-                    av[r] = buf_a[(lane_row * 4u + r) * STRIDE + k];
+                [[unroll]] for (uint r = 0u; r < ROWS_PER_LANE; r++)
+                    av[r] = buf_a[(lane_row * ROWS_PER_LANE + r) * STRIDE + k];
                 [[unroll]] for (uint t = 0u; t < 8u; t++)
                     bv[t] = buf_b[(wave * 32u + lane_tok * 8u + t) * STRIDE + k];
-                [[unroll]] for (uint r = 0u; r < 4u; r++)
+                [[unroll]] for (uint r = 0u; r < ROWS_PER_LANE; r++)
                     [[unroll]] for (uint tp = 0u; tp < 4u; tp++)
                         sum[r * 4u + tp] = fma(f16vec2(av[r].x),
                             f16vec2(bv[2u * tp].x, bv[2u * tp + 1u].x),
@@ -329,7 +330,7 @@ void main(void) {
         if (tok + 1u < pc.n_tok) y[(tok + 1u) * pc.out_dim + row] = float(sum.y);
     }
 #else
-    [[unroll]] for (uint r = 0u; r < 4u; r++) {
+    [[unroll]] for (uint r = 0u; r < ROWS_PER_LANE; r++) {
         uint row = out_row0 + r;
         if (row >= pc.out_dim) continue;
         [[unroll]] for (uint t = 0u; t < 8u; t++) {

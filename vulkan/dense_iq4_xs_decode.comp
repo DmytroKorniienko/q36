@@ -21,7 +21,10 @@ layout(push_constant) uniform Push {
 #ifndef Q36_BOUNDS
 #define Q36_BOUNDS 1
 #endif
-const uint ROWS = 4u;
+#ifndef Q36_ROWS
+#define Q36_ROWS 4
+#endif
+const uint ROWS = Q36_ROWS;
 const uint Q8K_WORDS = 74u;
 const int values[16] = int[16](
     -127, -104, -83, -65, -49, -35, -22, -10,

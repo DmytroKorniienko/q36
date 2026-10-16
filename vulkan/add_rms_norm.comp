@@ -1,4 +1,8 @@
 #version 460
+#ifdef Q36_Q8
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#endif
 
 /* Fused residual add + weighted RMS norm.  One workgroup per row.
  *
@@ -31,12 +35,35 @@ layout(set = 0, binding = 4) writeonly buffer Norm {
     float y[];
 };
 
+#ifdef Q36_Q8
+layout(set = 0, binding = 5) writeonly buffer Q8K { uint q8[]; };
+#endif
+
 layout(push_constant) uniform Push {
     uint n;
     float eps;
 } pc;
 
 shared double sh_sum[256];
+
+#ifdef Q36_Q8
+const uint Q8K_WORDS = 74u;
+
+int nearest_int(float fval) {
+    /* precise: keep the mul that produces fval from contracting into an fma
+     * with this magic-number add, or bytes drift from the CPU quantizer. */
+    precise float val = fval + 12582912.0f;
+    uint bits = floatBitsToUint(val);
+    return int(bits & 0x007fffffu) - 0x00400000;
+}
+
+uint pack_i8x4(int a0, int a1, int a2, int a3) {
+    return (uint(a0) & 255u)
+         | ((uint(a1) & 255u) << 8u)
+         | ((uint(a2) & 255u) << 16u)
+         | ((uint(a3) & 255u) << 24u);
+}
+#endif
 
 void main(void) {
     uint row = gl_WorkGroupID.x;
@@ -56,7 +83,58 @@ void main(void) {
         barrier();
     }
     float scale = inversesqrt(float(sh_sum[0] / double(pc.n)) + pc.eps);
+#ifdef Q36_Q8
+    /* Eight 32-lane subgroups quantize independent blocks after the unchanged
+     * RMS reduction. Lowest-index max ties and rounding match quantize_q8_k. */
+    uint lane = lid & 31u;
+    uint group = lid >> 5u;
+    for (uint first = 0u; first < pc.n / 256u; first += 8u) {
+        uint block = first + group;
+        uint elem = block * 256u + lane * 8u;
+        float v[8];
+        float best_abs = 0.0;
+        float best_val = 0.0;
+        uint best_idx = lane * 8u;
+        for (uint j = 0u; j < 8u; j++) {
+            v[j] = elem + j < pc.n ? (s[base + elem + j] * scale) * w[elem + j] : 0.0;
+            if (elem + j < pc.n) y[base + elem + j] = v[j];
+            if (abs(v[j]) > best_abs) {
+                best_abs = abs(v[j]);
+                best_val = v[j];
+                best_idx = lane * 8u + j;
+            }
+        }
+        float maxabs = subgroupMax(best_abs);
+        uint idx = subgroupMin(best_abs == maxabs ? best_idx : 0xffffffffu);
+        float maxv = subgroupShuffle(best_val, idx / 8u);
+        float iscale = maxv != 0.0 ? float(-127.0 / double(maxv)) : 0.0;
+        float d = iscale != 0.0 ? float(1.0 / double(iscale)) : 0.0;
+        int qv[8];
+        int sum8 = 0;
+        for (uint j = 0u; j < 8u; j++) {
+            int vq = iscale != 0.0 ? nearest_int(iscale * v[j]) : 0;
+            if (vq > 127) vq = 127;
+            qv[j] = vq;
+            sum8 += vq;
+        }
+        uint out_base = (row * (pc.n / 256u) + block) * Q8K_WORDS;
+        if (block < pc.n / 256u) {
+            if (lane == 0u) {
+                q8[out_base] = floatBitsToUint(d);
+                q8[out_base + 1u] = 0u;
+            }
+            q8[out_base + 2u + 2u * lane] = pack_i8x4(qv[0], qv[1], qv[2], qv[3]);
+            q8[out_base + 3u + 2u * lane] = pack_i8x4(qv[4], qv[5], qv[6], qv[7]);
+        }
+        uint src = (lane & 7u) * 4u;
+        int s0 = subgroupShuffle(sum8, src) + subgroupShuffle(sum8, src + 1u);
+        int s1 = subgroupShuffle(sum8, src + 2u) + subgroupShuffle(sum8, src + 3u);
+        if (lane < 8u && block < pc.n / 256u)
+            q8[out_base + 66u + lane] = (uint(s0) & 0xffffu) | ((uint(s1) & 0xffffu) << 16u);
+    }
+#else
     for (uint i = lid; i < pc.n; i += 256u) {
         y[base + i] = (s[base + i] * scale) * w[i];
     }
+#endif
 }
