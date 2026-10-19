@@ -146,6 +146,36 @@ float k_q8_dot_pair(uint b, uint p) {
     return d0 * s0 + d1 * s1;
 }
 
+/* Two q4_0 blocks form a word-aligned 36-byte stripe. Each packed
+ * byte supplies dimensions 16 apart; apply each scale after its dot. */
+float k_q4_dot_pair(uint b, uint p) {
+    uint wi = b >> 2u;
+    uint prev = kc[wi];
+    float d0 = unpackHalf2x16(prev).x;
+    float s0 = 0.0;
+    for (uint k = 0u; k < 4u; k++) {
+        uint next = kc[wi + 1u + k];
+        uint sw = (prev >> 16u) | (next << 16u);
+        prev = next;
+        uint qi = p * 64u + 4u * k;
+        s0 += dot(vec4(unpack8(int(sw & 0x0f0f0f0fu))) - vec4(8.0),
+                  vec4(sh_q[qi], sh_q[qi + 1u], sh_q[qi + 2u], sh_q[qi + 3u]));
+        s0 += dot(vec4(unpack8(int((sw >> 4u) & 0x0f0f0f0fu))) - vec4(8.0),
+                  vec4(sh_q[qi + 16u], sh_q[qi + 17u], sh_q[qi + 18u], sh_q[qi + 19u]));
+    }
+    float d1 = unpackHalf2x16(prev).y;
+    float s1 = 0.0;
+    for (uint k = 0u; k < 4u; k++) {
+        uint sw = kc[wi + 5u + k];
+        uint qi = p * 64u + 32u + 4u * k;
+        s1 += dot(vec4(unpack8(int(sw & 0x0f0f0f0fu))) - vec4(8.0),
+                  vec4(sh_q[qi], sh_q[qi + 1u], sh_q[qi + 2u], sh_q[qi + 3u]));
+        s1 += dot(vec4(unpack8(int((sw >> 4u) & 0x0f0f0f0fu))) - vec4(8.0),
+                  vec4(sh_q[qi + 16u], sh_q[qi + 17u], sh_q[qi + 18u], sh_q[qi + 19u]));
+    }
+    return d0 * s0 + d1 * s1;
+}
+
 float v_q4(uint t, uint vblk, uint vqo, uint vsh) {
     uint b = t * pc.v_row_bytes + vblk;
     uint dw = vc[b >> 2u];
@@ -245,12 +275,12 @@ void main(void) {
         return;
     }
 
-    /* Default resident cache mix: q8_0 keys, q4_0 values.  Word-wide qs
-     * loads with the block scale factored out of the lane sum replace the
-     * per-element byte extraction of the generic path below. */
-    if (pc.k_type == 1u && pc.v_type == 2u && (pc.head_dim & 63u) == 0u) {
+    /* Packed quantized keys with q4_0 values. Word-wide loads and one
+     * scale per block avoid per-element unpacking in the generic path. */
+    if ((pc.k_type == 1u || pc.k_type == 2u) && pc.v_type == 2u && (pc.head_dim & 63u) == 0u) {
         uint pairs = pc.head_dim >> 6u;
-        uint k_head_bytes = (pc.head_dim >> 5u) * 34u;
+        uint k_block_bytes = pc.k_type == 1u ? 34u : 18u;
+        uint k_head_bytes = (pc.head_dim >> 5u) * k_block_bytes;
         uint v_head_bytes = (pc.head_dim >> 5u) * 18u;
         uint vblk = kvh * v_head_bytes + (tid >> 5u) * 18u;
         uint vqo = 2u + (tid & 15u);
@@ -263,7 +293,10 @@ void main(void) {
             float dot = 0.0;
             if ((tid >> 2) < tile_n) {
                 uint kb = key * pc.k_row_bytes + kvh * k_head_bytes;
-                for (uint p = quad; p < pairs; p += 4u) dot += k_q8_dot_pair(kb + p * 68u, p);
+                for (uint p = quad; p < pairs; p += 4u) {
+                    dot += pc.k_type == 1u ? k_q8_dot_pair(kb + p * 68u, p) :
+                                            k_q4_dot_pair(kb + p * 36u, p);
+                }
             }
             dot = subgroupClusteredAdd(dot, 4u);
             if (quad == 0u && (tid >> 2) < tile_n) sh_w[tid >> 2] = dot * scale;

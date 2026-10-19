@@ -235,6 +235,45 @@ void main(void) {
                         }
                         for (uint j = 0u; j < HQ; j++) dot[j] += d0 * s0[j] + d1 * s1[j];
                     }
+                } else if (pc.k_type == 2u && pc.v_type == 2u && (pc.head_dim & 63u) == 0u) {
+                    /* Keep the packed Q4 dot in lockstep with decode. */
+                    uint pairs = pc.head_dim >> 6u;
+                    uint k_head_bytes = (pc.head_dim >> 5u) * 18u;
+                    uint kb = key * pc.k_row_bytes + kvh * k_head_bytes;
+                    for (uint p = quad; p < pairs; p += 4u) {
+                        uint wi = (kb + p * 36u) >> 2u;
+                        uint prev = kc[wi];
+                        float d0 = unpackHalf2x16(prev).x;
+                        float s0[HQ];
+                        float s1[HQ];
+                        for (uint j = 0u; j < HQ; j++) { s0[j] = 0.0; s1[j] = 0.0; }
+                        for (uint k = 0u; k < 4u; k++) {
+                            uint next = kc[wi + 1u + k];
+                            uint sw = (prev >> 16u) | (next << 16u);
+                            prev = next;
+                            vec4 lo = vec4(unpack8(int(sw & 0x0f0f0f0fu))) - vec4(8.0);
+                            vec4 hi = vec4(unpack8(int((sw >> 4u) & 0x0f0f0f0fu))) - vec4(8.0);
+                            uint qi = p * 64u + 4u * k;
+                            for (uint j = 0u; j < HQ; j++) {
+                                uint a = j * 256u + qi;
+                                s0[j] += dot4(lo, vec4(sh_q[a], sh_q[a + 1u], sh_q[a + 2u], sh_q[a + 3u]));
+                                s0[j] += dot4(hi, vec4(sh_q[a + 16u], sh_q[a + 17u], sh_q[a + 18u], sh_q[a + 19u]));
+                            }
+                        }
+                        float d1 = unpackHalf2x16(prev).y;
+                        for (uint k = 0u; k < 4u; k++) {
+                            uint sw = kc[wi + 5u + k];
+                            vec4 lo = vec4(unpack8(int(sw & 0x0f0f0f0fu))) - vec4(8.0);
+                            vec4 hi = vec4(unpack8(int((sw >> 4u) & 0x0f0f0f0fu))) - vec4(8.0);
+                            uint qi = p * 64u + 32u + 4u * k;
+                            for (uint j = 0u; j < HQ; j++) {
+                                uint a = j * 256u + qi;
+                                s1[j] += dot4(lo, vec4(sh_q[a], sh_q[a + 1u], sh_q[a + 2u], sh_q[a + 3u]));
+                                s1[j] += dot4(hi, vec4(sh_q[a + 16u], sh_q[a + 17u], sh_q[a + 18u], sh_q[a + 19u]));
+                            }
+                        }
+                        for (uint j = 0u; j < HQ; j++) dot[j] += d0 * s0[j] + d1 * s1[j];
+                    }
                 } else {
                     for (uint w = quad; w < half_dim; w += 4u) {
                         vec2 kp = vec2(kc_at(key, kvh, 2u * w), kc_at(key, kvh, 2u * w + 1u));

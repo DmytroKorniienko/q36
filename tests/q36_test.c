@@ -4131,8 +4131,9 @@ static float test_kv_at(const uint8_t *row, uint32_t type, uint32_t i) {
  * step (fused/split kernels).  Callers pick pos0/n_tok to cover partial
  * query tiles and multi-span causal ranges. */
 static void test_vulkan_attn_case(uint32_t n_head, uint32_t pos0, uint32_t n_tok,
-                                  uint32_t k_type, uint32_t v_type) {
-    const uint32_t n_head_kv = 2, head_dim = 256;
+                                  uint32_t k_type, uint32_t v_type,
+                                  uint32_t head_dim) {
+    const uint32_t n_head_kv = 2;
     const uint32_t kv_max = pos0 + n_tok;
     const uint32_t cache_row = n_head_kv * head_dim;
     const uint32_t k_row_bytes = test_kv_row_bytes(k_type, cache_row);
@@ -4308,15 +4309,19 @@ static void test_vulkan_attn_decode_fused(void) {
     test_skip("vulkan-kernels", "CPU-only build");
 #else
     /* Single span, partial query tile. */
-    test_vulkan_attn_case(16, 129, 3, Q36_KV_CACHE_F16, Q36_KV_CACHE_F16);
-    /* Two 2048-key spans, query tiles crossing the span boundary, causal
-     * ends landing mid-tile; batch (qtile) vs decode (split) bit equality. */
-    test_vulkan_attn_case(16, 2100, 12, Q36_KV_CACHE_F16, Q36_KV_CACHE_F16);
-    test_vulkan_attn_case(16, 129, 3, Q36_KV_CACHE_Q4_0, Q36_KV_CACHE_Q4_0);
-    test_vulkan_attn_case(16, 129, 3, Q36_KV_CACHE_Q8_0, Q36_KV_CACHE_Q4_0);
+    test_vulkan_attn_case(16, 129, 3, Q36_KV_CACHE_F16, Q36_KV_CACHE_F16, 256);
+    /* Multiple spans with causal ends landing mid-tile; batch (qtile)
+     * and decode (split) must agree bit for bit. */
+    test_vulkan_attn_case(16, 2100, 12, Q36_KV_CACHE_F16, Q36_KV_CACHE_F16, 256);
+    test_vulkan_attn_case(16, 129, 3, Q36_KV_CACHE_Q4_0, Q36_KV_CACHE_Q4_0, 256);
+    test_vulkan_attn_case(12, 510, 3, Q36_KV_CACHE_Q4_0, Q36_KV_CACHE_Q4_0, 256);
+    test_vulkan_attn_case(16, 4094, 5, Q36_KV_CACHE_Q4_0, Q36_KV_CACHE_Q4_0, 256);
+    test_vulkan_attn_case(12, 129, 3, Q36_KV_CACHE_Q4_0, Q36_KV_CACHE_Q4_0, 64);
+    test_vulkan_attn_case(16, 510, 3, Q36_KV_CACHE_Q4_0, Q36_KV_CACHE_Q4_0, 128);
+    test_vulkan_attn_case(16, 129, 3, Q36_KV_CACHE_Q8_0, Q36_KV_CACHE_Q4_0, 256);
     /* Six-head GQA, partial tiles crossing span and span-group boundaries. */
-    test_vulkan_attn_case(12, 510, 3, Q36_KV_CACHE_Q8_0, Q36_KV_CACHE_Q4_0);
-    test_vulkan_attn_case(12, 4094, 5, Q36_KV_CACHE_Q8_0, Q36_KV_CACHE_Q4_0);
+    test_vulkan_attn_case(12, 510, 3, Q36_KV_CACHE_Q8_0, Q36_KV_CACHE_Q4_0, 256);
+    test_vulkan_attn_case(12, 4094, 5, Q36_KV_CACHE_Q8_0, Q36_KV_CACHE_Q4_0, 256);
 #endif
 }
 
