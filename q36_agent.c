@@ -358,11 +358,6 @@ typedef struct {
 } agent_tool_visualizer;
 
 typedef struct {
-    char tail[32];
-    size_t len;
-} agent_qwen_tool_marker_detector;
-
-typedef struct {
     agent_token_renderer *renderer;
     agent_qwen_tool_parser *parser;
     agent_tool_visualizer viz;
@@ -374,8 +369,6 @@ typedef struct {
     size_t pending_len;
     char qwen_tool_start_tail[64];
     size_t qwen_tool_start_len;
-    agent_qwen_tool_marker_detector plain_qwen_tool;
-    agent_qwen_tool_marker_detector think_qwen_tool;
     bool qwen_tool_in_think;
     bool qwen_tool_in_think_reported;
     bool post_think_gap;
@@ -3674,22 +3667,6 @@ static void agent_stream_finish_ignored_qwen_tool(agent_stream_renderer *sr, con
     sr->qwen_tool_ignored = false;
 }
 
-static void agent_stream_malformed_qwen_tool(agent_stream_renderer *sr,
-                                        const char *detail) {
-    const char *msg = detail && detail[0] ? detail :
-        "Qwen tool markup outside a valid tool_call block";
-    if (sr->parser->state == AGENT_QWEN_TOOL_ERROR) return;
-    agent_qwen_tool_set_error(sr->parser, msg);
-    agent_trace(sr->renderer->worker, "malformed qwen_tool in assistant output: %s", msg);
-    if (!sr->renderer->last_output_newline)
-        renderer_plain(sr->renderer, "\n", 1);
-    renderer_color(sr->renderer, "\x1b[1;31m");
-    renderer_plain(sr->renderer, "[invalid tool call: ", 20);
-    renderer_plain(sr->renderer, msg, strlen(msg));
-    renderer_plain(sr->renderer, "]\n", 2);
-    renderer_color(sr->renderer, "\x1b[0m");
-}
-
 /* Mirror parser progress into the terminal visualizer.  Parser state is the
  * source of truth; this function only decides what the user should see. */
 static void agent_stream_tool_events(agent_stream_renderer *sr) {
@@ -3792,15 +3769,11 @@ static void agent_stream_start_qwen_tool(agent_stream_renderer *sr, bool ignored
     }
 }
 
-static void agent_stream_note_plain_qwen_tool_byte(agent_stream_renderer *sr, char c);
-
 static void agent_stream_flush_start_tail(agent_stream_renderer *sr) {
     if (!sr->qwen_tool_start_len) return;
     sr->post_think_gap = false;
     for (size_t i = 0; i < sr->qwen_tool_start_len; i++) {
         renderer_write_char(sr->renderer, sr->qwen_tool_start_tail[i]);
-        agent_stream_note_plain_qwen_tool_byte(sr, sr->qwen_tool_start_tail[i]);
-        if (sr->parser->state == AGENT_QWEN_TOOL_ERROR) break;
     }
     sr->qwen_tool_start_len = 0;
 }
@@ -3817,57 +3790,13 @@ static bool agent_stream_qwen_tool_start_match(const char *tail, size_t len,
     return false;
 }
 
-static bool agent_tail_matches(const char *tail, size_t len,
-                               const char *needle, size_t needle_len) {
-    return len >= needle_len &&
-           memcmp(tail + len - needle_len, needle, needle_len) == 0;
-}
-
-/* Detect tool-call markup not currently owned by the executable parser. Inside
- * <think> the marker means "tool call attempted too early", while in normal
- * assistant output it becomes a retryable tool error. */
-static bool agent_qwen_tool_marker_detector_feed(agent_qwen_tool_marker_detector *d,
-                                            char c) {
-    if (d->len == sizeof(d->tail)) {
-        memmove(d->tail, d->tail + 1, sizeof(d->tail) - 1);
-        d->len--;
-    }
-    d->tail[d->len++] = c;
-
-    static const char *markers[] = {
-        "<function=", "<parameter=", "</parameter>",
-        "</function>", "</tool_call>"
-    };
-    for (size_t i = 0; i < sizeof(markers) / sizeof(markers[0]); i++) {
-        if (agent_tail_matches(d->tail, d->len, markers[i], strlen(markers[i])))
-            return true;
-    }
-    return false;
-}
-
-static void agent_stream_note_thinking_qwen_tool_byte(agent_stream_renderer *sr,
-                                                 char c) {
-    if (!sr->in_think || sr->qwen_tool_in_think) return;
-    if (agent_qwen_tool_marker_detector_feed(&sr->think_qwen_tool, c))
-        sr->qwen_tool_in_think = true;
-}
-
-static void agent_stream_note_plain_qwen_tool_byte(agent_stream_renderer *sr,
-                                              char c) {
-    if (sr->parser->state == AGENT_QWEN_TOOL_ERROR) return;
-    if (sr->qwen_tool_active || sr->in_think || sr->qwen_tool_in_think) return;
-    if (agent_qwen_tool_marker_detector_feed(&sr->plain_qwen_tool, c)) {
-        agent_stream_malformed_qwen_tool(
-            sr, "Qwen tool markup outside a valid tool_call block");
-    }
-}
-
 /* Route ordinary assistant bytes either to normal markdown rendering or into
- * the Qwen tool detector. The opening marker may be split across tokens. */
+ * the Qwen tool detector. Only <tool_call> opens a tool block; function and
+ * parameter tags in prose or thinking are literal text. The opening marker
+ * may be split across tokens. */
 static void agent_stream_normal_byte(agent_stream_renderer *sr, char c) {
     static const char start[] = "<tool_call>";
     if (sr->parser->state == AGENT_QWEN_TOOL_ERROR) return;
-    agent_stream_note_thinking_qwen_tool_byte(sr, c);
 
     /* Qwen may emit blank lines after </think> before prose or a tool call. They are
      * visual gap between the hidden thinking phase and the real answer, and
@@ -3899,12 +3828,6 @@ static void agent_stream_normal_byte(agent_stream_renderer *sr, char c) {
             size_t flush = sr->qwen_tool_start_len - 1;
             for (size_t i = 0; i < flush; i++) {
                 renderer_write_char(sr->renderer, sr->qwen_tool_start_tail[i]);
-                agent_stream_note_plain_qwen_tool_byte(sr, sr->qwen_tool_start_tail[i]);
-                if (sr->parser->state == AGENT_QWEN_TOOL_ERROR) break;
-            }
-            if (sr->parser->state == AGENT_QWEN_TOOL_ERROR) {
-                sr->qwen_tool_start_len = 0;
-                return;
             }
             sr->qwen_tool_start_tail[0] = start[0];
             sr->qwen_tool_start_len = 1;
@@ -3916,7 +3839,6 @@ static void agent_stream_normal_byte(agent_stream_renderer *sr, char c) {
 
     sr->post_think_gap = false;
     renderer_write_char(sr->renderer, c);
-    agent_stream_note_plain_qwen_tool_byte(sr, c);
 }
 
 /* This is the single streaming display state machine for assistant output.  It

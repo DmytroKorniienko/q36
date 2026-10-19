@@ -591,6 +591,104 @@ static char *test_hint_capture(const char *text, size_t split, bool markdown,
     return agent_tail_capture_take(&capture, NULL);
 }
 
+static void test_tool_markup_in_text(void) {
+    const char *literal[] = {
+        "</parameter>",
+        "Don't think about `</parameter>`.",
+        "<think>The user wrote `</parameter>`. I can explain it.</think>"
+        "The tag `</parameter>` closes a parameter.\n",
+        "<think>Tags: <function=bash>, <parameter=command>, </parameter>, "
+        "</function>, </tool_call>.</think>"
+        "Tags: <function=bash>, <parameter=command>, </parameter>, "
+        "</function>, </tool_call>.\n",
+        "<function=bash><parameter=command>literal text</parameter></function>",
+        "```xml\n<parameter=example>\nvalue\n</parameter>\n```\n"
+    };
+    for (size_t t = 0; t < sizeof(literal) / sizeof(literal[0]); t++) {
+        const char *text = literal[t];
+        size_t n = strlen(text);
+        for (size_t split = 0; split <= n + 1; split++) {
+            agent_tail_capture capture = {.cap = 32768};
+            agent_token_renderer renderer = {.capture = &capture,
+                .last_output_newline = true};
+            agent_qwen_tool_parser parser = {.state = AGENT_QWEN_TOOL_SEARCH};
+            agent_stream_renderer stream = {.renderer = &renderer, .parser = &parser};
+            if (split <= n) {
+                agent_stream_text(&stream, text, split, false);
+                AGENT_TEST_ASSERT(!stream.qwen_tool_in_think);
+                AGENT_TEST_ASSERT(parser.state == AGENT_QWEN_TOOL_SEARCH);
+                AGENT_TEST_ASSERT(!agent_stream_wants_greedy_sampling(&stream));
+                agent_stream_text(&stream, text + split, n - split, false);
+            } else {
+                for (size_t i = 0; i < n; i++) {
+                    agent_stream_text(&stream, text + i, 1, false);
+                    AGENT_TEST_ASSERT(!stream.qwen_tool_in_think);
+                    AGENT_TEST_ASSERT(parser.state == AGENT_QWEN_TOOL_SEARCH);
+                    AGENT_TEST_ASSERT(!agent_stream_wants_greedy_sampling(&stream));
+                }
+            }
+            agent_stream_text(&stream, NULL, 0, true);
+            renderer_finish(&renderer);
+            AGENT_TEST_ASSERT(!stream.qwen_tool_in_think);
+            AGENT_TEST_ASSERT(parser.state == AGENT_QWEN_TOOL_SEARCH);
+            AGENT_TEST_ASSERT(parser.calls.len == 0);
+            char *out = agent_tail_capture_take(&capture, NULL);
+            AGENT_TEST_ASSERT(!strstr(out, "tool call ignored") &&
+                              !strstr(out, "invalid tool call"));
+            AGENT_TEST_ASSERT(strstr(out, "</parameter>") != NULL);
+            free(out);
+            agent_qwen_tool_parser_free(&parser);
+        }
+    }
+}
+
+static void test_tool_markup_blocks(void) {
+    const char *blocks[] = {
+        "<think>The user mentioned `</parameter>`.</think>\n"
+        "<tool_call><function=bash><parameter=command>printf '&lt;/parameter>'"
+        "</parameter></function></tool_call>",
+        "<think><tool_call><function=bash><parameter=command>printf BAD"
+        "</parameter></function></tool_call></think>",
+        "<tool_call><parameter=command>printf BAD</parameter></tool_call>"
+    };
+    for (size_t t = 0; t < sizeof(blocks) / sizeof(blocks[0]); t++) {
+        const char *text = blocks[t];
+        size_t n = strlen(text);
+        for (size_t split = 0; split <= n + 1; split++) {
+            agent_tail_capture capture = {.cap = 32768};
+            agent_token_renderer renderer = {.capture = &capture,
+                .last_output_newline = true};
+            agent_qwen_tool_parser parser = {.state = AGENT_QWEN_TOOL_SEARCH};
+            agent_stream_renderer stream = {.renderer = &renderer, .parser = &parser};
+            if (split <= n) {
+                agent_stream_text(&stream, text, split, false);
+                agent_stream_text(&stream, text + split, n - split, false);
+            } else {
+                for (size_t i = 0; i < n; i++)
+                    agent_stream_text(&stream, text + i, 1, false);
+            }
+            agent_stream_text(&stream, NULL, 0, true);
+            renderer_finish(&renderer);
+            if (t == 0) {
+                AGENT_TEST_ASSERT(!stream.qwen_tool_in_think);
+                AGENT_TEST_ASSERT(parser.state == AGENT_QWEN_TOOL_DONE);
+                AGENT_TEST_ASSERT(parser.calls.len == 1);
+                if (parser.calls.len == 1) {
+                    AGENT_TEST_ASSERT(!strcmp(parser.calls.v[0].name, "bash"));
+                    AGENT_TEST_ASSERT(!strcmp(agent_tool_arg_value(&parser.calls.v[0],
+                                              "command"), "printf '</parameter>'"));
+                }
+            } else {
+                AGENT_TEST_ASSERT(parser.calls.len == 0);
+                if (t == 1) AGENT_TEST_ASSERT(stream.qwen_tool_in_think);
+                else AGENT_TEST_ASSERT(parser.state == AGENT_QWEN_TOOL_ERROR);
+            }
+            free(agent_tail_capture_take(&capture, NULL));
+            agent_qwen_tool_parser_free(&parser);
+        }
+    }
+}
+
 static void test_hint_rendering(void) {
     const char *badge = "\x1b[1;97;48;5;23m Hint \x1b[0m";
     const char *sample =
@@ -899,6 +997,8 @@ int main(int argc, char **argv) {
     test_shell_terminal_controls();
     test_fragmented_terminal_input();
     test_markdown_literals();
+    test_tool_markup_in_text();
+    test_tool_markup_blocks();
     test_hint_rendering();
     test_unicode_output_and_footer();
     test_footer_only_updates();
