@@ -1,4 +1,7 @@
 #version 460
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_integer_dot_product : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_KHR_shader_subgroup_basic : require
@@ -13,6 +16,13 @@ layout(set = 0, binding = 0) readonly buffer Weights { uint16_t wh[]; };
 #endif
 layout(set = 0, binding = 1) readonly buffer Q8K { uint q8[]; };
 layout(set = 0, binding = 2) writeonly buffer Output { float y[]; };
+#ifdef Q36_HEAD_MASK
+layout(set = 0, binding = 3) readonly buffer Mask { uint ages[]; };
+#endif
+
+#ifndef Q36_TOKENS
+#define Q36_TOKENS 1
+#endif
 
 layout(push_constant) uniform Push {
     uint in_dim;
@@ -202,10 +212,18 @@ vec4 unpack_i8(uint v) {
                 float(bitfieldExtract(int(v), 24, 8)));
 }
 
+#if Q36_TOKENS == 1
 void main(void) {
     uint lid = gl_LocalInvocationID.x;
     uint itid = lid & 15u;
     uint first_row = gl_WorkGroupID.x * ROWS;
+#ifdef Q36_HEAD_MASK
+    if (ages[first_row / 64u] == 0u) {
+        if (lid < ROWS && first_row + lid < pc.out_dim)
+            y[first_row + lid] = uintBitsToFloat(0xff800000u);
+        return;
+    }
+#endif
     float acc[ROWS];
     for (uint r = 0u; r < ROWS; r++) acc[r] = 0.0;
 
@@ -338,3 +356,104 @@ void main(void) {
         ) y[row] = total * pc.scale;
     }
 }
+#else
+
+void main(void) {
+    uint lid = gl_LocalInvocationID.x;
+    uint part_id = lid & 15u;
+    uint first_row = gl_WorkGroupID.x * ROWS;
+    float acc[Q36_TOKENS][ROWS];
+    [[unroll]] for (uint t = 0u; t < Q36_TOKENS; t++)
+        [[unroll]] for (uint r = 0u; r < ROWS; r++) acc[t][r] = 0.0;
+
+    for (uint b = lid >> 4u; b < pc.blocks; b += 4u) {
+        [[unroll]] for (uint r = 0u; r < ROWS; r++) {
+            uint row = first_row + r;
+            if (row >= pc.out_dim) continue;
+            vec4 w[4];
+            int packed_w[4];
+            float wd = 0.0, wm = 0.0, sc = 0.0, mn = 0.0;
+            if (QTYPE == Q3_K) {
+                uint base = row * pc.row_bytes + 110u * b;
+                wd = load_f16(base + 108u);
+                sc = float(q3_scale(base, part_id));
+                uint half_id = part_id >> 3u, group = part_id & 7u;
+                uint shift = 2u * (group >> 1u);
+                [[unroll]] for (uint i = 0u; i < 4u; i++) {
+                    uint idx = 16u * part_id + 4u * i;
+                    uint qs = (load_u32(base + 32u + half_id * 32u + (idx & 31u)) >> shift) & 0x03030303u;
+                    uint hm = load_u32(base + (idx & 31u));
+                    uint negative = ((hm >> (half_id * 4u + (group >> 1u))) & 0x01010101u) ^ 0x01010101u;
+                    packed_w[i] = int(qs | (negative * 252u));
+                }
+            } else if (QTYPE == Q4_K || QTYPE == Q5_K) {
+                uint base = row * pc.row_bytes + (QTYPE == Q4_K ? 144u : 176u) * b;
+                uint group = part_id >> 1u, scale, minimum;
+                k4_scale_min(base, group, scale, minimum);
+                wd = load_f16(base); wm = load_f16(base + 2u);
+                sc = float(scale); mn = float(minimum);
+                [[unroll]] for (uint i = 0u; i < 4u; i++) {
+                    uint idx = 16u * part_id + 4u * i;
+                    uint ql = load_u32(base + (QTYPE == Q4_K ? 16u : 48u) +
+                                       (group >> 1u) * 32u + (idx & 31u));
+                    uint packed = (group & 1u) == 0u ? ql & 0x0f0f0f0fu : (ql >> 4u) & 0x0f0f0f0fu;
+                    if (QTYPE == Q5_K) {
+                        uint qh = load_u32(base + 16u + (idx & 31u));
+                        packed |= ((qh >> group) & 0x01010101u) << 4u;
+                    }
+                    packed_w[i] = int(packed);
+                }
+            } else if (QTYPE == Q6_K) {
+                uint base = row * pc.row_bytes + 210u * b;
+                wd = load_f16(base + 208u);
+                sc = float(load_i8(base + 192u + part_id));
+                [[unroll]] for (uint i = 0u; i < 4u; i++) {
+                    uint idx = 16u * part_id + 4u * i;
+                    uint half_block = idx >> 7u, in_idx = idx & 127u;
+                    uint l = in_idx & 31u, sel = in_idx >> 5u;
+                    uint off = half_block * 64u + ((sel & 1u) != 0u ? 32u : 0u) + l;
+                    uint ql = load_u32(base + off), qh = load_u32(base + 128u + half_block * 32u + l);
+                    uint low = sel < 2u ? ql & 0x0f0f0f0fu : (ql >> 4u) & 0x0f0f0f0fu;
+                    uint packed = low | (((qh >> (2u * sel)) & 0x03030303u) << 4u);
+                    packed_w[i] = int(packed);
+                }
+            } else {
+                [[unroll]] for (uint i = 0u; i < 4u; i++) w[i] = dequant_word(row, b, 4u * part_id + i);
+            }
+            [[unroll]] for (uint t = 0u; t < Q36_TOKENS; t++) {
+                if (t >= pc.n_tok) continue;
+                uint qbase = (t * pc.blocks + b) * Q8K_WORDS;
+                float yd = uintBitsToFloat(q8[qbase]);
+                float qsum = 0.0, qdot = 0.0;
+                if (QTYPE == Q2_K) {
+                    [[unroll]] for (uint i = 0u; i < 4u; i++)
+                        qdot += dot(w[i], unpack_i8(q8[qbase + 2u + 4u * part_id + i]));
+                } else {
+                    int isum = 0, idot = 0;
+                    [[unroll]] for (uint i = 0u; i < 4u; i++) {
+                        int q = int(q8[qbase + 2u + 4u * part_id + i]);
+                        idot += dotPacked4x8EXT(packed_w[i], q);
+                        isum += dotPacked4x8EXT(0x01010101, q);
+                    }
+                    qsum = float(isum);
+                    qdot = float(idot);
+                }
+                if (QTYPE == Q3_K) acc[t][r] = fma(yd * wd * sc, qdot, acc[t][r]);
+                else {
+                    float part = QTYPE == Q4_K || QTYPE == Q5_K ? wd * sc * qdot - wm * mn * qsum :
+                                 QTYPE == Q6_K ? wd * sc * (qdot - 32.0 * qsum) : qdot;
+                    acc[t][r] = fma(yd, part, acc[t][r]);
+                }
+            }
+        }
+    }
+    [[unroll]] for (uint t = 0u; t < Q36_TOKENS; t++) {
+        if (t >= pc.n_tok) continue;
+        [[unroll]] for (uint r = 0u; r < ROWS; r++) {
+            float total = subgroupAdd(acc[t][r]);
+            uint row = first_row + r;
+            if (lid == 0u && row < pc.out_dim) y[t * pc.out_dim + row] = total * pc.scale;
+        }
+    }
+}
+#endif

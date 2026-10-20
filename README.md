@@ -246,15 +246,52 @@ inputs; imatrix collection still uses the optional llama.cpp tooling.
 
 `./download_model.sh mtp` fetches the optional speculative decoding support
 GGUF for Qwen 3.6 MoE. It can be used with the `q2-imatrix` and
-`q2-q4-imatrix` main models, but must be enabled explicitly with `--mtp`. The
-MTP block can also be embedded in a 41-block MoE GGUF. Pass the same path to
-`-m` and `--mtp` to use it. With `--mtp` omitted, q36 runs the 40-block trunk
-and excludes block 40 from the resident GPU weight cache. The embedded form
-keeps the shared embedding and output tensors in one copy.
+`q2-q4-imatrix` main models, but must be enabled explicitly with `--mtp`.
+Embedded heads are supported in 41-block MoE GGUFs and in the 65-block
+`Qwen3.8-27B-UD-IQ3_S.gguf`. Pass the same path to `-m` and `--mtp` to use
+one. The embedding and output weights remain shared. With `--mtp` omitted,
+the runtime excludes the extra block from the resident GPU weight cache.
 
-The current MTP/speculative decoding path is still experimental: it is
-correctness-gated and currently provides at most a slight speedup, not a
-meaningful generation-speed win.
+For greedy Vulkan generation with the dense embedded head:
+
+```sh
+model=gguf/Qwen3.8-27B-UD-IQ3_S.gguf
+./q36 -m "$model" --mtp "$model" --mtp-draft 8 --mtp-margin 0 \
+  --temp 0 --nothink -p "Write a C function that reverses a linked list."
+```
+
+The verifier uses up to eight tokens per pass. Draft rejection restores the
+accepted recurrent state without replaying target matrices. The MTP cache
+is populated during prefill and corrected from accepted target hidden states.
+Verification shares quantized weights across rows and keeps token selection
+on the GPU. The draft output head uses a small mask of recent target
+alternatives; target verification always scores the full vocabulary.
+
+Dense Vulkan uses up to four rows for recursive MTP. With `--mtp-draft 8`,
+a matching 12–16-token suffix can supply a longer copied tail after MTP
+confirms its first proposal. Positive `--mtp-margin` values use MTP alone.
+The regression tests compare committed tokens and every target logit with
+ordinary decode, including quantized KV, checkpoint restore and verifier
+widths up to eight. MTP also matches a separate ordinary engine with MTP disabled.
+Other recurrent paths use scalar verification to preserve ordinary decode.
+
+MTP remains experimental. On the BC-250, matched greedy runs with 128
+output tokens and Q8_0 K / Q4_0 V cache give these generation rates:
+
+| Context | Story, plain → MTP t/s | Gain | C source, plain → MTP t/s | Gain |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 22.13 → 26.43 | 1.19× | 21.81 → 21.35 | 0.98× |
+| 2048 | 21.73 → 28.17 | 1.30× | 21.67 → 24.07 | 1.11× |
+| 3968 | 21.35 → 23.30 | 1.09× | 21.41 → 26.11 | 1.22× |
+| 4096 | 21.43 → 27.52 | 1.28× | 21.34 → 29.60 | 1.39× |
+| 8192, fresh | 20.48 → 29.02 | 1.42× | — | — |
+
+The first four rows are incremental sweeps; the 8K pair starts directly at
+8K. These two prompts do not demonstrate the requested general 1.5–2× gain.
+Peak GPU allocation grows by 485 MiB at 4K and 538 MiB at 8K. Both ordinary
+and MTP runs peak at 70°C across this set. Plain decode remains the default.
+Commands, correctness logs, superseded experiments and measurements are in
+[the local benchmark artifacts](tests/test-vectors/local/q38-mtp-20261020-v2/README.md).
 
 ## Speed
 
@@ -554,7 +591,7 @@ the current generation and returns to `q36>`.
 Thinking mode is enabled by default. Use `/nothink` or `--nothink` for direct
 answers. `--mtp MTP.gguf --mtp-draft 2` enables the optional MTP speculative
 path for greedy decoding. It uses `--mtp-margin` as a confidence gate and is
-currently an experimental slight-speedup path.
+experimental; benchmark it on the intended workload before choosing it.
 
 ## Server
 
@@ -1070,16 +1107,16 @@ Then it stores:
 - For each recurrent layer: its `float32` convolution history and recurrent
   state tensors.
 
-Version 1 is a legacy token-only input. Loading it rebuilds runtime state by
-prefilling the saved token sequence; current disk KV writes use version 2 or
+Version 1 stores tokens and rebuilds runtime state by prefilling the saved
+sequence. MTP sessions write this version so loading reconstructs both the
+target state and the shifted MTP history. Other sessions write version 2 or
 3 and persist the complete Qwen full-attention and recurrent state.
 
 The logits are raw IEEE-754 `float32` values from the host `q36_session`
 buffer. They are saved immediately after the checkpoint tokens so a loaded
 snapshot can sample or continue from the exact next-token distribution
 without running one extra decode step. MTP draft logits/state are not
-persisted; after loading a disk checkpoint the draft state is invalidated
-and rebuilt by normal generation.
+persisted; an MTP checkpoint rebuilds both models from its saved tokens.
 
 The tensor payload is q36-specific KV/session state, not a generic
 inference graph dump. It is expected to be portable only across compatible

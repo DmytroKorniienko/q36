@@ -326,6 +326,10 @@ int q36_session_eval_speculative_argmax(q36_session *s, int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen);
+int q36_session_eval_speculative_argmax_excluding(q36_session *s, int first_token,
+                                        int max_tokens, int excluded_id,
+                                        int *accepted, int accepted_cap,
+                                        char *err, size_t errlen);
 const float *q36_session_logits(q36_session *s, int *n_vocab);
 void q36_session_invalidate(q36_session *s);
 void q36_session_rewind(q36_session *s, int pos);

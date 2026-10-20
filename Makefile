@@ -119,6 +119,8 @@ VULKAN_SHADERS := \
 	vulkan/kv_store_quant.spv \
 	vulkan/rms_norm_rope_kv_qwen_quant.spv \
 	vulkan/top2.spv \
+	vulkan/mtp_head_mask.spv \
+	vulkan/mtp_head_q5k.spv \
 	vulkan/moe_gate_up_f32b.spv \
 	vulkan/moe_gate_up_decode.spv \
 	vulkan/moe_down_q2k_f32b.spv \
@@ -130,6 +132,9 @@ VULKAN_SHADERS := \
 	vulkan/moe_matvec.spv \
 	vulkan/moe_matvec_fast.spv \
 	vulkan/dense_iq3_xxs_decode.spv \
+	vulkan/dense_iq3_xxs_decode_n2.spv \
+	vulkan/dense_iq3_xxs_decode_n4.spv \
+	vulkan/dense_iq3_xxs_decode_n8.spv \
 	vulkan/dense_iq3_xxs_decode_r4.spv \
 	vulkan/dense_iq3_xxs_mmq.spv \
 	vulkan/dense_iq3_xxs_bm96_mmq.spv \
@@ -140,6 +145,9 @@ VULKAN_SHADERS := \
 	vulkan/dense_iq3_s_decode.spv \
 	vulkan/dense_iq3_s_decode_full.spv \
 	vulkan/dense_iq3_s_decode_r4.spv \
+	vulkan/dense_iq3_s_decode_n2.spv \
+	vulkan/dense_iq3_s_decode_n4.spv \
+	vulkan/dense_iq3_s_decode_n8.spv \
 	vulkan/dense_iq3_s_decode_r1.spv \
 	vulkan/dense_iq3_s_mmq.spv \
 	vulkan/dense_iq3_s_bm96_mmq.spv \
@@ -150,6 +158,9 @@ VULKAN_SHADERS := \
 	vulkan/dense_iq3_s_mmq_r4.spv \
 	vulkan/dense_iq4_xs.spv \
 	vulkan/dense_iq4_xs_decode.spv \
+	vulkan/dense_iq4_xs_decode_n2.spv \
+	vulkan/dense_iq4_xs_decode_n4.spv \
+	vulkan/dense_iq4_xs_decode_n8.spv \
 	vulkan/dense_iq4_xs_decode_r2.spv \
 	vulkan/dense_iq4_xs_mmq.spv \
 	vulkan/dense_iq4_xs_bm64_mmq.spv \
@@ -158,6 +169,18 @@ VULKAN_SHADERS := \
 	vulkan/dense_iq4_xs_mmq_n8.spv \
 	vulkan/dense_iq1_m.spv \
 	vulkan/dense_extra_decode.spv \
+	vulkan/dense_iq2_xxs_verify_n2.spv \
+	vulkan/dense_iq2_xxs_verify_n4.spv \
+	vulkan/dense_iq2_xxs_verify_n8.spv \
+	vulkan/dense_iq2_xs_verify_n2.spv \
+	vulkan/dense_iq2_xs_verify_n4.spv \
+	vulkan/dense_iq2_xs_verify_n8.spv \
+	vulkan/dense_iq2_s_verify_n2.spv \
+	vulkan/dense_iq2_s_verify_n4.spv \
+	vulkan/dense_iq2_s_verify_n8.spv \
+	vulkan/dense_extra_decode_n2.spv \
+	vulkan/dense_extra_decode_n4.spv \
+	vulkan/dense_extra_decode_n8.spv \
 	vulkan/dense_iq4_nl_decode.spv \
 	vulkan/dense_iq2_s_decode.spv \
 	vulkan/dense_extra_mmq.spv \
@@ -171,6 +194,18 @@ VULKAN_SHADERS := \
 	vulkan/dense_kquant_mmq_n4.spv \
 	vulkan/dense_kquant_mmq_n8.spv \
 	vulkan/dense_kquant_decode.spv \
+	vulkan/dense_q5k_verify_n2.spv \
+	vulkan/dense_q5k_verify_n4.spv \
+	vulkan/dense_q5k_verify_n8.spv \
+	vulkan/dense_q4k_verify_n2.spv \
+	vulkan/dense_q4k_verify_n4.spv \
+	vulkan/dense_q4k_verify_n8.spv \
+	vulkan/dense_q3k_verify_n2.spv \
+	vulkan/dense_q3k_verify_n4.spv \
+	vulkan/dense_q3k_verify_n8.spv \
+	vulkan/dense_kquant_decode_n2.spv \
+	vulkan/dense_kquant_decode_n4.spv \
+	vulkan/dense_kquant_decode_n8.spv \
 	vulkan/dense_kquant_decode_r2.spv \
 	vulkan/dense_q5k_decode_r1.spv \
 	vulkan/dense_q4k_decode_r1.spv \
@@ -218,6 +253,45 @@ vulkan/dense_iq3_s_decode.spv: vulkan/dense_iq3_s_decode.comp q36_iq3s_grid_valu
 
 vulkan/dense_iq3_s_decode_full.spv: vulkan/dense_iq3_s_decode.comp q36_iq3s_grid_values.inc
 	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_BOUNDS=0 -o $@ $<
+
+vulkan/dense_iq3_xxs_decode_n%.spv: vulkan/dense_iq3_xxs_decode.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_ROWS=4 -DQ36_TOKENS=$* $< -o $@
+
+vulkan/dense_iq4_xs_decode_n%.spv: vulkan/dense_iq4_xs_decode.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_ROWS=4 -DQ36_TOKENS=$* $< -o $@
+
+vulkan/dense_kquant_decode_n%.spv: vulkan/dense_kquant_decode.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_ROWS=4 -DQ36_TOKENS=$* $< -o $@
+
+vulkan/dense_extra_decode_n%.spv: vulkan/dense_extra_decode.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_ROWS=4 -DQ36_TOKENS=$* $< -o $@
+
+vulkan/dense_q3k_verify_n%.spv: vulkan/dense_kquant_decode.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_ROWS=4 -DQ36_TOKENS=$* -DQ36_Q3K_ONLY=1 $< -o $@
+
+vulkan/dense_q4k_verify_n%.spv: vulkan/dense_kquant_decode.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_ROWS=4 -DQ36_TOKENS=$* -DQ36_Q4K_ONLY=1 $< -o $@
+
+vulkan/dense_q5k_verify_n%.spv: vulkan/dense_kquant_decode.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_ROWS=4 -DQ36_TOKENS=$* -DQ36_Q5K_ONLY=1 $< -o $@
+
+vulkan/mtp_head_q5k.spv: vulkan/dense_kquant_decode.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_Q5K_ONLY=1 -DQ36_HEAD_MASK=1 $< -o $@
+
+vulkan/mtp_head_mask.spv: vulkan/mtp_head_mask.comp
+	$(GLSLC) -O --target-env=vulkan1.1 $< -o $@
+
+vulkan/dense_iq2_s_verify_n%.spv: vulkan/dense_extra_decode.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_ROWS=4 -DQ36_TOKENS=$* -DQ36_TYPE=22 $< -o $@
+
+vulkan/dense_iq2_xs_verify_n%.spv: vulkan/dense_extra_decode.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_ROWS=4 -DQ36_TOKENS=$* -DQ36_TYPE=17 $< -o $@
+
+vulkan/dense_iq2_xxs_verify_n%.spv: vulkan/dense_extra_decode.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_ROWS=4 -DQ36_TOKENS=$* -DQ36_TYPE=16 $< -o $@
+
+vulkan/dense_iq3_s_decode_n%.spv: vulkan/dense_iq3_s_decode.comp q36_iq3s_grid_values.inc
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_ROWS=4 -DQ36_TOKENS=$* $< -o $@
 
 vulkan/dense_iq3_s_decode_r4.spv: vulkan/dense_iq3_s_decode.comp q36_iq3s_grid_values.inc
 	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_ROWS=4 -DQ36_BOUNDS=0 -o $@ $<
@@ -485,13 +559,13 @@ cpu: q36_cli_cpu.o linenoise_cpu.o q36_server_cpu.o rax_cpu.o q36_bench_cpu.o q3
 	$(CC) $(CPU_CFLAGS) -o q36_test q36_test_cpu.o rax_cpu.o q36_ssd_cpu.o q36_prompt_prefix.o $(CPU_CORE_OBJS) $(LDLIBS)
 
 # --- GPU (default) objects ---
-q36_gpu_core.o: q36.c q36.h q36_image.h q36_gpu.h q36_quant.h q36_ssd.h q36_iq_tables.h q36_iq3s_grid_values.inc q36_streaming_hotlist.inc
+q36_gpu_core.o: q36.c q36.h q36_mtp.h q36_image.h q36_gpu.h q36_quant.h q36_ssd.h q36_iq_tables.h q36_iq3s_grid_values.inc q36_streaming_hotlist.inc
 	$(CC) $(GPU_CFLAGS) -c -o $@ q36.c
 
-q36_gpu_core_metal.o: q36.c q36.h q36_image.h q36_gpu.h q36_quant.h q36_ssd.h q36_iq_tables.h q36_iq3s_grid_values.inc q36_streaming_hotlist.inc
+q36_gpu_core_metal.o: q36.c q36.h q36_mtp.h q36_image.h q36_gpu.h q36_quant.h q36_ssd.h q36_iq_tables.h q36_iq3s_grid_values.inc q36_streaming_hotlist.inc
 	$(CC) $(GPU_CFLAGS) -DQ36_METAL -c -o $@ q36.c
 
-q36_gpu_core_metal_test.o: q36.c q36.h q36_gpu.h q36_quant.h q36_ssd.h q36_iq_tables.h q36_iq3s_grid_values.inc q36_streaming_hotlist.inc
+q36_gpu_core_metal_test.o: q36.c q36.h q36_mtp.h q36_gpu.h q36_quant.h q36_ssd.h q36_iq_tables.h q36_iq3s_grid_values.inc q36_streaming_hotlist.inc
 	$(CC) $(GPU_CFLAGS) -DQ36_METAL -DQ36_METAL_TEST_COMPAT -c -o $@ q36.c
 
 q36_cli_metal.o: q36_prompt_prefix.h q36_cli.c q36.h q36_ssd.h linenoise.h
@@ -530,10 +604,10 @@ q36_ssd.o: q36_ssd.c q36_ssd.h
 q36_web.o: q36_web.c q36_web.h
 	$(CC) $(GPU_CFLAGS) -c -o $@ q36_web.c
 
-q36_test.o: tests/q36_test.c q36_server.c q36.h rax.h q36_gpu.h q36_tool_text.h
+q36_test.o: tests/q36_test.c q36_server.c q36.h q36_mtp.h rax.h q36_gpu.h q36_tool_text.h
 	$(CC) $(GPU_CFLAGS) -Wno-unused-function -c -o $@ tests/q36_test.c
 
-q36_test_metal.o: tests/q36_test.c q36_server.c q36.h rax.h q36_gpu.h q36_tool_text.h
+q36_test_metal.o: tests/q36_test.c q36_server.c q36.h q36_mtp.h rax.h q36_gpu.h q36_tool_text.h
 	$(CC) $(GPU_CFLAGS) -DQ36_METAL -Wno-unused-function -c -o $@ tests/q36_test.c
 
 gguf-tools/quality-testing/score_openrouter.o: gguf-tools/quality-testing/score_openrouter.c q36.h q36_ssd.h q36_prompt_prefix.h
@@ -573,7 +647,7 @@ vulkan/matmul_q6k_mmq.spv: vulkan/matmul_q6k_mmq.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
 # --- CPU-only objects (-DQ36_NO_GPU) ---
-q36_cpu.o: q36.c q36.h q36_image.h q36_gpu.h q36_quant.h q36_ssd.h q36_iq_tables.h q36_iq3s_grid_values.inc q36_streaming_hotlist.inc
+q36_cpu.o: q36.c q36.h q36_mtp.h q36_image.h q36_gpu.h q36_quant.h q36_ssd.h q36_iq_tables.h q36_iq3s_grid_values.inc q36_streaming_hotlist.inc
 	$(CC) $(CPU_CFLAGS) -c -o $@ q36.c
 
 q36_image.o: q36_image.c q36_image.h third_party/iris/jpeg.h third_party/iris/png.h
@@ -606,10 +680,10 @@ q36_ssd_cpu.o: q36_ssd.c q36_ssd.h
 q36_web_cpu.o: q36_web.c q36_web.h
 	$(CC) $(CPU_CFLAGS) -c -o $@ q36_web.c
 
-q36_test_cpu.o: tests/q36_test.c q36_server.c q36.h rax.h q36_tool_text.h
+q36_test_cpu.o: tests/q36_test.c q36_server.c q36.h q36_mtp.h rax.h q36_tool_text.h
 	$(CC) $(CPU_CFLAGS) -Wno-unused-function -c -o $@ tests/q36_test.c
 
-q36_sampling_test_core.o: q36.c q36.h q36_gpu.h q36_quant.h q36_ssd.h q36_iq_tables.h q36_iq3s_grid_values.inc q36_streaming_hotlist.inc
+q36_sampling_test_core.o: q36.c q36.h q36_mtp.h q36_gpu.h q36_quant.h q36_ssd.h q36_iq_tables.h q36_iq3s_grid_values.inc q36_streaming_hotlist.inc
 	$(CC) $(CPU_CFLAGS) -Wno-unused-function -DQ36_TEST_HOOKS -c -o $@ q36.c
 
 tests/test_sampling.o: tests/test_sampling.c q36.h
@@ -631,7 +705,7 @@ test: all q36_agent_test $(SAMPLING_TEST) test-quality
 	python3 tests/test_agent_password.py ./q36_agent_test
 	python3 tests/test_agent_terminal.py ./q36_agent_test
 	./tests/test_sampling
-	./q36_test --quant-primitives --ssd-cache-shrink --qwen-tool-call-format --vector-fixtures --server
+	./q36_test --mtp-lookup --quant-primitives --ssd-cache-shrink --qwen-tool-call-format --vector-fixtures --server
 
 test-quick: test
 
@@ -827,7 +901,7 @@ test-long: q36_test
 		-o $@ tests/test-vectors/llama_qwen_logprobs_capture.c \
 		$(LLAMA_LIBS) $(LDLIBS) $(LLAMA_LDLIBS)
 
-q36_llama_test.o: tests/q36_test.c q36_server.c q36.h rax.h q36_gpu.h q36_tool_text.h
+q36_llama_test.o: tests/q36_test.c q36_server.c q36.h q36_mtp.h rax.h q36_gpu.h q36_tool_text.h
 	$(CC) $(CPU_CFLAGS) $(LLAMA_INCLUDE) -DQ36_WITH_LLAMA -Wno-unused-function -c -o $@ tests/q36_test.c
 
 q36_llama_test: q36_llama_test.o rax_cpu.o q36_ssd_cpu.o q36_prompt_prefix.o $(CPU_CORE_OBJS)

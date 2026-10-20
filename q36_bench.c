@@ -647,10 +647,10 @@ int main(int argc, char **argv) {
                 break;
             }
             if (spec) {
-                /* Only the frontier token skips EOS; accepted draft tokens may
-                 * include it, but decode always runs to exactly gen-tokens. */
+                /* Both draft and target skip EOS, matching ordinary decode
+                 * through the entire fixed-length benchmark continuation. */
                 int toks[17];
-                const int n = q36_session_eval_speculative_argmax(session,
+                const int n = q36_session_eval_speculative_argmax_excluding(session,
                         token, cfg.gen_tokens - i, eos,
                         toks, (int)(sizeof(toks) / sizeof(toks[0])),
                         err, sizeof(err));

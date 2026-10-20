@@ -2606,6 +2606,37 @@ int q36_gpu_router_topk_tensor(
     return 1;
 }
 
+int q36_gpu_gdn_front_supported(uint32_t width, uint32_t groups, uint32_t heads) {
+    (void)width; (void)groups; (void)heads;
+    return 0;
+}
+
+int q36_gpu_top2_rows_tensor(q36_gpu_tensor *out_ids,
+                            const q36_gpu_tensor *logits,
+                            uint32_t count, uint32_t rows, int excluded_id) {
+    (void)out_ids; (void)logits; (void)count; (void)rows; (void)excluded_id;
+    return 0;
+}
+
+int q36_gpu_mtp_head_mask_tensor(q36_gpu_tensor *mask,
+                                const q36_gpu_tensor *logits,
+                                const q36_gpu_tensor *top_ids,
+                                uint32_t count, uint32_t rows) {
+    (void)mask; (void)logits; (void)top_ids; (void)count; (void)rows;
+    return 0;
+}
+
+int q36_gpu_mtp_head_tensor(q36_gpu_tensor *out,
+                           const void *model_map, uint64_t model_size,
+                           uint64_t weight_offset, uint32_t weight_type,
+                           uint32_t in_dim, uint32_t out_dim,
+                           const q36_gpu_tensor *x, const q36_gpu_tensor *mask,
+                           float scale) {
+    (void)out; (void)model_map; (void)model_size; (void)weight_offset;
+    (void)weight_type; (void)in_dim; (void)out_dim; (void)x; (void)mask; (void)scale;
+    return 0;
+}
+
 int q36_gpu_top2_tensor(q36_gpu_tensor *out_ids,
                         const q36_gpu_tensor *logits,
                         uint32_t count) {

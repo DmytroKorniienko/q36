@@ -407,6 +407,7 @@ int q36_gpu_recurrent_conv_step_tensor(
         q36_gpu_tensor       *window,
         uint32_t                n_tok);
 
+int q36_gpu_gdn_front_supported(uint32_t width, uint32_t groups, uint32_t heads);
 int q36_gpu_gdn_front_tensor(q36_gpu_tensor *history,
     const q36_gpu_tensor *cur, const q36_gpu_tensor *x,
     q36_gpu_tensor *q, q36_gpu_tensor *k, q36_gpu_tensor *v, q36_gpu_tensor *gb,
@@ -641,6 +642,23 @@ int q36_gpu_top2_tensor(
         q36_gpu_tensor       *out_ids,
         const q36_gpu_tensor *logits,
         uint32_t              count);
+
+/* Two ids per row, with one optional token excluded from the search. */
+int q36_gpu_top2_rows_tensor(q36_gpu_tensor *out_ids,
+                            const q36_gpu_tensor *logits,
+                            uint32_t count, uint32_t rows, int excluded_id);
+
+/* Speculative head pruning affects proposals only; target logits stay full. */
+int q36_gpu_mtp_head_mask_tensor(q36_gpu_tensor *mask,
+                                const q36_gpu_tensor *logits,
+                                const q36_gpu_tensor *top_ids,
+                                uint32_t count, uint32_t rows);
+int q36_gpu_mtp_head_tensor(q36_gpu_tensor *out,
+                           const void *model_map, uint64_t model_size,
+                           uint64_t weight_offset, uint32_t weight_type,
+                           uint32_t in_dim, uint32_t out_dim,
+                           const q36_gpu_tensor *x, const q36_gpu_tensor *mask,
+                           float scale);
 
 /* One routed expert weight: GGUF offset/type of the 3D expert tensor plus the
  * optional per-expert ".scale" tensor (n_expert f32). */

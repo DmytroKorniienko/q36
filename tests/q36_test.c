@@ -2,6 +2,7 @@
 #define Q36_SERVER_TEST_NO_MAIN
 #include "../q36_server.c"
 #include "../q36_quant.h"
+#include "../q36_mtp.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <float.h>
@@ -3148,6 +3149,65 @@ static void test_vulkan_small_one(uint32_t type, uint32_t block_bytes,
             for (uint32_t i = n * out_dim; i < tokens * out_dim; i++)
                 TEST_ASSERT(got[i] == 12345.0f);
         }
+
+        /* The verifier shares weights across tokens but must preserve the
+         * single-token accumulation, including non-power-of-two tails. */
+        for (uint32_t t = 0; t < 8; t++) {
+            q36_gpu_tensor *xi = q36_gpu_tensor_view(x, (uint64_t)t * in_dim * sizeof(float),
+                                                     (uint64_t)in_dim * sizeof(float));
+            q36_gpu_tensor *yi = q36_gpu_tensor_view(ref, (uint64_t)t * out_dim * sizeof(float),
+                                                       (uint64_t)out_dim * sizeof(float));
+            TEST_ASSERT(xi && yi);
+            if (xi && yi) TEST_ASSERT(type == 8 ?
+                q36_gpu_matmul_q8_0_scaled_tensor(yi, weights, weight_bytes, 0,
+                    in_dim, out_dim, xi, 1, scales[s]) != 0 :
+                matmul(yi, weights, weight_bytes, 0, type,
+                    in_dim, out_dim, xi, 1, scales[s]) != 0);
+            q36_gpu_tensor_free(xi);
+            q36_gpu_tensor_free(yi);
+        }
+        TEST_ASSERT(q36_gpu_tensor_read(ref, 0, want, 8u * out_dim * sizeof(float)) != 0);
+        if (type == 13) {
+            uint32_t ages[3] = {1, 0, 1};
+            q36_gpu_tensor *mask = q36_gpu_tensor_alloc(sizeof(ages));
+            TEST_ASSERT(mask != NULL);
+            if (mask) {
+                TEST_ASSERT(q36_gpu_tensor_write(mask, 0, ages, sizeof(ages)) != 0);
+                for (uint32_t i = 0; i < tokens * out_dim; i++) got[i] = 12345.0f;
+                TEST_ASSERT(q36_gpu_tensor_write(out, 0, got, y_bytes) != 0);
+                TEST_ASSERT(q36_gpu_mtp_head_tensor(out, weights, weight_bytes, 0,
+                    type, in_dim, out_dim, x, mask, scales[s]) != 0);
+                TEST_ASSERT(q36_gpu_tensor_read(out, 0, got, y_bytes) != 0);
+                for (uint32_t i = 0; i < out_dim; i++) {
+                    if (ages[i / 64u]) TEST_ASSERT(memcmp(got + i, want + i, sizeof(float)) == 0);
+                    else TEST_ASSERT(isinf(got[i]) && got[i] < 0.0f);
+                }
+                for (uint32_t i = out_dim; i < tokens * out_dim; i++)
+                    TEST_ASSERT(got[i] == 12345.0f);
+            }
+            q36_gpu_tensor_free(mask);
+        }
+        q36_gpu_set_micro_batch(true);
+        for (uint32_t n = 2; n <= 8; n++) {
+            for (uint32_t i = 0; i < tokens * out_dim; i++) got[i] = 12345.0f;
+            TEST_ASSERT(q36_gpu_tensor_write(out, 0, got, y_bytes) != 0);
+            TEST_ASSERT(type == 8 ?
+                q36_gpu_matmul_q8_0_scaled_tensor(out, weights, weight_bytes, 0,
+                    in_dim, out_dim, x, n, scales[s]) != 0 :
+                matmul(out, weights, weight_bytes, 0, type,
+                    in_dim, out_dim, x, n, scales[s]) != 0);
+            TEST_ASSERT(q36_gpu_tensor_read(out, 0, got, y_bytes) != 0);
+            if (memcmp(got, want, n * out_dim * sizeof(float))) {
+                uint32_t i = 0;
+                while (i < n * out_dim && got[i] == want[i]) i++;
+                fprintf(stderr, "q36-test: verify type=%u rows=%u n=%u at=%u got=%g want=%g\n",
+                        type, out_dim, n, i, got[i], want[i]);
+                TEST_ASSERT(false);
+            }
+            for (uint32_t i = n * out_dim; i < tokens * out_dim; i++)
+                TEST_ASSERT(got[i] == 12345.0f);
+        }
+        q36_gpu_set_micro_batch(false);
     }
 cleanup:
     q36_gpu_tensor_free(x);
@@ -4366,7 +4426,87 @@ done:
 #endif
 }
 
+static void test_mtp_lookup(void) {
+    int history[27], ambiguous[43];
+    for (int i = 0; i < 12; i++) history[i] = ambiguous[i] = ambiguous[16 + i] = i;
+    for (int i = 0; i < 11; i++) history[16 + i] = ambiguous[32 + i] = i;
+    for (int i = 0; i < 3; i++) history[12 + i] = ambiguous[12 + i] = ambiguous[28 + i] = 101 + i;
+    history[15] = ambiguous[15] = -5;
+    ambiguous[31] = -6;
+    ambiguous[29] = 999;
+    int draft[5] = {-1,-1,-1,-1,-1};
+    const int want[] = {11,101,102,103,-1};
+    TEST_ASSERT(q36_mtp_lookup(history, 27, 11, draft, 4) == 4);
+    TEST_ASSERT(memcmp(draft, want, sizeof(want)) == 0);
+    TEST_ASSERT(q36_mtp_lookup(history, 27, 11, draft, 1) == 0);
+    TEST_ASSERT(q36_mtp_lookup(history, 5, 11, draft, 4) == 0);
+    TEST_ASSERT(q36_mtp_lookup(history, 27, 99, draft, 4) == 0);
+    TEST_ASSERT(q36_mtp_lookup(ambiguous, 43, 11, draft, 4) == 0);
+    ambiguous[31] = -5;
+    TEST_ASSERT(q36_mtp_lookup(ambiguous, 43, 11, draft, 4) == 4);
+    TEST_ASSERT(draft[0] == 11 && draft[1] == 101 && draft[2] == 999 && draft[3] == 103);
+    ambiguous[29] = 102;
+    ambiguous[31] = -6;
+    TEST_ASSERT(q36_mtp_lookup(ambiguous, 43, 11, draft, 4) == 4);
+    TEST_ASSERT(memcmp(draft, want, sizeof(want)) == 0);
+}
+
+static void test_vulkan_top2_rows(void) {
+#if !defined(Q36_NO_GPU) && !defined(Q36_METAL)
+    q36_gpu_set_quality(false);
+    enum { count = 33027, rows = 8, blocks = (count + 63) / 64 };
+    float *values = malloc((size_t)count * rows * sizeof(float));
+    int32_t got[rows * 2 + 1];
+    uint32_t ages[blocks];
+    q36_gpu_tensor *x = q36_gpu_tensor_alloc((uint64_t)count * rows * sizeof(float));
+    q36_gpu_tensor *ids = q36_gpu_tensor_alloc(sizeof(got));
+    q36_gpu_tensor *mask = q36_gpu_tensor_alloc(sizeof(ages));
+    TEST_ASSERT(values && x && ids && mask);
+    if (!values || !x || !ids || !mask) goto done;
+    for (unsigned row = 0; row < rows; row++) {
+        float *v = values + row * count;
+        for (unsigned i = 0; i < count; i++) v[i] = -50.0f;
+        v[5] = 20.0f;
+        v[200 + row] = v[32768 + row] = 10.0f;
+    }
+    TEST_ASSERT(q36_gpu_tensor_write(x, 0, values, (uint64_t)count * rows * sizeof(float)) != 0);
+    for (unsigned i = 0; i < rows * 2 + 1; i++) got[i] = -99;
+    TEST_ASSERT(q36_gpu_tensor_write(ids, 0, got, sizeof(got)) != 0);
+    TEST_ASSERT(q36_gpu_top2_rows_tensor(ids, x, count, rows, -1) != 0);
+    TEST_ASSERT(q36_gpu_tensor_read(ids, 0, got, sizeof(got)) != 0);
+    for (unsigned row = 0; row < rows; row++) {
+        TEST_ASSERT(got[2 * row] == 5);
+        TEST_ASSERT(got[2 * row + 1] == 200 + (int)row);
+    }
+    TEST_ASSERT(got[rows * 2] == -99);
+    TEST_ASSERT(q36_gpu_top2_rows_tensor(ids, x, count, rows, 5) != 0);
+    TEST_ASSERT(q36_gpu_tensor_read(ids, 0, got, sizeof(got)) != 0);
+    for (unsigned row = 0; row < rows; row++) {
+        TEST_ASSERT(got[2 * row] == 200 + (int)row);
+        TEST_ASSERT(got[2 * row + 1] == 32768 + (int)row);
+    }
+    TEST_ASSERT(q36_gpu_mtp_head_mask_tensor(mask, x, ids, count, rows) != 0);
+    TEST_ASSERT(q36_gpu_tensor_read(mask, 0, ages, sizeof(ages)) != 0);
+    for (unsigned i = 0; i < blocks; i++) TEST_ASSERT(ages[i] == (i <= 512 ? 4u : 0u));
+    /* Once the target alternatives move away, their blocks age out. */
+    TEST_ASSERT(q36_gpu_top2_rows_tensor(ids, x, count, rows, -1) != 0);
+    for (unsigned step = 1; step <= 4; step++) {
+        TEST_ASSERT(q36_gpu_mtp_head_mask_tensor(mask, x, ids, count, rows) != 0);
+        TEST_ASSERT(q36_gpu_tensor_read(mask, 0, ages, sizeof(ages)) != 0);
+        TEST_ASSERT(ages[512] == 4u - step);
+        TEST_ASSERT(ages[511] == 4u && ages[blocks - 1] == 0u);
+    }
+done:
+    free(values);
+    q36_gpu_tensor_free(x);
+    q36_gpu_tensor_free(ids);
+    q36_gpu_tensor_free(mask);
+    q36_gpu_cleanup();
+#endif
+}
+
 static void test_vulkan_kernels(void) {
+    test_vulkan_top2_rows();
     test_vulkan_host_overwrite();
     test_metal_f16_matvec_fast_nr0_4();
     test_vulkan_f32_matvec();
@@ -6711,6 +6851,24 @@ static void test_gpu_cpu_parity(void) {
         selected[i] = true;
         fprintf(stderr, "q36-test: gpu-cpu-parity CPU capture %s\n", cases[i].id);
         test_backend_parity_capture_cpu(cpu_engine, &cases[i], &captures[i]);
+        const char *dump = getenv("Q36_TEST_PARITY_DUMP_DIR");
+        if (dump && dump[0] && captures[i].steps > 0) {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s/%s.bin", dump, cases[i].id);
+            FILE *fp = fopen(path, "wb");
+            TEST_ASSERT(fp != NULL);
+            if (fp) {
+                const test_backend_parity_capture *c = &captures[i];
+                uint32_t shape[] = {0x51333650u, (uint32_t)c->vocab,
+                    (uint32_t)c->steps, (uint32_t)c->prompt.len};
+                TEST_ASSERT(fwrite(shape, sizeof(shape), 1, fp) == 1);
+                TEST_ASSERT(fwrite(c->prompt.v, sizeof(int), c->prompt.len, fp) == (size_t)c->prompt.len);
+                TEST_ASSERT(fwrite(c->tokens, sizeof(int), c->steps, fp) == (size_t)c->steps);
+                for (int step = 0; step < c->steps; step++)
+                    TEST_ASSERT(fwrite(c->logits[step], sizeof(float), c->vocab, fp) == (size_t)c->vocab);
+                TEST_ASSERT(fclose(fp) == 0);
+            }
+        }
     }
     q36_engine_close(cpu_engine);
 
@@ -7427,12 +7585,24 @@ static void test_mtp_verifier_replay(void) {
         test_skip("mtp-verifier", "model or MTP file not found");
         return;
     }
+    const char *frontier_env = getenv("Q36_TEST_MTP_FRONTIER");
+    int frontier = frontier_env ? atoi(frontier_env) : 0;
+    const char *draft_env = getenv("Q36_TEST_MTP_DRAFT");
+    int draft = draft_env ? atoi(draft_env) : 4;
+    const char *tokens_env = getenv("Q36_TEST_MTP_TOKENS");
+    int limit = tokens_env ? atoi(tokens_env) : 96;
+    if (limit < 16) limit = 16;
+    if (limit > 512) limit = 512;
+    int ctx = frontier > 0 ? frontier + limit + 32 : 4096;
+    bool compact = getenv("Q36_TEST_MTP_COMPACT") != NULL;
     q36_engine_options opt = {
         .model_path = test_model_path(),
         .mtp_path = test_mtp_path(),
         .backend = Q36_BACKEND_VULKAN,
-        .mtp_draft_tokens = 4,
+        .mtp_draft_tokens = draft,
         .mtp_margin = 0.0f,
+        .cache_type_k = compact ? Q36_KV_CACHE_Q8_0 : Q36_KV_CACHE_F16,
+        .cache_type_v = compact ? Q36_KV_CACHE_Q4_0 : Q36_KV_CACHE_F16,
     };
     q36_engine *engine = NULL;
     q36_session *spec = NULL;
@@ -7442,38 +7612,67 @@ static void test_mtp_verifier_replay(void) {
     int committed = 0;
     int multi = 0;
     int partial = 0;
-    float worst_gap = 0.0f;
+    int longest = 0;
+    float worst_gap = 0.0f, worst_logits = 0.0f;
 
     TEST_ASSERT(q36_engine_open(&engine, &opt) == 0);
     if (!engine) return;
     TEST_ASSERT(q36_engine_has_mtp(engine));
-    TEST_ASSERT(q36_engine_mtp_draft_tokens(engine) > 2);
+    TEST_ASSERT(q36_engine_mtp_draft_tokens(engine) > 1);
     q36_encode_chat_prompt(engine, "",
         "Explain why speculative decoding is exact, then give a small C example.",
         Q36_THINK_NONE, &prompt);
-    TEST_ASSERT(q36_session_create(&spec, engine, 4096) == 0);
-    TEST_ASSERT(q36_session_create(&plain, engine, 4096) == 0);
+    if (frontier > 0) {
+        const char *path = getenv("Q36_TEST_MTP_PROMPT");
+        char *text = test_read_file(path && path[0] ? path : "tests/long_context_story_prompt.txt");
+        TEST_ASSERT(text != NULL);
+        if (!text) goto done;
+        q36_tokens_free(&prompt);
+        q36_tokenize_text(engine, text, &prompt);
+        free(text);
+        TEST_ASSERT(prompt.len >= frontier);
+        if (prompt.len < frontier) goto done;
+        prompt.len = frontier;
+    }
+    TEST_ASSERT(q36_session_create(&spec, engine, ctx) == 0);
+    TEST_ASSERT(q36_session_create(&plain, engine, ctx) == 0);
     if (!spec || !plain) goto done;
     TEST_ASSERT(q36_session_sync(spec, &prompt, err, sizeof(err)) == 0);
     TEST_ASSERT(q36_session_sync(plain, &prompt, err, sizeof(err)) == 0);
 
-    while (committed < 96) {
-        int first = q36_session_argmax(spec);
+    FILE *payload = tmpfile();
+    TEST_ASSERT(payload != NULL);
+    if (payload) {
+        uint64_t bytes = q36_session_payload_bytes(spec);
+        TEST_ASSERT(q36_session_save_payload(spec, payload, err, sizeof(err)) == 0);
+        TEST_ASSERT((uint64_t)ftell(payload) == bytes);
+        rewind(payload);
+        TEST_ASSERT(q36_session_load_payload(spec, payload, bytes, err, sizeof(err)) == 0);
+        fclose(payload);
+    }
+    while (committed < limit) {
+        int first = frontier > 0 ?
+            q36_session_argmax_excluding(spec, q36_token_eos(engine)) : q36_session_argmax(spec);
         if (first < 0 || first == q36_token_eos(engine)) break;
         int accepted[17];
-        int n = q36_session_eval_speculative_argmax(
-            spec, first, 96 - committed, q36_token_eos(engine),
+        int n = (frontier > 0 ? q36_session_eval_speculative_argmax_excluding : q36_session_eval_speculative_argmax)(
+            spec, first, limit - committed, q36_token_eos(engine),
             accepted, (int)(sizeof(accepted) / sizeof(accepted[0])),
             err, sizeof(err));
         TEST_ASSERT(n > 0);
-        if (n <= 0) break;
+        if (n <= 0) {
+            fprintf(stderr, "q36-test: MTP failed: %s\n", err);
+            break;
+        }
         if (n > 1) multi++;
+        if (n > longest) longest = n;
         if (n > 1 && n < q36_engine_mtp_draft_tokens(engine)) partial++;
 
         for (int i = 0; i < n; i++) {
             int vocab = 0;
             const float *logits = q36_session_logits(plain, &vocab);
-            int top = q36_session_argmax(plain);
+            int top = frontier > 0 ?
+                q36_session_argmax_excluding(plain, q36_token_eos(engine)) : q36_session_argmax(plain);
             TEST_ASSERT(logits && accepted[i] >= 0 && accepted[i] < vocab);
             TEST_ASSERT(top >= 0);
             if (!logits || top < 0 || accepted[i] < 0 || accepted[i] >= vocab) break;
@@ -7482,18 +7681,45 @@ static void test_mtp_verifier_replay(void) {
             TEST_ASSERT(gap <= 1.0e-6f);
             TEST_ASSERT(q36_session_eval(plain, accepted[i], err, sizeof(err)) == 0);
             committed++;
-            if (accepted[i] == q36_token_eos(engine) || committed >= 96) break;
+            if ((!frontier && accepted[i] == q36_token_eos(engine)) || committed >= limit) break;
         }
         TEST_ASSERT(q36_session_pos(spec) == q36_session_pos(plain));
         TEST_ASSERT(q36_session_argmax(spec) == q36_session_argmax(plain));
+        int vocab = q36_qwen35_n_vocab();
+        const float *sl = q36_session_logits(spec, NULL);
+        const float *pl = q36_session_logits(plain, NULL);
+        TEST_ASSERT(sl && pl);
+        if (!sl || !pl) break;
+        float diff = 0.0f;
+        for (int j = 0; j < vocab; j++) {
+            float d = fabsf(sl[j] - pl[j]);
+            if (d > diff) diff = d;
+        }
+        if (diff > worst_logits) worst_logits = diff;
+        if (diff > 1.0e-6f)
+            fprintf(stderr, "q36-test: MTP boundary pos=%d n=%d max_diff=%g\n",
+                    q36_session_pos(spec), n, diff);
+        TEST_ASSERT(diff <= 1.0e-6f);
     }
 
     fprintf(stderr,
-            "q36-test: MTP replay committed=%d multi=%d partial=%d worst_argmax_gap=%g\n",
-            committed, multi, partial, worst_gap);
+            "q36-test: MTP replay committed=%d multi=%d partial=%d longest=%d worst_argmax_gap=%g worst_logits_diff=%g\n",
+            committed, multi, partial, longest, worst_gap, worst_logits);
     TEST_ASSERT(committed >= 16);
     TEST_ASSERT(multi > 0);
-    TEST_ASSERT(partial > 0);
+    const char *min_env = getenv("Q36_TEST_MTP_MIN_ACCEPT");
+    if (min_env) TEST_ASSERT(longest >= atoi(min_env));
+    if (draft > 2) TEST_ASSERT(partial > 0);
+    int accepted[17];
+    int pos = q36_session_pos(spec), first = q36_session_argmax(spec);
+    TEST_ASSERT(q36_session_eval_speculative_argmax(spec, first, 0, -1,
+        accepted, 17, err, sizeof(err)) == 0);
+    TEST_ASSERT(q36_session_pos(spec) == pos);
+    TEST_ASSERT(q36_session_eval_speculative_argmax(spec, first, 8, first,
+        accepted, 17, err, sizeof(err)) == 1);
+    TEST_ASSERT(accepted[0] == first && q36_session_pos(spec) == pos + 1);
+    TEST_ASSERT(q36_session_eval_speculative_argmax(spec, q36_session_argmax(spec), 8, -1,
+        accepted, 1, err, sizeof(err)) == 1);
 
 done:
     q36_tokens_free(&prompt);
@@ -7653,7 +7879,7 @@ static const q36_test_entry test_entries[] = {
     {"--ssd-streaming-parity", "ssd-streaming-parity", "resident/warm/cold/cache-pressure GPU parity", test_ssd_streaming_parity},
     {"--vulkan-fusion-parity", "vulkan-fusion-parity", "fused Vulkan path against complete feature fallbacks", test_vulkan_fusion_parity},
     {"--vulkan-queue-parity", "vulkan-queue-parity", "ACE and graphics queues produce bit-identical logits", test_vulkan_queue_parity},
-    {"--mtp-verifier", "mtp-verifier", "MTP commits replay through plain target decode", test_mtp_verifier_replay},
+    {"--mtp-verifier", "mtp-verifier", "exact MTP acceptance, recurrent rollback and checkpoint restore", test_mtp_verifier_replay},
     {"--qwen-tool-call-format", "qwen-tool-call-format", "Qwen tool-call rendering format unit test", test_qwen_tool_call_format},
     {"--kat-model-support", "kat-model-support", "KAT model identity and special tokenizer tokens", test_kat_model_support},
     {"--vector-fixtures", "vector-fixtures", "llama.cpp fixture consistency check", test_vector_fixtures},
@@ -7663,6 +7889,7 @@ static const q36_test_entry test_entries[] = {
     {"--llama-parity-seq-long", "llama-parity-seq-long", "HF-template Q36 parity on long prompts against live sequential llama.cpp", test_llama_parity_seq_long},
     {"--llama-parity-batch-loose", "llama-parity-batch-loose", "HF-template loose Q36 parity against live batch llama.cpp", test_llama_parity_batch_loose},
 #endif
+    {"--mtp-lookup", "mtp-lookup", "unambiguous prompt lookup and draft bounds", test_mtp_lookup},
     {"--vulkan-kernels", "vulkan-kernels", "isolated Vulkan-kernel numeric regressions", test_vulkan_kernels},
     {"--dense-quant-model-rows", "dense-quant-model-rows", "dense model quant kernels against CPU-dequantized GGUF rows", test_dense_quant_model_rows},
     {"--steering-sessions", "steering-sessions", "independent steering strengths in native session batches", test_steering_sessions},

@@ -1,0 +1,29 @@
+#version 460
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0) buffer Mask { uint ages[]; };
+layout(set = 0, binding = 1) readonly buffer Logits { float logits[]; };
+layout(set = 0, binding = 2) readonly buffer Tops { int ids[]; };
+layout(push_constant) uniform Push { uint count; uint rows; } pc;
+
+void main() {
+    uint block = gl_WorkGroupID.x;
+    uint token = block * 64u + gl_LocalInvocationID.x;
+    bool keep = token < 32768u;
+    for (uint row = 0u; row < pc.rows; row++) {
+        float value = token < pc.count ? logits[row * pc.count + token] :
+                      uintBitsToFloat(0xff800000u);
+        float peak = subgroupMax(value);
+        int top = ids[2u * row];
+        if (top >= 0 && peak >= logits[row * pc.count + uint(top)] - 8.0)
+            keep = true;
+    }
+    if (gl_LocalInvocationID.x == 0u) {
+        uint ttl = ages[block];
+        /* Recent target alternatives cover domain-specific tokens without
+         * a copied vocabulary head or corpus-specific frequency table. */
+        ages[block] = keep ? 4u : ttl > 0u ? ttl - 1u : 0u;
+    }
+}

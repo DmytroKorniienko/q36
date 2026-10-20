@@ -1,4 +1,5 @@
 #version 460
+#extension GL_EXT_control_flow_attributes : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 #extension GL_EXT_shader_16bit_storage : require
@@ -19,11 +20,24 @@ layout(set = 0, binding = 1) readonly buffer Q8K { uint q8[]; };
 layout(set = 0, binding = 2) writeonly buffer Output { float y[]; };
 layout(set = 0, binding = 3) readonly buffer Tables { uint tables[]; };
 
+#ifndef Q36_TOKENS
+#define Q36_TOKENS 1
+#endif
+
+#if Q36_TOKENS > 1
+#define UNROLL [[unroll]]
+#else
+#define UNROLL
+#endif
+
 layout(push_constant) uniform Push {
     uint out_dim;
     uint blocks;
     uint row_bytes;
     float scale;
+#if Q36_TOKENS > 1
+    uint n_tok;
+#endif
 } pc;
 
 #ifndef Q36_ROWS
@@ -60,23 +74,46 @@ vec4 unpack_i8(uint v) {
                 float(bitfieldExtract(int(v), 24, 8)));
 }
 
+int signed_bytes(uint grid, uint signs) {
+    /* Spread the four sign bits to the low bit of each byte. */
+    uint bits = ((signs & 15u) * 0x00204081u) & 0x01010101u;
+    /* Grid magnitudes are nonzero, so negation cannot carry across bytes. */
+    return int((grid ^ (bits * 255u)) + bits);
+}
+
 void main(void) {
     uint lid = gl_LocalInvocationID.x;
     uint itid = lid & 7u;
     uint first_row = gl_WorkGroupID.x * ROWS;
-    float acc[ROWS];
-    for (uint r = 0u; r < ROWS; r++) acc[r] = 0.0;
-    for (uint i = lid; i < 512u; i += 64u)
+    float acc[Q36_TOKENS][ROWS];
+    UNROLL for (uint t = 0u; t < Q36_TOKENS; t++)
+        UNROLL for (uint r = 0u; r < ROWS; r++) acc[t][r] = 0.0;
+    UNROLL for (uint i = lid; i < 512u; i += 64u)
         grid_lut[i] = q36_iq3s_grid[i];
     barrier();
 
     for (uint b = lid >> 3u; b < pc.blocks; b += 8u) {
         uint qbase = b * Q8K_WORDS + 2u + 8u * itid;
-        vec4 qv[8];
-        for (uint l = 0u; l < 8u; l++) qv[l] = unpack_i8(q8[qbase + l]);
-        float yd = uintBitsToFloat(q8[b * Q8K_WORDS]);
+#if Q36_TOKENS > 1
+        int qv[Q36_TOKENS][8];
+#else
+        vec4 qv[Q36_TOKENS][8];
+#endif
+        float yd[Q36_TOKENS];
+        UNROLL for (uint t = 0u; t < Q36_TOKENS; t++) {
+#if Q36_TOKENS > 1
+            if (t >= pc.n_tok) continue;
+#endif
+            uint offset = t * pc.blocks * Q8K_WORDS;
+#if Q36_TOKENS > 1
+            UNROLL for (uint l = 0u; l < 8u; l++) qv[t][l] = int(q8[offset + qbase + l]);
+#else
+            UNROLL for (uint l = 0u; l < 8u; l++) qv[t][l] = unpack_i8(q8[offset + qbase + l]);
+#endif
+            yd[t] = uintBitsToFloat(q8[offset + b * Q8K_WORDS]);
+        }
 
-        for (uint r = 0u; r < ROWS; r++) {
+        UNROLL for (uint r = 0u; r < ROWS; r++) {
             uint row = first_row + r;
 #if Q36_BOUNDS
             if (row >= pc.out_dim) continue;
@@ -86,14 +123,26 @@ void main(void) {
             uint qs0 = load_u32(base + 2u + 8u * itid);
             uint qs1 = load_u32(base + 6u + 8u * itid);
             uint signs4 = load_u32(base + 74u + 4u * itid);
-            float sum = 0.0;
-            for (uint l = 0u; l < 4u; l++) {
+            /* These 32 byte products sum exactly in f32; packed integer dots
+             * preserve the decode result before applying float scales. */
+#if Q36_TOKENS > 1
+            int sum[Q36_TOKENS];
+            UNROLL for (uint t = 0u; t < Q36_TOKENS; t++) sum[t] = 0;
+#else
+            float sum[Q36_TOKENS];
+            UNROLL for (uint t = 0u; t < Q36_TOKENS; t++) sum[t] = 0.0;
+#endif
+            UNROLL for (uint l = 0u; l < 4u; l++) {
                 uint qs = l < 2u ? qs0 >> (16u * l) : qs1 >> (16u * (l - 2u));
                 uint signs = (signs4 >> (8u * l)) & 255u;
                 uint grid0 = grid_lut[(qs & 255u) |
                                       ((qh << (8u - 2u * l)) & 256u)];
                 uint grid1 = grid_lut[((qs >> 8u) & 255u) |
                                       ((qh << (7u - 2u * l)) & 256u)];
+#if Q36_TOKENS > 1
+                int weight0 = signed_bytes(grid0, signs);
+                int weight1 = signed_bytes(grid1, signs >> 4u);
+#else
                 vec4 weight0 = unpack_i8(grid0) * vec4(
                     (signs & 1u) != 0u ? -1.0 : 1.0,
                     (signs & 2u) != 0u ? -1.0 : 1.0,
@@ -104,32 +153,47 @@ void main(void) {
                     (signs & 32u) != 0u ? -1.0 : 1.0,
                     (signs & 64u) != 0u ? -1.0 : 1.0,
                     (signs & 128u) != 0u ? -1.0 : 1.0);
-                vec4 q0 = qv[2u * l];
-                vec4 q1 = qv[2u * l + 1u];
-                sum = fma(weight0.x, q0.x,
-                      fma(weight0.y, q0.y,
-                      fma(weight0.z, q0.z,
-                      fma(weight0.w, q0.w,
-                      fma(weight1.x, q1.x,
-                      fma(weight1.y, q1.y,
-                      fma(weight1.z, q1.z,
-                      fma(weight1.w, q1.w, sum))))))));
+#endif
+                UNROLL for (uint t = 0u; t < Q36_TOKENS; t++) {
+#if Q36_TOKENS > 1
+                    if (t >= pc.n_tok) continue;
+                    sum[t] += dotPacked4x8EXT(weight0, qv[t][2u * l]) +
+                              dotPacked4x8EXT(weight1, qv[t][2u * l + 1u]);
+#else
+                    vec4 q0 = qv[t][2u * l];
+                    vec4 q1 = qv[t][2u * l + 1u];
+                    sum[t] = fma(weight0.x, q0.x,
+                          fma(weight0.y, q0.y,
+                          fma(weight0.z, q0.z,
+                          fma(weight0.w, q0.w,
+                          fma(weight1.x, q1.x,
+                          fma(weight1.y, q1.y,
+                          fma(weight1.z, q1.z,
+                          fma(weight1.w, q1.w, sum[t]))))))));
+#endif
+                }
             }
             uint sc = load_u8(base + 106u + (itid >> 1u));
             int ls = 2 * int((itid & 1u) == 0u ? sc & 15u : sc >> 4u) + 1;
             float wd = unpackHalf2x16(load_u16(base)).x;
-            acc[r] = fma(wd * yd * float(ls), sum, acc[r]);
+            UNROLL for (uint t = 0u; t < Q36_TOKENS; t++)
+                acc[t][r] = fma(wd * yd[t] * float(ls), float(sum[t]), acc[t][r]);
         }
     }
 
-    for (uint r = 0u; r < ROWS; r++) {
-        float total = subgroupAdd(acc[r]);
-        uint row = first_row + r;
-        if (lid == 0u
-#if Q36_BOUNDS
-            && row < pc.out_dim
+    UNROLL for (uint t = 0u; t < Q36_TOKENS; t++) {
+#if Q36_TOKENS > 1
+        if (t >= pc.n_tok) continue;
 #endif
-        )
-            y[row] = total * pc.scale;
+        UNROLL for (uint r = 0u; r < ROWS; r++) {
+            float total = subgroupAdd(acc[t][r]);
+            uint row = first_row + r;
+            if (lid == 0u
+#if Q36_BOUNDS
+                && row < pc.out_dim
+#endif
+            )
+                y[t * pc.out_dim + row] = total * pc.scale;
+        }
     }
 }

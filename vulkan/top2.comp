@@ -18,6 +18,7 @@ layout(push_constant) uniform Push {
     uint count;
     uint groups;
     uint pass;
+    int excluded;
 } pc;
 
 shared float values0[256];
@@ -47,6 +48,8 @@ void insert_pair(inout float v0, inout int i0,
 
 void main(void) {
     uint lid = gl_LocalInvocationID.x;
+    uint row = gl_WorkGroupID.y;
+    uint offset = row * pc.groups;
     float v0 = uintBitsToFloat(0xff800000u);
     float v1 = v0;
     int i0 = -1;
@@ -56,9 +59,10 @@ void main(void) {
         uint i = gl_WorkGroupID.x * 256u + lid;
         uint step = pc.groups * 256u;
         for (; i < pc.count; i += step)
-            insert_pair(v0, i0, v1, i1, x[i], int(i));
+            if (int(i) != pc.excluded)
+                insert_pair(v0, i0, v1, i1, x[row * pc.count + i], int(i));
     } else if (lid < pc.groups) {
-        Pair p = part[lid];
+        Pair p = part[offset + lid];
         insert_pair(v0, i0, v1, i1, p.v0, p.i0);
         insert_pair(v0, i0, v1, i1, p.v1, p.i1);
     }
@@ -83,13 +87,13 @@ void main(void) {
 
     if (lid != 0u) return;
     if (pc.pass == 0u) {
-        uint group = gl_WorkGroupID.x;
+        uint group = offset + gl_WorkGroupID.x;
         part[group].v0 = values0[0];
         part[group].v1 = values1[0];
         part[group].i0 = indices0[0];
         part[group].i1 = indices1[0];
     } else {
-        ids[0] = indices0[0];
-        ids[1] = indices1[0];
+        ids[2u * row] = indices0[0];
+        ids[2u * row + 1u] = indices1[0];
     }
 }

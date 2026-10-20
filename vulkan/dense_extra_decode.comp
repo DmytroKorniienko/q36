@@ -1,4 +1,6 @@
 #version 460
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_integer_dot_product : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 #extension GL_EXT_shader_16bit_storage : require
@@ -13,12 +15,25 @@ layout(set = 0, binding = 1) readonly buffer Q8K { uint q8[]; };
 layout(set = 0, binding = 2) writeonly buffer Output { float y[]; };
 layout(set = 0, binding = 3) readonly buffer Tables { uint tables[]; };
 
+#ifndef Q36_TOKENS
+#define Q36_TOKENS 1
+#endif
+
+#if Q36_TOKENS > 1
+#define UNROLL [[unroll]]
+#else
+#define UNROLL
+#endif
+
 layout(push_constant) uniform Push {
     uint out_dim;
     uint blocks;
     uint row_bytes;
     uint type;
     float scale;
+#if Q36_TOKENS > 1
+    uint n_tok;
+#endif
 } pc;
 
 #ifdef Q36_TYPE
@@ -73,6 +88,20 @@ vec4 signed_grid(uint word, uint signs, uint bit0) {
                     (signs & (1u << (bit0 + 1u))) != 0u ? -1.0 : 1.0,
                     (signs & (1u << (bit0 + 2u))) != 0u ? -1.0 : 1.0,
                     (signs & (1u << (bit0 + 3u))) != 0u ? -1.0 : 1.0);
+}
+
+int signed_bytes(uint word, uint signs) {
+    uint bits = ((signs & 15u) * 0x00204081u) & 0x01010101u;
+    return int((word ^ (bits * 255u)) + bits);
+}
+
+float grid_dot(uint word, uint signs, uint bit0, vec4 q) {
+#if Q36_TOKENS > 1
+    int w = signed_bytes(word, signs >> bit0);
+    return float(dotPacked4x8EXT(w, pack32(i8vec4(q))));
+#else
+    return dot(signed_grid(word, signs, bit0), q);
+#endif
 }
 
 float iq4_value(uint q) {
@@ -161,11 +190,11 @@ float block_dot(uint row, uint qb, uint group, vec4 qv[8]) {
         uint packed = load_u32(base + 6u + 8u * group);
         d = unpackHalf2x16(load_u16(base)).x *
             (0.5 + float(packed >> 28u)) * 0.25;
-        for (uint l = 0u; l < 4u; l++) {
+        UNROLL for (uint l = 0u; l < 4u; l++) {
             uint entry = load_u8(base + 2u + 8u * group + l);
             uint signs = table_u8(TAB_KSIGNS_BYTES + ((packed >> (7u * l)) & 127u));
-            sum += dot(signed_grid(tables[TAB_IQ2XXS + entry * 2u], signs, 0u), qv[2u * l]);
-            sum += dot(signed_grid(tables[TAB_IQ2XXS + entry * 2u + 1u], signs, 4u), qv[2u * l + 1u]);
+            sum += grid_dot(tables[TAB_IQ2XXS + entry * 2u], signs, 0u, qv[2u * l]);
+            sum += grid_dot(tables[TAB_IQ2XXS + entry * 2u + 1u], signs, 4u, qv[2u * l + 1u]);
         }
         return d * sum;
     }
@@ -173,12 +202,12 @@ float block_dot(uint row, uint qb, uint group, vec4 qv[8]) {
         base += qb * 74u;
         float wd = unpackHalf2x16(load_u16(base)).x * 0.25;
         uint sc = load_u8(base + 66u + group);
-        for (uint l = 0u; l < 4u; l++) {
+        UNROLL for (uint l = 0u; l < 4u; l++) {
             uint qs = load_u16(base + 2u + 8u * group + 2u * l);
             uint signs = table_u8(TAB_KSIGNS_BYTES + (qs >> 9u));
             d = wd * (0.5 + float(l < 2u ? sc & 15u : sc >> 4u));
-            sum += d * dot(signed_grid(tables[TAB_IQ2XS + (qs & 511u) * 2u], signs, 0u), qv[2u * l]);
-            sum += d * dot(signed_grid(tables[TAB_IQ2XS + (qs & 511u) * 2u + 1u], signs, 4u), qv[2u * l + 1u]);
+            sum += d * grid_dot(tables[TAB_IQ2XS + (qs & 511u) * 2u], signs, 0u, qv[2u * l]);
+            sum += d * grid_dot(tables[TAB_IQ2XS + (qs & 511u) * 2u + 1u], signs, 4u, qv[2u * l + 1u]);
         }
         return sum;
     }
@@ -187,13 +216,13 @@ float block_dot(uint row, uint qb, uint group, vec4 qv[8]) {
         float wd = unpackHalf2x16(load_u16(base)).x * 0.25;
         uint qh = load_u8(base + 66u + group);
         uint sc = load_u8(base + 74u + group);
-        for (uint l = 0u; l < 4u; l++) {
+        UNROLL for (uint l = 0u; l < 4u; l++) {
             uint entry = load_u8(base + 2u + 4u * group + l) |
                          ((qh << (8u - 2u * l)) & 0x300u);
             uint signs = load_u8(base + 34u + 4u * group + l);
             d = wd * (0.5 + float(l < 2u ? sc & 15u : sc >> 4u));
-            sum += d * dot(signed_grid(tables[TAB_IQ2S + entry * 2u], signs, 0u), qv[2u * l]);
-            sum += d * dot(signed_grid(tables[TAB_IQ2S + entry * 2u + 1u], signs, 4u), qv[2u * l + 1u]);
+            sum += d * grid_dot(tables[TAB_IQ2S + entry * 2u], signs, 0u, qv[2u * l]);
+            sum += d * grid_dot(tables[TAB_IQ2S + entry * 2u + 1u], signs, 4u, qv[2u * l + 1u]);
         }
         return sum;
     }
@@ -203,7 +232,7 @@ float block_dot(uint row, uint qb, uint group, vec4 qv[8]) {
         d = unpackHalf2x16(load_u16(base)).x *
             float(2u * ((qh >> 12u) & 7u) + 1u);
         float delta = (qh & 0x8000u) != 0u ? -0.125 : 0.125;
-        for (uint l = 0u; l < 4u; l++) {
+        UNROLL for (uint l = 0u; l < 4u; l++) {
             uint entry = load_u8(base + 2u + 4u * group + l) |
                          (((qh >> (3u * l)) & 7u) << 8u);
             sum += dot(unpack_i8(tables[TAB_IQ1S + entry * 2u]) + delta, qv[2u * l]);
@@ -214,7 +243,7 @@ float block_dot(uint row, uint qb, uint group, vec4 qv[8]) {
 
     base += (qb * 8u + group) * 18u;
     d = unpackHalf2x16(load_u16(base)).x;
-    for (uint i = 0u; i < 8u; i++) {
+    UNROLL for (uint i = 0u; i < 8u; i++) {
         uint packed = load_u32(base + 2u + 4u * (i & 3u));
         uint shift = i >= 4u ? 4u : 0u;
         vec4 v = vec4(iq4_value((packed >> (shift + 0u)) & 15u),
@@ -226,29 +255,92 @@ float block_dot(uint row, uint qb, uint group, vec4 qv[8]) {
     return d * sum;
 }
 
+#if Q36_TOKENS > 1 && defined(Q36_TYPE) && Q36_TYPE == 16
+
+void main(void) {
+    uint lid = gl_LocalInvocationID.x, group = lid & 7u;
+    uint first_row = gl_WorkGroupID.x * ROWS;
+    float acc[Q36_TOKENS][ROWS];
+    UNROLL for (uint t = 0u; t < Q36_TOKENS; t++)
+        UNROLL for (uint r = 0u; r < ROWS; r++) acc[t][r] = 0.0;
+    for (uint b = lid >> 3u; b < pc.blocks; b += 8u) {
+        UNROLL for (uint r = 0u; r < ROWS; r++) {
+            uint row = first_row + r;
+            if (row >= pc.out_dim) continue;
+            uint base = row * pc.row_bytes + b * 66u;
+            uint scales = load_u32(base + 6u + 8u * group);
+            float sum[Q36_TOKENS];
+            UNROLL for (uint t = 0u; t < Q36_TOKENS; t++) sum[t] = 0.0;
+            UNROLL for (uint l = 0u; l < 4u; l++) {
+                uint entry = load_u8(base + 2u + 8u * group + l);
+                uint signs = table_u8(TAB_KSIGNS_BYTES + ((scales >> (7u * l)) & 127u));
+                uint table = TAB_IQ2XXS;
+                int w0 = signed_bytes(tables[table + 2u * entry], signs);
+                int w1 = signed_bytes(tables[table + 2u * entry + 1u], signs >> 4u);
+                UNROLL for (uint t = 0u; t < Q36_TOKENS; t++) {
+                    if (t >= pc.n_tok) continue;
+                    uint qbase = (t * pc.blocks + b) * Q8K_WORDS + 2u + 8u * group + 2u * l;
+                    float v0 = float(dotPacked4x8EXT(w0, int(q8[qbase])));
+                    float v1 = float(dotPacked4x8EXT(w1, int(q8[qbase + 1u])));
+                    sum[t] += v0;
+                    sum[t] += v1;
+                }
+            }
+            UNROLL for (uint t = 0u; t < Q36_TOKENS; t++) {
+                if (t >= pc.n_tok) continue;
+                float yd = uintBitsToFloat(q8[(t * pc.blocks + b) * Q8K_WORDS]);
+                float v = sum[t];
+                v *= unpackHalf2x16(load_u16(base)).x * (0.5 + float(scales >> 28u)) * 0.25;
+                acc[t][r] = fma(yd, v, acc[t][r]);
+            }
+        }
+    }
+    UNROLL for (uint t = 0u; t < Q36_TOKENS; t++) {
+        if (t >= pc.n_tok) continue;
+        UNROLL for (uint r = 0u; r < ROWS; r++) {
+            float total = subgroupAdd(acc[t][r]);
+            uint row = first_row + r;
+            if (lid == 0u && row < pc.out_dim) y[t * pc.out_dim + row] = total * pc.scale;
+        }
+    }
+}
+#else
 void main(void) {
     uint lid = gl_LocalInvocationID.x;
     uint lane8 = lid & 7u;
     uint first_row = gl_WorkGroupID.x * ROWS;
-    float acc[ROWS];
-    for (uint r = 0u; r < ROWS; r++) acc[r] = 0.0;
+    float acc[Q36_TOKENS][ROWS];
+    UNROLL for (uint t = 0u; t < Q36_TOKENS; t++)
+        UNROLL for (uint r = 0u; r < ROWS; r++) acc[t][r] = 0.0;
 
     for (uint b = lid >> 3u; b < pc.blocks; b += 8u) {
-        uint qbase = b * Q8K_WORDS + 2u + 8u * lane8;
-        float yd = uintBitsToFloat(q8[b * Q8K_WORDS]);
-        vec4 qv[8];
-        for (uint i = 0u; i < 8u; i++) qv[i] = unpack_i8(q8[qbase + i]);
-        for (uint r = 0u; r < ROWS; r++) {
-            uint row = first_row + r;
-            if (row >= pc.out_dim) continue;
-            float sum = block_dot(row, b, lane8, qv);
-            acc[r] = fma(yd, sum, acc[r]);
+        UNROLL for (uint t = 0u; t < Q36_TOKENS; t++) {
+#if Q36_TOKENS > 1
+            if (t >= pc.n_tok) continue;
+#endif
+            uint token_offset = t * pc.blocks * Q8K_WORDS;
+            uint qbase = b * Q8K_WORDS + 2u + 8u * lane8;
+            float yd = uintBitsToFloat(q8[token_offset + b * Q8K_WORDS]);
+            vec4 qv[8];
+            UNROLL for (uint i = 0u; i < 8u; i++) qv[i] = unpack_i8(q8[token_offset + qbase + i]);
+            UNROLL for (uint r = 0u; r < ROWS; r++) {
+                uint row = first_row + r;
+                if (row >= pc.out_dim) continue;
+                float sum = block_dot(row, b, lane8, qv);
+                acc[t][r] = fma(yd, sum, acc[t][r]);
+            }
         }
     }
 
-    for (uint r = 0u; r < ROWS; r++) {
-        float total = subgroupAdd(acc[r]);
-        uint row = first_row + r;
-        if (lid == 0u && row < pc.out_dim) y[row] = total * pc.scale;
+    UNROLL for (uint t = 0u; t < Q36_TOKENS; t++) {
+#if Q36_TOKENS > 1
+        if (t >= pc.n_tok) continue;
+#endif
+        UNROLL for (uint r = 0u; r < ROWS; r++) {
+            float total = subgroupAdd(acc[t][r]);
+            uint row = first_row + r;
+            if (lid == 0u && row < pc.out_dim) y[t * pc.out_dim + row] = total * pc.scale;
+        }
     }
 }
+#endif
