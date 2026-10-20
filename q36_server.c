@@ -6439,6 +6439,7 @@ struct server {
     kv_disk_cache kv;
     tool_memory tool_mem;
     bool disable_exact_tool_replay;
+    bool mtp_opportunistic;
     pthread_mutex_t tool_mu;
     pthread_mutex_t kv_mu;
     pthread_mutex_t inference_mu;
@@ -9528,7 +9529,8 @@ static void generate_job(server *s, server_slot *slot, job *j) {
         int toks[17];
         int ntok = 0;
         const int block_start = q36_session_pos(slot->session);
-        if (!multimodal && !s->batched_mode && temperature <= 0.0f &&
+        if (!multimodal && !s->batched_mode &&
+            (temperature <= 0.0f || s->mtp_opportunistic) &&
             presence_penalty == 0.0f && frequency_penalty == 0.0f &&
             q36_engine_mtp_draft_tokens(s->engine) > 1 &&
             getenv("Q36_MTP_SPEC_DISABLE") == NULL)
@@ -10399,6 +10401,7 @@ typedef struct {
     kv_cache_options kv_cache;
     bool kv_cache_reject_different_quant;
     bool disable_exact_tool_replay;
+    bool mtp_opportunistic;
     int tool_memory_max_ids;
     bool enable_cors;
     int batched_sessions;
@@ -10504,6 +10507,8 @@ static void usage(FILE *fp) {
         "      MTP support GGUF, or the same path as -m for an embedded block.\n"
         "  --mtp-draft N\n"
         "      Maximum autoregressive MTP draft tokens per speculative step. Default: 1\n"
+        "  --mtp-opportunistic\n"
+        "      Sample block boundaries and accept greedy tails; changes the sampling distribution.\n"
         "  --mtp-margin F\n"
         "      Minimum recursive-draft confidence for the fast N=2 verifier. Default: 3\n"
         "  -c, --ctx N\n"
@@ -10664,6 +10669,8 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.mtp_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-draft")) {
             c.engine.mtp_draft_tokens = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--mtp-opportunistic")) {
+            c.mtp_opportunistic = true;
         } else if (!strcmp(arg, "--mtp-margin")) {
             c.engine.mtp_margin = parse_float_arg(need_arg(&i, argc, argv, arg), arg, 0.0f, 1000.0f);
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
@@ -10778,6 +10785,11 @@ static server_config parse_options(int argc, char **argv) {
             exit(2);
         }
     }
+    if (c.mtp_opportunistic && (!c.engine.mtp_path || c.engine.mtp_draft_tokens <= 1 || c.batched_sessions > 0)) {
+        server_log(Q36_LOG_DEFAULT,
+                   "q36-server: --mtp-opportunistic requires non-batched --mtp FILE and --mtp-draft > 1");
+        exit(2);
+    }
     if (c.kv_cache.cold_max_tokens > 0 &&
         c.kv_cache.cold_max_tokens < c.kv_cache.min_tokens)
     {
@@ -10843,6 +10855,7 @@ int main(int argc, char **argv) {
     }
     s.default_tokens = cfg.default_tokens;
     s.disable_exact_tool_replay = cfg.disable_exact_tool_replay;
+    s.mtp_opportunistic = cfg.mtp_opportunistic;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     if (s.disable_exact_tool_replay) {
         server_log(Q36_LOG_DEFAULT,

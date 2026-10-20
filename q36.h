@@ -290,6 +290,9 @@ int q36_session_common_prefix(q36_session *s, const q36_tokens *prompt);
 int q36_session_argmax(q36_session *s);
 int q36_session_argmax_excluding(q36_session *s, int excluded_id);
 int q36_session_sample(q36_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng);
+int q36_session_sample_excluding(q36_session *s, int excluded_id,
+                                  float temperature, int top_k, float top_p,
+                                  float min_p, uint64_t *rng);
 int q36_session_sample_penalized(q36_session *s,
                                  float temperature, int top_k,
                                  float top_p, float min_p,
@@ -322,6 +325,8 @@ int q36_sessions_eval_batch_with_prefill(
         q36_decode_item *items, int count,
         q36_session *prefill_session, const q36_tokens *prefill_prompt,
         char *err, size_t errlen);
+/* first_token may already be sampled. Later accepted tokens follow target
+ * argmax; using this at positive temperature changes the distribution. */
 int q36_session_eval_speculative_argmax(q36_session *s, int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,

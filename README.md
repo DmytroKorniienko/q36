@@ -267,7 +267,8 @@ Verification shares quantized weights across rows and keeps token selection
 on the GPU. The draft output head uses a small mask of recent target
 alternatives; target verification always scores the full vocabulary.
 
-Dense Vulkan uses up to four rows for recursive MTP. With `--mtp-draft 8`,
+Dense Vulkan adapts recursive MTP between two and four rows using observed
+latency and acceptance. With `--mtp-draft 8`,
 a matching 12–16-token suffix can supply a longer copied tail after MTP
 confirms its first proposal. Positive `--mtp-margin` values use MTP alone.
 The regression tests compare committed tokens and every target logit with
@@ -275,23 +276,59 @@ ordinary decode, including quantized KV, checkpoint restore and verifier
 widths up to eight. MTP also matches a separate ordinary engine with MTP disabled.
 Other recurrent paths use scalar verification to preserve ordinary decode.
 
+For opportunistic sampling, add `--mtp-opportunistic` at a positive temperature:
+
+```sh
+./q36 -m "$model" --mtp "$model" --mtp-draft 8 --mtp-margin 0 \
+  --mtp-opportunistic --temp 1 --seed 42 --nothink \
+  -p "Write a C function that reverses a linked list."
+```
+
+Each block samples its first token with the requested temperature, top-k,
+top-p and min-p, then accepts the draft tail while it matches the target's
+greedy continuation. This deliberately changes the sampling distribution.
+The next block samples again from the last committed target state. Target
+logits, KV updates and rejection rollback use the same verifier as greedy MTP.
+The flag also works in `q36-server` for non-batched text requests with zero
+presence/frequency penalties; other requests keep ordinary sampling.
+Positive-temperature generation samples every token when the flag is omitted.
+
 MTP remains experimental. On the BC-250, matched greedy runs with 128
 output tokens and Q8_0 K / Q4_0 V cache give these generation rates:
 
 | Context | Story, plain → MTP t/s | Gain | C source, plain → MTP t/s | Gain |
 | ---: | ---: | ---: | ---: | ---: |
-| 128 | 22.13 → 26.43 | 1.19× | 21.81 → 21.35 | 0.98× |
-| 2048 | 21.73 → 28.17 | 1.30× | 21.67 → 24.07 | 1.11× |
-| 3968 | 21.35 → 23.30 | 1.09× | 21.41 → 26.11 | 1.22× |
-| 4096 | 21.43 → 27.52 | 1.28× | 21.34 → 29.60 | 1.39× |
-| 8192, fresh | 20.48 → 29.02 | 1.42× | — | — |
+| 128 | 22.09 → 27.80 | 1.26× | 22.20 → 25.64 | 1.15× |
+| 2048 | 21.66 → 31.02 | 1.43× | 21.65 → 26.22 | 1.21× |
+| 3968 | 21.29 → 25.65 | 1.20× | 21.29 → 27.43 | 1.29× |
+| 4096 | 21.25 → 29.61 | 1.39× | 21.29 → 29.01 | 1.36× |
+| 8192, fresh | 20.52 → 29.32 | 1.43× | — | — |
 
 The first four rows are incremental sweeps; the 8K pair starts directly at
-8K. These two prompts do not demonstrate the requested general 1.5–2× gain.
-Peak GPU allocation grows by 485 MiB at 4K and 538 MiB at 8K. Both ordinary
-and MTP runs peak at 70°C across this set. Plain decode remains the default.
-Commands, correctness logs, superseded experiments and measurements are in
-[the local benchmark artifacts](tests/test-vectors/local/q38-mtp-20261020-v2/README.md).
+8K. The fresh 8K repeat measured 29.48 t/s. These prompts do not demonstrate
+a general 1.5–2× gain. Compared with the previous MTP implementation, short
+C-source generation improves by 20%, while its 4K point is about 2% slower
+in both repetitions. Peak GPU allocation grows by 465 MiB at 4K and 518 MiB
+at 8K, about 20 MiB less than before. Runs peak at 71°C across this set.
+Plain decode remains the default. Commands, correctness logs and measurements
+are in [the local benchmark artifacts](tests/test-vectors/local/q38-mtp-20261020-v3/README.md).
+
+With opportunistic MTP at temperature 1, the same cache and output lengths
+yield these gains over ordinary sampling, using seeds 1 and 42:
+
+| Context | Story gain, both seeds | C-source gain, both seeds |
+| ---: | ---: | ---: |
+| 128 | 1.28–1.30× | 1.11–1.12× |
+| 2048 | 1.29–1.31× | 1.21–1.32× |
+| 3968 | 1.17–1.19× | 1.18–1.28× |
+| 4096 | 1.27–1.29× | 1.31–1.44× |
+
+Fresh 8K with seed 1 improves from 19.93 to 28.34 t/s (1.42×). Verified
+greedy tails account for 39–66% of output tokens across these trials. The
+arms generate different sequences because of those tails. Peak extra GPU
+allocation is 465 MiB at 4K and 501 MiB at 8K; runs peak at 71°C. This
+still falls short of a general 1.5–2× gain. Commands, state checks and saved
+example outputs are in [the opportunistic sampling artifacts](tests/test-vectors/local/q38-mtp-20261020-v4/README.md).
 
 ## Speed
 

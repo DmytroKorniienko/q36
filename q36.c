@@ -809,6 +809,7 @@ typedef struct {
     q36_gpu_tensor *mtp_cur;
     q36_gpu_tensor *mtp_logits;
     q36_gpu_tensor *mtp_head_mask;
+    q36_mtp_policy mtp_policy;
     q36_gpu_tensor *mtp_target_h;
     uint32_t spec_row;
     bool mtp_enabled;
@@ -837,6 +838,7 @@ static uint64_t q36_mtp_stat_full;
 static uint64_t q36_mtp_stat_lookup;
 static uint64_t q36_mtp_stat_lookup_drafted;
 static uint64_t q36_mtp_stat_lookup_accepted;
+static uint64_t q36_mtp_stat_depth[5];
 static bool q36_mtp_stat_registered;
 
 static void q36_mtp_stats_report(void) {
@@ -850,15 +852,18 @@ static void q36_mtp_stats_report(void) {
             q36_mtp_stat_drafted ? 100.0 * (double)q36_mtp_stat_accepted / (double)q36_mtp_stat_drafted : 0.0,
             q36_mtp_stat_lookup,
             q36_mtp_stat_lookup_drafted ? 100.0 * (double)q36_mtp_stat_lookup_accepted / (double)q36_mtp_stat_lookup_drafted : 0.0);
+    fprintf(stderr, "q36: MTP recursive depths 2=%" PRIu64 " 3=%" PRIu64 " 4=%" PRIu64 "\n",
+            q36_mtp_stat_depth[2], q36_mtp_stat_depth[3], q36_mtp_stat_depth[4]);
 }
 
-static void q36_mtp_stats_add(int drafted, int accepted, bool full) {
+static void q36_mtp_stats_add(int drafted, int accepted, bool full, int depth) {
     if (!getenv("Q36_MTP_STATS")) return;
     if (!q36_mtp_stat_registered) {
         atexit(q36_mtp_stats_report);
         q36_mtp_stat_registered = true;
     }
     q36_mtp_stat_calls++;
+    if (depth >= 2 && depth <= 4) q36_mtp_stat_depth[depth]++;
     if (drafted > 0) q36_mtp_stat_drafted += (uint64_t)drafted;
     if (accepted > 0) q36_mtp_stat_accepted += (uint64_t)accepted;
     if (full) q36_mtp_stat_full++;
@@ -5920,6 +5925,7 @@ static bool q36_vulkan_runtime_reset(q36_vulkan_runtime *rt) {
     uint64_t state_dim = (uint64_t)Q36_N_SSM_STATE * Q36_N_SSM_STATE * Q36_N_SSM_DT_RANK;
     uint64_t state_bytes;
     if (!rt) return false;
+    memset(&rt->mtp_policy, 0, sizeof(rt->mtp_policy));
     state_bytes = state_dim * (rt->recur_state_f16 ? sizeof(uint16_t) : sizeof(float));
     if (!q36_gpu_tensor_zero(rt->hidden) || !q36_gpu_tensor_zero(rt->next_hidden)) return false;
     if (rt->last_h && !q36_gpu_tensor_zero(rt->last_h)) return false;
@@ -6287,7 +6293,14 @@ static q36_vulkan_runtime *q36_vulkan_runtime_create(int ctx_size,
                 (uint64_t)prefill_cap * Q36_N_EMBD * 2u * sizeof(float)) :
             q36_gpu_tensor_alloc((uint64_t)prefill_cap * Q36_N_EMBD * 2u * sizeof(float));
         if (!rt->mtp_concat) goto fail;
-        rt->mtp_target_h = q36_gpu_tensor_alloc((uint64_t)(prefill_cap + 1u) * Q36_N_EMBD * sizeof(float));
+        uint64_t target_bytes = (uint64_t)(prefill_cap + 1u) * Q36_N_EMBD * sizeof(float);
+        /* KV-only catchup leaves the dense up panel dead. Scalar verification
+         * needs separate storage because each row overwrites that panel. */
+        rt->mtp_target_h = Q36_MODEL_DENSE && !ssd_streaming &&
+            target_bytes <= q36_gpu_tensor_bytes(rt->ffn_shared_up) &&
+            q36_gpu_gdn_front_supported(Q36_N_EMBD, Q36_N_SSM_GROUP, Q36_N_SSM_DT_RANK) ?
+            q36_gpu_tensor_view(rt->ffn_shared_up, 0, target_bytes) :
+            q36_gpu_tensor_alloc(target_bytes);
         if (!rt->mtp_target_h) goto fail;
         Q36_GPU_ALLOC_MTP_F32(mtp_cur, Q36_N_EMBD);
         Q36_GPU_ALLOC_MTP_F32(mtp_logits, Q36_N_VOCAB);
@@ -11418,6 +11431,20 @@ int q36_session_sample(q36_session *s, float temperature, int top_k, float top_p
                                   top_k, top_p, min_p, rng, s->sample_probs);
 }
 
+int q36_session_sample_excluding(q36_session *s, int excluded_id,
+                                  float temperature, int top_k, float top_p,
+                                  float min_p, uint64_t *rng) {
+    if (!s || excluded_id < 0 || excluded_id >= (int)Q36_N_VOCAB) return -1;
+    if (!rng || temperature <= 0.0f) return q36_session_argmax_excluding(s, excluded_id);
+    if (!q36_session_ensure_logits_host(s)) return -1;
+    float saved = s->logits[excluded_id];
+    s->logits[excluded_id] = -INFINITY;
+    int token = q36_sample_top_p_min_p(s->logits, Q36_N_VOCAB, temperature,
+                                       top_k, top_p, min_p, rng, s->sample_probs);
+    s->logits[excluded_id] = saved;
+    return token;
+}
+
 int q36_session_sample_penalized(q36_session *s,
                                  float temperature, int top_k,
                                  float top_p, float min_p,
@@ -11803,6 +11830,16 @@ static int q36_session_eval_speculative(q36_session *s, int first_token,
         /* Long copied tails amortize verification; recursive MTP is cheaper
          * in the small decode tiles on dense Vulkan models. */
         mtp_cap = Q36_MODEL_DENSE && e->backend == Q36_BACKEND_VULKAN && draft_cap > 4 ? 4 : draft_cap;
+        const char *depth_env = getenv("Q36_MTP_DEPTH");
+        if (Q36_MODEL_DENSE && e->backend == Q36_BACKEND_VULKAN && depth_env) {
+            int depth = atoi(depth_env);
+            if (depth >= 2 && depth < mtp_cap) mtp_cap = depth;
+        }
+        bool adaptive = !depth_env && Q36_MODEL_DENSE &&
+            e->backend == Q36_BACKEND_VULKAN && !e->ssd_streaming &&
+            e->mtp_margin <= 0.0f && mtp_cap > 2 &&
+            q36_gpu_gdn_front_supported(Q36_N_EMBD, Q36_N_SSM_GROUP, Q36_N_SSM_DT_RANK);
+        if (adaptive) mtp_cap = q36_mtp_policy_depth(&rt->mtp_policy, mtp_cap);
         start_pos = (uint32_t)s->checkpoint.len;
         if (!q36_session_reserve_kv(s, start_pos + (uint32_t)draft_cap, start_pos)) {
             if (err && errlen) snprintf(err, errlen, "failed to grow MTP KV cache");
@@ -11811,6 +11848,7 @@ static int q36_session_eval_speculative(q36_session *s, int first_token,
         verify[0] = first_token;
         verify_n = 1;
         prev_token = first_token;
+        double draft_start = adaptive ? q36_now_sec() : 0.0;
         int lookup_n = draft_cap <= 2 || e->mtp_margin > 0.0f || getenv("Q36_MTP_LOOKUP_OFF") ? 0 :
             q36_mtp_lookup(s->checkpoint.v, s->checkpoint.len, first_token, lookup, draft_cap);
         bool used_lookup = false;
@@ -11899,7 +11937,10 @@ static int q36_session_eval_speculative(q36_session *s, int first_token,
             q36_tokens_push(&s->checkpoint, verify[i]);
         }
         s->checkpoint_valid = true;
-        q36_mtp_stats_add(verify_n - 1, commit_n - 1, commit_n == verify_n);
+        if (adaptive && !used_lookup && verify_n == mtp_cap)
+            q36_mtp_policy_observe(&rt->mtp_policy, mtp_cap, commit_n,
+                                    q36_now_sec() - draft_start);
+        q36_mtp_stats_add(verify_n - 1, commit_n - 1, commit_n == verify_n, mtp_cap);
         if (used_lookup && getenv("Q36_MTP_STATS")) {
             q36_mtp_stat_lookup++;
             q36_mtp_stat_lookup_drafted += verify_n - 2;

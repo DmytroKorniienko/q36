@@ -8,7 +8,7 @@
  *
  * The benchmark walks one fixed token sequence to configurable context
  * frontiers, measuring only the newest prefill interval at each frontier.  It
- * then snapshots the live session in memory, performs a fixed greedy decode
+ * then snapshots the live session in memory, performs a fixed-length decode
  * run without allowing EOS, restores the snapshot, and continues to the next
  * frontier.  Snapshot save/restore time is intentionally outside both timing
  * windows.
@@ -35,6 +35,9 @@ typedef struct {
     int threads;
     int mtp_draft_tokens;
     float mtp_margin;
+    float temperature;
+    uint64_t seed;
+    bool mtp_opportunistic;
     int ctx_start;
     int ctx_max;
     int ctx_alloc;
@@ -67,7 +70,7 @@ static void usage(FILE *fp) {
         "Usage: q36-bench --prompt-file FILE [options]\n"
         "\n"
         "Benchmarks instantaneous prefill and generation throughput at context\n"
-        "frontiers such as 2048, 4096, 6144, ... . Generation is always greedy,\n"
+        "frontiers such as 2048, 4096, 6144, ... . Generation defaults to greedy,\n"
         "runs for exactly --gen-tokens tokens, and skips EOS so every row is\n"
         "comparable.\n"
         "\n"
@@ -97,6 +100,11 @@ static void usage(FILE *fp) {
         "                         the speculative path when --mtp-draft > 1.\n"
         "  --mtp-draft N          Max MTP draft tokens per speculative step. Default: 1\n"
         "  --mtp-margin F         MTP draft confidence gate. Default: 3.0\n"
+        "  --mtp-opportunistic    Sample block boundaries and accept greedy tails;\n"
+        "                         changes the sampling distribution.\n"
+        "  --temp F              Sampling temperature. Default: 0 (greedy).\n"
+        "                         Other sampling defaults come from the loaded model.\n"
+        "  --seed N              Sampling seed, reset at each frontier. Default: 1\n"
         "  --ssd-streaming        SSD-backed model streaming instead of full residency.\n"
         "  --ssd-streaming-cold   SSD streaming: skip the default expert-cache preload.\n"
         "  --ssd-streaming-cache-experts N|NGB\n"
@@ -113,7 +121,7 @@ static void usage(FILE *fp) {
         "  --step-mul F           Multiplicative step. Default: 1\n"
         "  --step-incr N          Linear step when --step-mul is 1. Default: 2048\n"
         "  --dump-frontier-logits-dir DIR  Write complete logits before decode.\n"
-        "  --gen-tokens N         Greedy decode tokens per frontier. Default: 128\n"
+        "  --gen-tokens N         Decode tokens per frontier. Default: 128\n"
         "                         0 benchmarks prefill only: no snapshot, decode,\n"
         "                         or restore, so each frontier extends the last.\n"
         "\n"
@@ -230,6 +238,7 @@ static bench_config parse_options(int argc, char **argv) {
         .step_mul = 1.0,
         .mtp_draft_tokens = 1,
         .mtp_margin = 3.0f,
+        .seed = 1,
     };
 
     bool cache_type_k_set = false;
@@ -299,6 +308,24 @@ static bench_config parse_options(int argc, char **argv) {
             c.mtp_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-draft")) {
             c.mtp_draft_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--mtp-opportunistic")) {
+            c.mtp_opportunistic = true;
+        } else if (!strcmp(arg, "--temp")) {
+            double v = parse_double_arg(need_arg(&i, argc, argv, arg), arg);
+            if (v < 0.0 || v > 100.0) {
+                fprintf(stderr, "q36-bench: --temp must be between 0 and 100\n");
+                exit(2);
+            }
+            c.temperature = (float)v;
+        } else if (!strcmp(arg, "--seed")) {
+            const char *value = need_arg(&i, argc, argv, arg);
+            char *end = NULL;
+            errno = 0;
+            c.seed = strtoull(value, &end, 10);
+            if (!value[0] || value[0] == '-' || *end || errno) {
+                fprintf(stderr, "q36-bench: invalid seed: %s\n", value);
+                exit(2);
+            }
         } else if (!strcmp(arg, "--mtp-margin")) {
             double v = parse_double_arg(need_arg(&i, argc, argv, arg), arg);
             if (v < 0.0) {
@@ -369,6 +396,10 @@ static bench_config parse_options(int argc, char **argv) {
     if (c.ctx_alloc > Q36_CONTEXT_ALLOC_MAX) {
         fprintf(stderr, "q36-bench: --ctx-alloc must not exceed %d\n",
                 Q36_CONTEXT_ALLOC_MAX);
+        exit(2);
+    }
+    if (c.mtp_opportunistic && (!c.mtp_path || c.mtp_draft_tokens <= 1)) {
+        fprintf(stderr, "q36-bench: --mtp-opportunistic requires --mtp FILE and --mtp-draft > 1\n");
         exit(2);
     }
     if (c.mtp_path && c.mtp_draft_tokens <= 1)
@@ -535,6 +566,13 @@ int main(int argc, char **argv) {
     q36_engine *engine = NULL;
     if (q36_engine_open(&engine, &opt) != 0) return 1;
     log_context_memory(&cfg);
+    int top_k;
+    float default_temp, top_p, min_p;
+    q36_engine_sampling_defaults(engine, &default_temp, &top_k, &top_p, &min_p);
+    if (cfg.temperature > 0.0f)
+        fprintf(stderr, "q36-bench: sampling temperature=%g top_k=%d top_p=%g min_p=%g seed=%llu opportunistic=%d\n",
+                cfg.temperature, top_k, top_p, min_p,
+                (unsigned long long)cfg.seed, cfg.mtp_opportunistic);
 
     char *text = read_file(cfg.prompt_path ? cfg.prompt_path : cfg.chat_prompt_path);
     q36_tokens prompt = {0};
@@ -578,7 +616,8 @@ int main(int argc, char **argv) {
     fflush(out);
 
     const int eos = q36_token_eos(engine);
-    const bool spec = q36_engine_mtp_draft_tokens(engine) > 1 &&
+    const bool spec = (cfg.temperature <= 0.0f || cfg.mtp_opportunistic) &&
+                      q36_engine_mtp_draft_tokens(engine) > 1 &&
                       getenv("Q36_MTP_SPEC_DISABLE") == NULL;
     q36_session_snapshot snap = {0};
     char err[256];
@@ -633,6 +672,7 @@ int main(int argc, char **argv) {
 #endif
         const bool spec_trace = getenv("Q36_BENCH_SPEC_TRACE") != NULL;
         unsigned spec_calls = 0, spec_tokens = 0, spec_hist[18] = {0};
+        uint64_t rng = cfg.seed;
         const double gen_t0 = bench_now_sec();
         for (int i = 0; i < cfg.gen_tokens; ) {
             if (q36_session_pos(session) + 1 >= q36_session_ctx(session)) {
@@ -640,15 +680,16 @@ int main(int argc, char **argv) {
                 rc = 1;
                 break;
             }
-            const int token = q36_session_argmax_excluding(session, eos);
+            const int token = q36_session_sample_excluding(session, eos,
+                cfg.temperature, top_k, top_p, min_p, &rng);
             if (token < 0) {
                 fprintf(stderr, "q36-bench: failed to choose non-EOS token at frontier %d\n", frontier);
                 rc = 1;
                 break;
             }
             if (spec) {
-                /* Both draft and target skip EOS, matching ordinary decode
-                 * through the entire fixed-length benchmark continuation. */
+                /* Exclude EOS from both the sampled boundary and greedy tail
+                 * so every arm measures the configured output length. */
                 int toks[17];
                 const int n = q36_session_eval_speculative_argmax_excluding(session,
                         token, cfg.gen_tokens - i, eos,

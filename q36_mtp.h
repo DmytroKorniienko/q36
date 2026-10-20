@@ -3,6 +3,50 @@
 
 #include <string.h>
 
+typedef struct {
+    double seconds[3];
+    unsigned samples[3];
+    double accepted[3];
+    unsigned attempts[3];
+    unsigned calls;
+} q36_mtp_policy;
+
+/* Compare time per committed token, with an occasional probe so a change
+ * in the continuation can make a different depth profitable. */
+static inline int q36_mtp_policy_depth(q36_mtp_policy *p, int cap) {
+    if (cap < 2) return cap;
+    if (cap > 4) cap = 4;
+    unsigned call = p->calls++;
+    int arms = cap - 1;
+    for (int i = 0; i < arms; i++)
+        if (!p->samples[i]) return i + 2;
+    if ((call & 15u) == 15u) return 2 + (int)((call / 16u) % (unsigned)arms);
+    double expected[3], product = 1.0, total = 1.0;
+    for (int i = 0; i < arms; i++) {
+        product *= p->attempts[i] ? p->accepted[i] : 1.0;
+        expected[i] = total += product;
+    }
+    int best = 0;
+    for (int i = 1; i < arms; i++)
+        if (p->seconds[i] * expected[best] < p->seconds[best] * expected[i]) best = i;
+    return best + 2;
+}
+
+static inline void q36_mtp_policy_observe(q36_mtp_policy *p, int depth,
+                                           int tokens, double seconds) {
+    if (depth < 2 || depth > 4 || tokens < 1 || tokens > depth || !(seconds > 0)) return;
+    int i = depth - 2;
+    if (p->samples[i] < 8u) p->samples[i]++;
+    double rate = 1.0 / p->samples[i];
+    p->seconds[i] += rate * (seconds - p->seconds[i]);
+    /* A longer verification also observes every accepted shorter prefix.
+     * Condition each probability on its predecessor having matched. */
+    for (int j = 0; j < depth - 1 && j < tokens; j++) {
+        if (p->attempts[j] < 8u) p->attempts[j]++;
+        p->accepted[j] += ((tokens > j + 1 ? 1.0 : 0.0) - p->accepted[j]) / p->attempts[j];
+    }
+}
+
 /* Reuse a continuation only when the longest matching suffix is unambiguous.
  * The known first token participates in the match but is not in history yet.
  * Bound the scan so CPU work stays small as the context grows. */

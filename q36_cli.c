@@ -36,6 +36,7 @@ typedef struct {
     float top_p;
     float min_p;
     uint64_t seed;
+    bool mtp_opportunistic;
     bool dump_tokens;
     const char *dump_logprobs_path;
     int dump_logprobs_top_k;
@@ -96,6 +97,8 @@ static void usage(FILE *fp) {
         "      Qwen3-VL mmproj sidecar. It remains disk-backed.\n"
         "  --mtp-draft N\n"
         "      Maximum autoregressive MTP draft tokens per speculative step. Default: 1\n"
+        "  --mtp-opportunistic\n"
+        "      Sample block boundaries and accept greedy tails; changes the sampling distribution.\n"
         "  --mtp-margin F\n"
         "      Minimum recursive-draft confidence for the fast N=2 verifier. Default: 3\n"
         "  -c, --ctx N\n"
@@ -618,7 +621,8 @@ static int run_sampled_generation(q36_engine *engine, const cli_config *cfg, con
 
         int toks[17];
         int ntok = 0;
-        if (cfg->gen.temperature <= 0.0f && q36_engine_mtp_draft_tokens(engine) > 1 &&
+        if ((cfg->gen.temperature <= 0.0f || cfg->gen.mtp_opportunistic) &&
+            q36_engine_mtp_draft_tokens(engine) > 1 &&
             getenv("Q36_MTP_SPEC_DISABLE") == NULL) {
             ntok = q36_session_eval_speculative_argmax(session,
                                                        token,
@@ -1193,7 +1197,8 @@ static int run_chat_turn(q36_engine *engine, cli_config *cfg, repl_chat *chat,
 
         int toks[17];
         int ntok = 0;
-        if (cfg->gen.temperature <= 0.0f && q36_engine_mtp_draft_tokens(engine) > 1 &&
+        if ((cfg->gen.temperature <= 0.0f || cfg->gen.mtp_opportunistic) &&
+            q36_engine_mtp_draft_tokens(engine) > 1 &&
             getenv("Q36_MTP_SPEC_DISABLE") == NULL) {
             ntok = q36_session_eval_speculative_argmax(chat->session,
                                                        token,
@@ -1548,6 +1553,8 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.vision_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-draft")) {
             c.engine.mtp_draft_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--mtp-opportunistic")) {
+            c.gen.mtp_opportunistic = true;
         } else if (!strcmp(arg, "--mtp-margin")) {
             c.engine.mtp_margin = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1000.0f);
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
@@ -1721,6 +1728,10 @@ static cli_config parse_options(int argc, char **argv) {
         }
     }
 
+    if (c.gen.mtp_opportunistic && (!c.engine.mtp_path || c.engine.mtp_draft_tokens <= 1)) {
+        fprintf(stderr, "q36: --mtp-opportunistic requires --mtp FILE and --mtp-draft > 1\n");
+        exit(2);
+    }
     if (c.engine.directional_steering_file && !directional_steering_scale_set) {
         c.engine.directional_steering_ffn = 1.0f;
     }

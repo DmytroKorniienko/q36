@@ -4427,6 +4427,25 @@ done:
 }
 
 static void test_mtp_lookup(void) {
+    q36_mtp_policy policy = {0};
+    for (int phase = 0; phase < 3; phase++) {
+        int winner = phase == 0 ? 2 : phase == 1 ? 4 : 3;
+        int selected = 0;
+        for (int step = 0; step < 256; step++) {
+            int depth = q36_mtp_policy_depth(&policy, 4);
+            TEST_ASSERT(depth >= 2 && depth <= 4);
+            q36_mtp_policy_observe(&policy, depth, depth,
+                                    depth * (depth == winner ? 1.0 : 4.0));
+            if (step >= 160 && depth == winner) selected++;
+        }
+        TEST_ASSERT(selected >= 80);
+    }
+    for (int cap = 1; cap <= 4; cap++) {
+        int depth = q36_mtp_policy_depth(&policy, cap);
+        TEST_ASSERT(depth >= 1 && depth <= cap);
+    }
+    for (int i = 0; i < 3; i++) TEST_ASSERT(policy.samples[i] > 0);
+
     int history[27], ambiguous[43];
     for (int i = 0; i < 12; i++) history[i] = ambiguous[i] = ambiguous[16 + i] = i;
     for (int i = 0; i < 11; i++) history[16 + i] = ambiguous[32 + i] = i;
@@ -7576,7 +7595,7 @@ static void test_think_tool_recovery_live(void) {
     test_close_engine(false);
 }
 
-static void test_mtp_verifier_replay(void) {
+static void test_mtp_verifier_replay_sampling(bool sampled) {
     if (test_is_cpu_only_build()) {
         test_skip("mtp-verifier", "MTP requires Vulkan");
         return;
@@ -7609,6 +7628,10 @@ static void test_mtp_verifier_replay(void) {
     q36_session *plain = NULL;
     q36_tokens prompt = {0};
     char err[192] = {0};
+    uint64_t rng = 42, plain_rng = 42;
+    const char *temp_env = getenv("Q36_TEST_MTP_TEMP");
+    float temperature = sampled ? (temp_env ? strtof(temp_env, NULL) : 1.0f) : 0.0f;
+    int sampled_non_greedy = 0;
     int committed = 0;
     int multi = 0;
     int partial = 0;
@@ -7650,9 +7673,28 @@ static void test_mtp_verifier_replay(void) {
         TEST_ASSERT(q36_session_load_payload(spec, payload, bytes, err, sizeof(err)) == 0);
         fclose(payload);
     }
+    if (sampled) {
+        int top = q36_session_argmax(spec);
+        float saved = q36_session_logits(spec, NULL)[top];
+        uint64_t excluded_rng = 7;
+        int other = q36_session_sample_excluding(spec, top,
+            temperature, 0, 1.0f, 0.05f, &excluded_rng);
+        TEST_ASSERT(other >= 0 && other != top);
+        TEST_ASSERT(q36_session_logits(spec, NULL)[top] == saved);
+        TEST_ASSERT(q36_session_argmax(spec) == top);
+    }
     while (committed < limit) {
         int first = frontier > 0 ?
             q36_session_argmax_excluding(spec, q36_token_eos(engine)) : q36_session_argmax(spec);
+        if (sampled) {
+            int greedy = first;
+            first = q36_session_sample_excluding(spec, q36_token_eos(engine),
+                temperature, 0, 1.0f, 0.05f, &rng);
+            int reference = q36_session_sample_excluding(plain, q36_token_eos(engine),
+                temperature, 0, 1.0f, 0.05f, &plain_rng);
+            TEST_ASSERT(first == reference && rng == plain_rng);
+            if (first != greedy) sampled_non_greedy++;
+        }
         if (first < 0 || first == q36_token_eos(engine)) break;
         int accepted[17];
         int n = (frontier > 0 ? q36_session_eval_speculative_argmax_excluding : q36_session_eval_speculative_argmax)(
@@ -7664,6 +7706,7 @@ static void test_mtp_verifier_replay(void) {
             fprintf(stderr, "q36-test: MTP failed: %s\n", err);
             break;
         }
+        TEST_ASSERT(accepted[0] == first);
         if (n > 1) multi++;
         if (n > longest) longest = n;
         if (n > 1 && n < q36_engine_mtp_draft_tokens(engine)) partial++;
@@ -7676,9 +7719,11 @@ static void test_mtp_verifier_replay(void) {
             TEST_ASSERT(logits && accepted[i] >= 0 && accepted[i] < vocab);
             TEST_ASSERT(top >= 0);
             if (!logits || top < 0 || accepted[i] < 0 || accepted[i] >= vocab) break;
-            float gap = logits[top] - logits[accepted[i]];
-            if (gap > worst_gap) worst_gap = gap;
-            TEST_ASSERT(gap <= 1.0e-6f);
+            if (!sampled || i > 0) {
+                float gap = logits[top] - logits[accepted[i]];
+                if (gap > worst_gap) worst_gap = gap;
+                TEST_ASSERT(gap <= 1.0e-6f);
+            }
             TEST_ASSERT(q36_session_eval(plain, accepted[i], err, sizeof(err)) == 0);
             committed++;
             if ((!frontier && accepted[i] == q36_token_eos(engine)) || committed >= limit) break;
@@ -7692,6 +7737,7 @@ static void test_mtp_verifier_replay(void) {
         if (!sl || !pl) break;
         float diff = 0.0f;
         for (int j = 0; j < vocab; j++) {
+            TEST_ASSERT(isfinite(sl[j]) && isfinite(pl[j]));
             float d = fabsf(sl[j] - pl[j]);
             if (d > diff) diff = d;
         }
@@ -7707,6 +7753,11 @@ static void test_mtp_verifier_replay(void) {
             committed, multi, partial, longest, worst_gap, worst_logits);
     TEST_ASSERT(committed >= 16);
     TEST_ASSERT(multi > 0);
+    if (sampled) {
+        fprintf(stderr, "q36-test: opportunistic non-greedy boundaries=%d temperature=%g\n",
+                sampled_non_greedy, temperature);
+        if (temperature > 0.0f) TEST_ASSERT(sampled_non_greedy > 0);
+    }
     const char *min_env = getenv("Q36_TEST_MTP_MIN_ACCEPT");
     if (min_env) TEST_ASSERT(longest >= atoi(min_env));
     if (draft > 2) TEST_ASSERT(partial > 0);
@@ -7726,6 +7777,14 @@ done:
     q36_session_free(plain);
     q36_session_free(spec);
     q36_engine_close(engine);
+}
+
+static void test_mtp_verifier_replay(void) {
+    test_mtp_verifier_replay_sampling(false);
+}
+
+static void test_mtp_opportunistic(void) {
+    test_mtp_verifier_replay_sampling(true);
 }
 
 static void test_steering_sessions(void) {
@@ -7880,6 +7939,7 @@ static const q36_test_entry test_entries[] = {
     {"--vulkan-fusion-parity", "vulkan-fusion-parity", "fused Vulkan path against complete feature fallbacks", test_vulkan_fusion_parity},
     {"--vulkan-queue-parity", "vulkan-queue-parity", "ACE and graphics queues produce bit-identical logits", test_vulkan_queue_parity},
     {"--mtp-verifier", "mtp-verifier", "exact MTP acceptance, recurrent rollback and checkpoint restore", test_mtp_verifier_replay},
+    {"--mtp-opportunistic", "mtp-opportunistic", "sampled block seeds, greedy tails and exact target state", test_mtp_opportunistic},
     {"--qwen-tool-call-format", "qwen-tool-call-format", "Qwen tool-call rendering format unit test", test_qwen_tool_call_format},
     {"--kat-model-support", "kat-model-support", "KAT model identity and special tokenizer tokens", test_kat_model_support},
     {"--vector-fixtures", "vector-fixtures", "llama.cpp fixture consistency check", test_vector_fixtures},

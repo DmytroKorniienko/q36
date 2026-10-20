@@ -255,7 +255,59 @@ float block_dot(uint row, uint qb, uint group, vec4 qv[8]) {
     return d * sum;
 }
 
-#if Q36_TOKENS > 1 && defined(Q36_TYPE) && Q36_TYPE == 16
+#if Q36_TOKENS > 1 && defined(Q36_TYPE) && (Q36_TYPE == 17 || Q36_TYPE == 22)
+/* Decode each weight group once, but keep every token's scaled sum local
+ * so the compiler retains the ordinary decode contraction order. */
+void main(void) {
+    uint lid=gl_LocalInvocationID.x,group=lid&7u;
+    uint first=gl_WorkGroupID.x*ROWS;
+    float acc[Q36_TOKENS][ROWS];
+    UNROLL for(uint t=0u;t<Q36_TOKENS;t++)
+        UNROLL for(uint r=0u;r<ROWS;r++)acc[t][r]=0.0;
+    for(uint b=lid>>3u;b<pc.blocks;b+=8u) {
+        UNROLL for(uint r=0u;r<ROWS;r++) {
+            uint row=first+r;
+            if(row>=pc.out_dim)continue;
+            uint base=row*pc.row_bytes+b*(QTYPE==IQ2_S?82u:74u);
+            float wd=unpackHalf2x16(load_u16(base)).x*0.25;
+            uint scales=load_u8(base+(QTYPE==IQ2_S?74u:66u)+group);
+            uint high=QTYPE==IQ2_S?load_u8(base+66u+group):0u;
+            ivec2 weights[4];float d[4];
+            UNROLL for(uint l=0u;l<4u;l++) {
+                uint entry,signs;
+                if(QTYPE==IQ2_S) {
+                    entry=load_u8(base+2u+4u*group+l)|((high<<(8u-2u*l))&0x300u);
+                    signs=load_u8(base+34u+4u*group+l);
+                } else {
+                    uint qs=load_u16(base+2u+8u*group+2u*l);
+                    entry=qs&511u;signs=table_u8(TAB_KSIGNS_BYTES+(qs>>9u));
+                }
+                uint tab=(QTYPE==IQ2_S?TAB_IQ2S:TAB_IQ2XS)+2u*entry;
+                weights[l]=ivec2(signed_bytes(tables[tab],signs),signed_bytes(tables[tab+1u],signs>>4u));
+                d[l]=wd*(0.5+float(l<2u?scales&15u:scales>>4u));
+            }
+            UNROLL for(uint t=0u;t<Q36_TOKENS;t++) {
+                if(t>=pc.n_tok)continue;
+                uint qbase=(t*pc.blocks+b)*Q8K_WORDS+2u+8u*group;
+                float sum=0.0;
+                UNROLL for(uint l=0u;l<4u;l++) {
+                    sum+=d[l]*float(dotPacked4x8EXT(weights[l].x,int(q8[qbase+2u*l])));
+                    sum+=d[l]*float(dotPacked4x8EXT(weights[l].y,int(q8[qbase+2u*l+1u])));
+                }
+                float yd=uintBitsToFloat(q8[(t*pc.blocks+b)*Q8K_WORDS]);
+                acc[t][r]=fma(yd,sum,acc[t][r]);
+            }
+        }
+    }
+    UNROLL for(uint t=0u;t<Q36_TOKENS;t++) {
+        if(t>=pc.n_tok)continue;
+        UNROLL for(uint r=0u;r<ROWS;r++) {
+            float value=subgroupAdd(acc[t][r]);
+            if(lid==0u&&first+r<pc.out_dim)y[t*pc.out_dim+first+r]=value*pc.scale;
+        }
+    }
+}
+#elif Q36_TOKENS > 1 && defined(Q36_TYPE) && Q36_TYPE == 16
 
 void main(void) {
     uint lid = gl_LocalInvocationID.x, group = lid & 7u;
