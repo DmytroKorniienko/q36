@@ -252,8 +252,14 @@ int q36_session_create(q36_session **out, q36_engine *e, int ctx_size);
 void q36_session_free(q36_session *s);
 int q36_session_power(q36_session *s);
 int q36_session_set_power(q36_session *s, int power_percent);
+float q36_session_directional_steering_attn(q36_session *s);
 float q36_session_directional_steering_ffn(q36_session *s);
+/* Changes this session's subsequent tokens without rebuilding its live KV.
+ * The direction bank is shared; each session owns its steering strengths. */
 int q36_session_set_directional_steering_ffn(q36_session *s, float scale);
+int q36_session_set_directional_steering(q36_session *s, float attn, float ffn);
+/* Cache identity for the loaded directions and current strengths; zero when disabled. */
+uint64_t q36_session_directional_steering_key(q36_session *s);
 void q36_session_set_progress(q36_session *s, q36_session_progress_fn fn, void *ud);
 void q36_session_set_display_progress(q36_session *s, q36_session_progress_fn fn, void *ud);
 void q36_session_set_cancel(q36_session *s, q36_session_cancel_fn fn, void *ud);

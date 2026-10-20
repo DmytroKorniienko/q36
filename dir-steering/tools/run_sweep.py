@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Run a small steering scale sweep through ds4.
+"""Run a small steering scale sweep through q36.
 
 This is intentionally thin: it exercises the same public CLI options users
-will use in production and leaves all inference behavior inside ds4.
+will use in production and leaves all inference behavior inside q36.
 """
 
 import argparse
+import math
 import subprocess
 from pathlib import Path
 
@@ -23,8 +24,8 @@ def read_prompts(path: Path) -> list[str]:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ds4", default="./ds4")
-    ap.add_argument("--model", default="ds4flash.gguf")
+    ap.add_argument("--q36", default="./q36")
+    ap.add_argument("--model", default="gguf/Qwen3.8-27B-UD-IQ3_S.gguf")
     ap.add_argument("--direction", required=True,
                     help="flat f32 vector file produced by build_direction.py")
     ap.add_argument("--prompts", required=True)
@@ -38,14 +39,19 @@ def main() -> None:
     prompts = read_prompts(Path(args.prompts))
     scales = [float(x) for x in args.scales.split(",") if x.strip()]
 
+    if not scales or not all(math.isfinite(x) and -100 <= x <= 100
+                             for x in [*scales, args.attn_scale]):
+        ap.error("scales must be finite and between -100 and 100")
+    q36 = str(Path(args.q36).resolve())
+
     for prompt in prompts:
         print("=" * 80)
         print(f"PROMPT: {prompt}")
         for scale in scales:
             print("-" * 80)
-            print(f"FFN scale: {scale:g}")
+            print(f"FFN scale: {scale:g}", flush=True)
             cmd = [
-                args.ds4,
+                q36,
                 "-m", args.model,
                 "--ctx", str(args.ctx),
                 "-n", str(args.tokens),

@@ -550,6 +550,17 @@ typedef struct {
     q36_layer_weights block;
 } q36_mtp_weights;
 
+enum {
+    Q36_DUMP_RESIDUAL_PRE, Q36_DUMP_ATTN_NORM, Q36_DUMP_ATTN_OUT,
+    Q36_DUMP_RESIDUAL_ATTN, Q36_DUMP_FFN_NORM, Q36_DUMP_FFN_OUT,
+    Q36_DUMP_RESIDUAL_POST, Q36_DUMP_OUTPUT_NORM, Q36_DUMP_COUNT
+};
+
+static const char *q36_dump_names[Q36_DUMP_COUNT] = {
+    "residual_pre", "attn_norm", "attn_out", "residual_attn",
+    "ffn_norm", "ffn_out", "residual_post", "output_norm"
+};
+
 struct q36_engine {
     q36_model model;
     q36_model mtp_model;
@@ -575,13 +586,21 @@ struct q36_engine {
     q36_kv_cache_type cache_type_v;
     char *directional_steering_file;
     float *directional_steering_dirs;
+    uint64_t directional_steering_hash;
 #ifndef Q36_NO_GPU
     q36_gpu_tensor *directional_steering_gpu;
+    q36_gpu_tensor *activation_dump_gpu;
     q36_gpu_tensor *session_batch_logits;
     uint32_t session_batch_logits_cap;
 #endif
     float directional_steering_attn_scale;
     float directional_steering_ffn_scale;
+    char *activation_dump_prefix;
+    uint32_t activation_dump_mask;
+    int activation_dump_layer;
+    int activation_dump_pos; /* -1: last prompt token; -2: every committed token. */
+    int activation_dump_slot[Q36_DUMP_COUNT];
+    uint32_t activation_dump_slots;
     bool quality;
     int routed_quant_bits;
     float expert_weights_scale;
@@ -614,6 +633,8 @@ struct q36_session {
     float *mtp_logits;
     bool logits_host_valid;
     bool gpu_top2_valid;
+    bool dump_active;
+    uint32_t dump_first, dump_count, dump_pos;
     int gpu_top2[2];
     void *runtime;
     q36_session_progress_fn progress;
@@ -627,6 +648,8 @@ struct q36_session {
     float mtp_draft_margin;
     int mtp_backoff;
     int mtp_backoff_len;
+    float directional_steering_attn_scale;
+    float directional_steering_ffn_scale;
 };
 
 typedef struct {
@@ -3127,6 +3150,101 @@ static void q36_directional_steering_project_rows(float *x,
         for (uint32_t i = 0; i < Q36_N_EMBD; i++) xr[i] -= coeff * dir[i];
     }
 }
+
+static void q36_dump_select(q36_session *s, uint32_t pos, uint32_t rows,
+                              bool last_prompt) {
+    q36_engine *e = s->engine;
+    s->dump_active = false;
+    if (!e->activation_dump_prefix || !rows) return;
+    if (e->activation_dump_pos == -1) {
+        if (!last_prompt) return;
+        s->dump_first = rows - 1u;
+        s->dump_count = 1;
+    } else if (e->activation_dump_pos == -2) {
+        s->dump_first = 0;
+        s->dump_count = rows;
+    } else {
+        uint32_t target = (uint32_t)e->activation_dump_pos;
+        if (target < pos || target - pos >= rows) return;
+        s->dump_first = target - pos;
+        s->dump_count = 1;
+    }
+    s->dump_pos = pos + s->dump_first;
+    s->dump_active = true;
+}
+
+static bool q36_dump_wants(q36_session *s, uint32_t kind, uint32_t layer) {
+    q36_engine *e = s->engine;
+    return s->dump_active && (e->activation_dump_mask & (1u << kind)) &&
+           (e->activation_dump_layer < 0 || (uint32_t)e->activation_dump_layer == layer) &&
+           (kind != Q36_DUMP_OUTPUT_NORM || layer + 1u == Q36_N_LAYER);
+}
+
+static bool q36_dump_write(q36_session *s, uint32_t kind, uint32_t layer,
+                            uint32_t pos, const float *row) {
+    q36_engine *e = s->engine;
+    size_t size = strlen(e->activation_dump_prefix) + 96;
+    char *path = xmalloc(size);
+    /* Keep the extractor's pos0 naming for its default final-prompt capture. */
+    if (e->activation_dump_pos == -1) pos = 0;
+    snprintf(path, size, "%s_%s-%u_pos%u.bin", e->activation_dump_prefix,
+             q36_dump_names[kind], layer, pos);
+    FILE *fp = fopen(path, "wb");
+    bool ok = fp && q36_all_finite(row, Q36_N_EMBD);
+    if (ok) ok = fwrite(row, sizeof(float), Q36_N_EMBD, fp) == Q36_N_EMBD;
+    if (fp && fclose(fp) != 0) ok = false;
+    if (!ok) fprintf(stderr, "q36: failed to capture activation row: %s\n", path);
+    free(path);
+    return ok;
+}
+
+static bool q36_dump_activation_cpu(q36_session *s, uint32_t kind,
+                                     uint32_t layer, const float *x) {
+    if (!q36_dump_wants(s, kind, layer)) return true;
+    for (uint32_t i = 0; i < s->dump_count; i++) {
+        if (!q36_dump_write(s, kind, layer, s->dump_pos + i,
+                x + (uint64_t)(s->dump_first + i) * Q36_N_EMBD)) return false;
+    }
+    return true;
+}
+
+#ifndef Q36_NO_GPU
+static bool q36_dump_activation_gpu(q36_session *s, uint32_t kind,
+                                     uint32_t layer, q36_gpu_tensor *x) {
+    if (!q36_dump_wants(s, kind, layer)) return true;
+    uint64_t bytes = (uint64_t)Q36_N_EMBD * sizeof(float);
+    if (s->dump_count == 1) {
+        /* Queue one selected row per stream and layer, then read after the
+         * graph finishes. All-position diagnostics use bounded host scratch. */
+        uint64_t slot = (uint64_t)s->engine->activation_dump_slot[kind] * Q36_N_LAYER + layer;
+        return q36_gpu_tensor_copy(s->engine->activation_dump_gpu, slot * bytes,
+                                   x, s->dump_first * bytes, bytes) != 0;
+    }
+    float *rows = xmalloc((size_t)(s->dump_count * bytes));
+    bool ok = q36_gpu_tensor_read(x, s->dump_first * bytes, rows, s->dump_count * bytes) != 0;
+    for (uint32_t i = 0; ok && i < s->dump_count; i++)
+        ok = q36_dump_write(s, kind, layer, s->dump_pos + i,
+                             rows + (uint64_t)i * Q36_N_EMBD);
+    free(rows);
+    return ok;
+}
+
+static bool q36_dump_activations_gpu(q36_session *s) {
+    if (s->dump_count != 1) return true;
+    uint64_t bytes = (uint64_t)s->engine->activation_dump_slots * Q36_N_LAYER * Q36_N_EMBD * sizeof(float);
+    float *rows = xmalloc((size_t)bytes);
+    bool ok = q36_gpu_tensor_read(s->engine->activation_dump_gpu, 0, rows, bytes) != 0;
+    for (uint32_t kind = 0; ok && kind < Q36_DUMP_COUNT; kind++) {
+        for (uint32_t il = 0; ok && il < Q36_N_LAYER; il++) {
+            if (!q36_dump_wants(s, kind, il)) continue;
+            uint64_t slot = (uint64_t)s->engine->activation_dump_slot[kind] * Q36_N_LAYER + il;
+            ok = q36_dump_write(s, kind, il, s->dump_pos, rows + slot * Q36_N_EMBD);
+        }
+    }
+    free(rows);
+    return ok;
+}
+#endif
 
 static void q36_rms_norm_rows(float *dst,
                               const float *src,
@@ -7156,6 +7274,7 @@ static bool q36_forward_tokens_cpu(q36_session *s,
     }
     for (uint32_t il = 0; il < Q36_N_LAYER; il++) {
         const q36_layer_weights *l = &e->weights.layer[il];
+        if (!q36_dump_activation_cpu(s, Q36_DUMP_RESIDUAL_PRE, il, rt->batch_hidden)) return false;
         q36_rms_norm_rows(rt->batch_norm,
                           rt->batch_hidden,
                           (const float *)(e->model.map + l->attn_norm->abs_offset),
@@ -7163,6 +7282,7 @@ static bool q36_forward_tokens_cpu(q36_session *s,
                           Q36_N_EMBD,
                           Q36_RMS_EPS,
                           e->n_threads);
+        if (!q36_dump_activation_cpu(s, Q36_DUMP_ATTN_NORM, il, rt->batch_norm)) return false;
         if (l->kind == Q36_LAYER_FULL_ATTN) {
             if (!q36_forward_full_attn_batch(e, l, il, pos0, rt->batch_norm, rt->batch_next_hidden, n_tok, rt)) {
                 fprintf(stderr, "q36: full attention block failed at pos=%u layer=%u\n", pos0, il);
@@ -7178,7 +7298,8 @@ static bool q36_forward_tokens_cpu(q36_session *s,
                                                e->directional_steering_dirs,
                                                il,
                                                n_tok,
-                                               e->directional_steering_attn_scale);
+                                               s->directional_steering_attn_scale);
+        if (!q36_dump_activation_cpu(s, Q36_DUMP_ATTN_OUT, il, rt->batch_next_hidden)) return false;
         if (!q36_all_finite(rt->batch_next_hidden, n_tok * Q36_N_EMBD)) {
             fprintf(stderr, "q36: non-finite attn output at pos=%u layer=%u kind=%s\n",
                     pos0, il, l->kind == Q36_LAYER_FULL_ATTN ? "full" : "recurrent");
@@ -7190,6 +7311,7 @@ static bool q36_forward_tokens_cpu(q36_session *s,
                      n_tok,
                      Q36_N_EMBD,
                      e->n_threads);
+        if (!q36_dump_activation_cpu(s, Q36_DUMP_RESIDUAL_ATTN, il, rt->batch_next_hidden)) return false;
         q36_rms_norm_rows(rt->batch_norm,
                           rt->batch_next_hidden,
                           (const float *)(e->model.map + l->post_attention_norm->abs_offset),
@@ -7197,6 +7319,7 @@ static bool q36_forward_tokens_cpu(q36_session *s,
                           Q36_N_EMBD,
                           Q36_RMS_EPS,
                           e->n_threads);
+        if (!q36_dump_activation_cpu(s, Q36_DUMP_FFN_NORM, il, rt->batch_norm)) return false;
         if (!q36_forward_ffn_batch(e, l, rt->batch_norm, rt->batch_hidden, n_tok, rt)) {
             fprintf(stderr, "q36: ffn block failed at pos=%u layer=%u\n", pos0, il);
             return false;
@@ -7205,7 +7328,8 @@ static bool q36_forward_tokens_cpu(q36_session *s,
                                                e->directional_steering_dirs,
                                                il,
                                                n_tok,
-                                               e->directional_steering_ffn_scale);
+                                               s->directional_steering_ffn_scale);
+        if (!q36_dump_activation_cpu(s, Q36_DUMP_FFN_OUT, il, rt->batch_hidden)) return false;
         if (!q36_all_finite(rt->batch_hidden, n_tok * Q36_N_EMBD)) {
             fprintf(stderr, "q36: non-finite ffn output at pos=%u layer=%u\n", pos0, il);
             return false;
@@ -7216,6 +7340,7 @@ static bool q36_forward_tokens_cpu(q36_session *s,
                      n_tok,
                      Q36_N_EMBD,
                      e->n_threads);
+        if (!q36_dump_activation_cpu(s, Q36_DUMP_RESIDUAL_POST, il, rt->batch_hidden)) return false;
         if (!q36_all_finite(rt->batch_hidden, n_tok * Q36_N_EMBD)) {
             fprintf(stderr, "q36: non-finite hidden state at pos=%u layer=%u\n", pos0, il);
             return false;
@@ -7228,6 +7353,7 @@ static bool q36_forward_tokens_cpu(q36_session *s,
                       Q36_N_EMBD,
                       Q36_RMS_EPS,
                       e->n_threads);
+    if (!q36_dump_activation_cpu(s, Q36_DUMP_OUTPUT_NORM, Q36_N_LAYER - 1u, rt->batch_norm)) return false;
     if (!q36_all_finite(rt->batch_norm, n_tok * Q36_N_EMBD)) {
         fprintf(stderr, "q36: non-finite output norm at pos=%u\n", pos0);
         return false;
@@ -7970,6 +8096,8 @@ static bool q36_forward_tokens_vulkan_into(q36_session *s,
     bool attn_q8 = false;
     for (uint32_t il = 0; il < Q36_N_LAYER; il++) {
         const q36_layer_weights *l = &e->weights.layer[il];
+        if (!q36_dump_activation_gpu(s, Q36_DUMP_RESIDUAL_PRE, il, rt->hidden)) return false;
+        if (!q36_dump_activation_gpu(s, Q36_DUMP_ATTN_NORM, il, rt->norm)) return false;
         if (l->kind == Q36_LAYER_FULL_ATTN) {
             if (!q36_forward_full_attn_vulkan(s, l, il, pos0, positions,
                                                n_tok, rt->norm, rt->next_hidden, attn_q8)) {
@@ -7982,14 +8110,14 @@ static bool q36_forward_tokens_vulkan_into(q36_session *s,
                 return false;
             }
         }
-        if (e->directional_steering_attn_scale != 0.0f &&
+        if (s->directional_steering_attn_scale != 0.0f &&
             !q36_gpu_directional_steering_project_tensor(
                 rt->next_hidden,
                 e->directional_steering_gpu,
                 il,
                 Q36_N_EMBD,
                 n_tok,
-                e->directional_steering_attn_scale)) {
+                s->directional_steering_attn_scale)) {
             return false;
         }
         if (e->quality && !q36_gpu_tensor_all_finite(rt->next_hidden, n_tok * Q36_N_EMBD)) {
@@ -7997,6 +8125,7 @@ static bool q36_forward_tokens_vulkan_into(q36_session *s,
                     pos0, il, l->kind == Q36_LAYER_FULL_ATTN ? "full" : "recurrent");
             return false;
         }
+        if (!q36_dump_activation_gpu(s, Q36_DUMP_ATTN_OUT, il, rt->next_hidden)) return false;
         bool norm_q8 = false;
 #ifndef Q36_METAL
         if (Q36_MODEL_DENSE && n_tok == 1u && !e->quality) {
@@ -8011,24 +8140,27 @@ static bool q36_forward_tokens_vulkan_into(q36_session *s,
                                          Q36_N_EMBD, n_tok, Q36_RMS_EPS)) {
             return false;
         }
+        if (!q36_dump_activation_gpu(s, Q36_DUMP_RESIDUAL_ATTN, il, rt->next_hidden)) return false;
+        if (!q36_dump_activation_gpu(s, Q36_DUMP_FFN_NORM, il, rt->norm)) return false;
         if (!q36_forward_ffn_vulkan(s, l, il, n_tok, rt->norm, rt->hidden, norm_q8)) {
             fprintf(stderr, "q36: ffn block failed at pos=%u layer=%u\n", pos0, il);
             return false;
         }
-        if (e->directional_steering_ffn_scale != 0.0f &&
+        if (s->directional_steering_ffn_scale != 0.0f &&
             !q36_gpu_directional_steering_project_tensor(
                 rt->hidden,
                 e->directional_steering_gpu,
                 il,
                 Q36_N_EMBD,
                 n_tok,
-                e->directional_steering_ffn_scale)) {
+                s->directional_steering_ffn_scale)) {
             return false;
         }
         if (e->quality && !q36_gpu_tensor_all_finite(rt->hidden, n_tok * Q36_N_EMBD)) {
             fprintf(stderr, "q36: non-finite ffn output at pos=%u layer=%u\n", pos0, il);
             return false;
         }
+        if (!q36_dump_activation_gpu(s, Q36_DUMP_FFN_OUT, il, rt->hidden)) return false;
         {
             const q36_tensor *next_norm = il + 1u < Q36_N_LAYER ?
                 e->weights.layer[il + 1u].attn_norm : e->weights.output_norm;
@@ -8056,6 +8188,9 @@ static bool q36_forward_tokens_vulkan_into(q36_session *s,
                 return false;
             }
         }
+        if (!q36_dump_activation_gpu(s, Q36_DUMP_RESIDUAL_POST, il, rt->hidden)) return false;
+        if (il + 1u == Q36_N_LAYER &&
+            !q36_dump_activation_gpu(s, Q36_DUMP_OUTPUT_NORM, il, rt->norm)) return false;
         if (e->quality && !q36_gpu_tensor_all_finite(rt->hidden, n_tok * Q36_N_EMBD)) {
             fprintf(stderr, "q36: non-finite hidden state at pos=%u layer=%u\n", pos0, il);
             return false;
@@ -8324,6 +8459,38 @@ static bool q36_sessions_recurrent_vulkan(q36_decode_item *items, int count,
             q36_tensor_scalar_or(&e->model, l->ssm_out_scale, 1.0f));
 }
 
+static bool q36_sessions_steering_vulkan(q36_decode_item *items, int count,
+                                         q36_gpu_tensor *x, uint32_t layer, bool attn) {
+    q36_session *first = items[0].session;
+    float scale = attn ? first->directional_steering_attn_scale
+                       : first->directional_steering_ffn_scale;
+    bool same = true;
+    for (int i = 1; i < count; i++) {
+        q36_session *s = items[i].session;
+        float other = attn ? s->directional_steering_attn_scale
+                           : s->directional_steering_ffn_scale;
+        if (other != scale) same = false;
+    }
+    if (same) {
+        return scale == 0.0f || q36_gpu_directional_steering_project_tensor(
+                x, first->engine->directional_steering_gpu, layer,
+                Q36_N_EMBD, (uint32_t)count, scale);
+    }
+    /* Batched sessions share weights, but each row keeps its own intervention. */
+    for (int i = 0; i < count; i++) {
+        q36_session *s = items[i].session;
+        scale = attn ? s->directional_steering_attn_scale
+                     : s->directional_steering_ffn_scale;
+        if (scale == 0.0f) continue;
+        q36_gpu_tensor *row = q36_vulkan_row(x, (uint32_t)i, Q36_N_EMBD);
+        bool ok = row && q36_gpu_directional_steering_project_tensor(
+                row, s->engine->directional_steering_gpu, layer, Q36_N_EMBD, 1, scale);
+        q36_gpu_tensor_free(row);
+        if (!ok) return false;
+    }
+    return true;
+}
+
 static bool q36_sessions_eval_batch_vulkan(q36_decode_item *items, int count) {
     q36_session *first = items[0].session;
     q36_engine *e = first->engine;
@@ -8352,12 +8519,7 @@ static bool q36_sessions_eval_batch_vulkan(q36_decode_item *items, int count) {
                                             rt->norm, rt->next_hidden)
             : q36_sessions_recurrent_vulkan(items, count, l, il,
                                              rt->norm, rt->next_hidden);
-        if (ok && e->directional_steering_attn_scale != 0.0f) {
-            ok = q36_gpu_directional_steering_project_tensor(
-                    rt->next_hidden, e->directional_steering_gpu, il,
-                    Q36_N_EMBD, rows,
-                    e->directional_steering_attn_scale) != 0;
-        }
+        if (ok) ok = q36_sessions_steering_vulkan(items, count, rt->next_hidden, il, true);
         if (ok) {
             ok = q36_gpu_add_rms_norm_tensor(
                     rt->norm, rt->next_hidden, rt->next_hidden, rt->hidden,
@@ -8370,12 +8532,7 @@ static bool q36_sessions_eval_batch_vulkan(q36_decode_item *items, int count) {
                     rt, &e->model, l, e->expert_weights_scale, il,
                     rows, rt->norm, rt->hidden, true, false);
         }
-        if (ok && e->directional_steering_ffn_scale != 0.0f) {
-            ok = q36_gpu_directional_steering_project_tensor(
-                    rt->hidden, e->directional_steering_gpu, il,
-                    Q36_N_EMBD, rows,
-                    e->directional_steering_ffn_scale) != 0;
-        }
+        if (ok) ok = q36_sessions_steering_vulkan(items, count, rt->hidden, il, false);
         if (ok) {
             const q36_tensor *next_norm = il + 1u < Q36_N_LAYER
                 ? e->weights.layer[il + 1u].attn_norm : e->weights.output_norm;
@@ -8686,7 +8843,9 @@ static bool q36_forward_token_cpu(q36_session *s, int token, uint32_t pos, bool 
     }
     for (uint32_t il = 0; il < Q36_N_LAYER; il++) {
         const q36_layer_weights *l = &e->weights.layer[il];
+        if (!q36_dump_activation_cpu(s, Q36_DUMP_RESIDUAL_PRE, il, rt->hidden)) return false;
         q36_ref_rms_norm(rt->work0, rt->hidden, (const float *)(e->model.map + l->attn_norm->abs_offset), Q36_N_EMBD, Q36_RMS_EPS);
+        if (!q36_dump_activation_cpu(s, Q36_DUMP_ATTN_NORM, il, rt->work0)) return false;
         if (l->kind == Q36_LAYER_FULL_ATTN) {
             if (!q36_forward_full_attn(e, l, il, pos, rt->work0, rt->next_hidden, rt)) {
                 fprintf(stderr, "q36: full attention block failed for token=%d pos=%u layer=%u\n", token, pos, il);
@@ -8702,14 +8861,17 @@ static bool q36_forward_token_cpu(q36_session *s, int token, uint32_t pos, bool 
                                                e->directional_steering_dirs,
                                                il,
                                                1,
-                                               e->directional_steering_attn_scale);
+                                               s->directional_steering_attn_scale);
+        if (!q36_dump_activation_cpu(s, Q36_DUMP_ATTN_OUT, il, rt->next_hidden)) return false;
         if (!q36_all_finite(rt->next_hidden, Q36_N_EMBD)) {
             fprintf(stderr, "q36: non-finite attn output at token=%d pos=%u layer=%u kind=%s\n",
                     token, pos, il, l->kind == Q36_LAYER_FULL_ATTN ? "full" : "recurrent");
             return false;
         }
         for (uint32_t i = 0; i < Q36_N_EMBD; i++) rt->next_hidden[i] += rt->hidden[i];
+        if (!q36_dump_activation_cpu(s, Q36_DUMP_RESIDUAL_ATTN, il, rt->next_hidden)) return false;
         q36_ref_rms_norm(rt->work0, rt->next_hidden, (const float *)(e->model.map + l->post_attention_norm->abs_offset), Q36_N_EMBD, Q36_RMS_EPS);
+        if (!q36_dump_activation_cpu(s, Q36_DUMP_FFN_NORM, il, rt->work0)) return false;
         if (!q36_forward_ffn(e, l, rt->work0, rt->work1, rt)) {
             fprintf(stderr, "q36: ffn block failed for token=%d pos=%u layer=%u\n", token, pos, il);
             return false;
@@ -8718,18 +8880,21 @@ static bool q36_forward_token_cpu(q36_session *s, int token, uint32_t pos, bool 
                                                e->directional_steering_dirs,
                                                il,
                                                1,
-                                               e->directional_steering_ffn_scale);
+                                               s->directional_steering_ffn_scale);
+        if (!q36_dump_activation_cpu(s, Q36_DUMP_FFN_OUT, il, rt->work1)) return false;
         if (!q36_all_finite(rt->work1, Q36_N_EMBD)) {
             fprintf(stderr, "q36: non-finite ffn output at token=%d pos=%u layer=%u\n", token, pos, il);
             return false;
         }
         for (uint32_t i = 0; i < Q36_N_EMBD; i++) rt->hidden[i] = rt->next_hidden[i] + rt->work1[i];
+        if (!q36_dump_activation_cpu(s, Q36_DUMP_RESIDUAL_POST, il, rt->hidden)) return false;
         if (!q36_all_finite(rt->hidden, Q36_N_EMBD)) {
             fprintf(stderr, "q36: non-finite hidden state at token=%d pos=%u layer=%u\n", token, pos, il);
             return false;
         }
     }
     q36_ref_rms_norm(rt->work0, rt->hidden, (const float *)(e->model.map + e->weights.output_norm->abs_offset), Q36_N_EMBD, Q36_RMS_EPS);
+    if (!q36_dump_activation_cpu(s, Q36_DUMP_OUTPUT_NORM, Q36_N_LAYER - 1u, rt->work0)) return false;
     if (!q36_all_finite(rt->work0, Q36_N_EMBD)) {
         fprintf(stderr, "q36: non-finite output norm at token=%d pos=%u\n", token, pos);
         return false;
@@ -9796,11 +9961,17 @@ static bool q36_load_directional_steering(q36_engine *e) {
     uint64_t bytes;
     struct stat st;
     FILE *fp;
-    if (!e || (e->directional_steering_attn_scale == 0.0f &&
-               e->directional_steering_ffn_scale == 0.0f)) {
-        return true;
+    if (!e) return false;
+    if (!isfinite(e->directional_steering_attn_scale) ||
+        !isfinite(e->directional_steering_ffn_scale) ||
+        fabsf(e->directional_steering_attn_scale) > 100.0f ||
+        fabsf(e->directional_steering_ffn_scale) > 100.0f) {
+        fprintf(stderr, "q36: steering scales must be between -100 and 100\n");
+        return false;
     }
     if (!e->directional_steering_file || !e->directional_steering_file[0]) {
+        if (e->directional_steering_attn_scale == 0.0f &&
+            e->directional_steering_ffn_scale == 0.0f) return true;
         fprintf(stderr, "q36: directional steering needs --dir-steering-file\n");
         return false;
     }
@@ -9820,14 +9991,16 @@ static bool q36_load_directional_steering(q36_engine *e) {
         return false;
     }
     e->directional_steering_dirs = xmalloc((size_t)bytes);
-    if (fread(e->directional_steering_dirs, sizeof(float), (size_t)count, fp) != count ||
-        fclose(fp) != 0) {
+    bool ok = fread(e->directional_steering_dirs, sizeof(float), (size_t)count, fp) == count;
+    if (fclose(fp) != 0) ok = false;
+    if (!ok || !q36_all_finite(e->directional_steering_dirs, (size_t)count)) {
         fprintf(stderr, "q36: failed to read directional steering vectors from %s\n",
                 e->directional_steering_file);
         free(e->directional_steering_dirs);
         e->directional_steering_dirs = NULL;
         return false;
     }
+    e->directional_steering_hash = hash_bytes(e->directional_steering_dirs, bytes);
 #ifndef Q36_NO_GPU
     if (q36_backend_uses_graph(e->backend)) {
         e->directional_steering_gpu = q36_gpu_tensor_alloc(bytes);
@@ -9845,6 +10018,60 @@ static bool q36_load_directional_steering(q36_engine *e) {
             e->directional_steering_file,
             (double)e->directional_steering_attn_scale,
             (double)e->directional_steering_ffn_scale);
+    return true;
+}
+
+static bool q36_load_activation_dump(q36_engine *e) {
+    const char *prefix = getenv("Q36_GRAPH_DUMP_PREFIX");
+    if (!prefix || !prefix[0]) return true;
+    e->activation_dump_prefix = q36_strdup(prefix);
+    e->activation_dump_layer = -1;
+    e->activation_dump_pos = -1;
+    const char *name = getenv("Q36_GRAPH_DUMP_NAME");
+    char *names = q36_strdup(name && name[0] ? name : "ffn_out");
+    char *save = NULL;
+    bool ok = true;
+    for (char *part = strtok_r(names, ",", &save); part; part = strtok_r(NULL, ",", &save)) {
+        uint32_t mask = 0;
+        if (!strcmp(part, "all")) mask = (1u << Q36_DUMP_COUNT) - 1u;
+        for (uint32_t k = 0; k < Q36_DUMP_COUNT; k++)
+            if (!strcmp(part, q36_dump_names[k])) mask |= 1u << k;
+        if (!mask) ok = false;
+        e->activation_dump_mask |= mask;
+    }
+    free(names);
+    if (!ok || !e->activation_dump_mask) {
+        fprintf(stderr, "q36: unknown Q36_GRAPH_DUMP_NAME; use all or comma-separated residual_pre,attn_norm,attn_out,residual_attn,ffn_norm,ffn_out,residual_post,output_norm\n");
+        return false;
+    }
+    const char *vars[] = {"Q36_GRAPH_DUMP_LAYER", "Q36_GRAPH_DUMP_POS"};
+    int *values[] = {&e->activation_dump_layer, &e->activation_dump_pos};
+    for (int i = 0; i < 2; i++) {
+        const char *text = getenv(vars[i]);
+        if (!text || !text[0]) continue;
+        if (!strcmp(text, "all")) { *values[i] = i ? -2 : -1; continue; }
+        if (i && !strcmp(text, "last")) continue;
+        char *end = NULL;
+        errno = 0;
+        long n = strtol(text, &end, 10);
+        long limit = i ? INT32_MAX : (long)Q36_N_LAYER - 1;
+        if (errno || *end || n < 0 || n > limit) {
+            fprintf(stderr, "q36: invalid %s: %s\n", vars[i], text);
+            return false;
+        }
+        *values[i] = (int)n;
+    }
+    for (uint32_t k = 0; k < Q36_DUMP_COUNT; k++) {
+        if (e->activation_dump_mask & (1u << k))
+            e->activation_dump_slot[k] = (int)e->activation_dump_slots++;
+    }
+#ifndef Q36_NO_GPU
+    if (q36_backend_uses_graph(e->backend)) {
+        e->activation_dump_gpu = q36_gpu_tensor_alloc(
+                (uint64_t)e->activation_dump_slots * Q36_N_LAYER * Q36_N_EMBD * sizeof(float));
+        if (!e->activation_dump_gpu) return false;
+    }
+#endif
     return true;
 }
 
@@ -9903,10 +10130,6 @@ int q36_engine_open(q36_engine **out, const q36_engine_options *opt) {
     }
     e->directional_steering_attn_scale = opt->directional_steering_attn;
     e->directional_steering_ffn_scale = opt->directional_steering_ffn;
-    if (!q36_load_directional_steering(e)) {
-        q36_engine_close(e);
-        return 1;
-    }
     if (opt->simulate_used_memory_bytes != 0 &&
         !q36_ssd_memory_lock_acquire(&e->simulated_memory,
                                      opt->simulate_used_memory_bytes)) {
@@ -9923,6 +10146,16 @@ int q36_engine_open(q36_engine **out, const q36_engine_options *opt) {
     }
     config_validate_model(&e->model);
     e->variant = g_q36_shape.variant;
+    /* The vector bank follows the detected model, including the 64 x 5120
+     * dense model. Load zero-scale banks too so /steer can enable them later. */
+    if (!q36_load_directional_steering(e)) {
+        q36_engine_close(e);
+        return 1;
+    }
+    if (!q36_load_activation_dump(e)) {
+        q36_engine_close(e);
+        return 1;
+    }
     if (opt->vision_path && opt->vision_path[0]) {
         model_open(&e->vision_model, opt->vision_path, false);
         q36_str arch = required_string(&e->vision_model, "general.architecture");
@@ -10172,6 +10405,7 @@ void q36_engine_close(q36_engine *e) {
     if (!e) return;
 #ifndef Q36_NO_GPU
     q36_gpu_tensor_free(e->directional_steering_gpu);
+    q36_gpu_tensor_free(e->activation_dump_gpu);
     q36_gpu_tensor_free(e->session_batch_logits);
     if (q36_backend_uses_graph(e->backend)) q36_gpu_cleanup();
 #endif
@@ -10181,6 +10415,7 @@ void q36_engine_close(q36_engine *e) {
     if (!e->mtp_embedded) model_close(&e->mtp_model);
     model_close(&e->model);
     free(e->directional_steering_file);
+    free(e->activation_dump_prefix);
     q36_ssd_memory_lock_release(&e->simulated_memory);
     free(e);
 }
@@ -10483,6 +10718,8 @@ int q36_session_create(q36_session **out, q36_engine *e, int ctx_size) {
     s = xcalloc(1, sizeof(*s));
     s->reserved_context_bytes = reserved;
     s->engine = e;
+    s->directional_steering_attn_scale = e->directional_steering_attn_scale;
+    s->directional_steering_ffn_scale = e->directional_steering_ffn_scale;
     s->ctx_size = ctx_size;
     s->logits = xmalloc((size_t)Q36_N_VOCAB * sizeof(*s->logits));
     s->sample_probs = xmalloc((size_t)Q36_N_VOCAB * sizeof(*s->sample_probs));
@@ -10579,24 +10816,49 @@ int q36_session_set_power(q36_session *s, int power_percent) {
     return s ? q36_engine_set_power(s->engine, power_percent) : 1;
 }
 
-float q36_session_directional_steering_ffn(q36_session *s) {
-    return s && s->engine ? s->engine->directional_steering_ffn_scale : 0.0f;
+float q36_session_directional_steering_attn(q36_session *s) {
+    return s ? s->directional_steering_attn_scale : 0.0f;
 }
 
-int q36_session_set_directional_steering_ffn(q36_session *s, float scale) {
-    if (!s || !s->engine || !isfinite(scale) || scale < -100.0f || scale > 100.0f)
+float q36_session_directional_steering_ffn(q36_session *s) {
+    return s ? s->directional_steering_ffn_scale : 0.0f;
+}
+
+uint64_t q36_session_directional_steering_key(q36_session *s) {
+    if (!s || (s->directional_steering_attn_scale == 0 &&
+               s->directional_steering_ffn_scale == 0)) return 0;
+    float scales[2] = {s->directional_steering_attn_scale,
+                       s->directional_steering_ffn_scale};
+    uint32_t bits[2];
+    memcpy(bits, scales, sizeof(bits));
+    for (int i = 0; i < 2; i++) if (!(bits[i] & 0x7fffffffU)) bits[i] = 0;
+    uint64_t key[2] = {s->engine->directional_steering_hash, 0};
+    memcpy(&key[1], bits, sizeof(bits));
+    uint64_t hash = hash_bytes(key, sizeof(key));
+    return hash ? hash : 1;
+}
+
+int q36_session_set_directional_steering(q36_session *s, float attn, float ffn) {
+    if (!s || !s->engine || !isfinite(attn) || !isfinite(ffn) ||
+        fabsf(attn) > 100.0f || fabsf(ffn) > 100.0f)
         return 1;
     bool loaded = s->engine->directional_steering_dirs != NULL;
 #ifndef Q36_NO_GPU
     loaded = loaded || s->engine->directional_steering_gpu != NULL;
 #endif
-    if (scale != 0.0f && !loaded) {
-        fprintf(stderr, "q36: live FFN steering needs a vector loaded at startup\n");
+    if ((attn != 0.0f || ffn != 0.0f) && !loaded) {
+        fprintf(stderr, "q36: live steering needs a vector loaded at startup\n");
         return 1;
     }
-    s->engine->directional_steering_ffn_scale = scale;
+    s->directional_steering_attn_scale = attn;
+    s->directional_steering_ffn_scale = ffn;
     s->mtp_draft_valid = false;
     return 0;
+}
+
+int q36_session_set_directional_steering_ffn(q36_session *s, float scale) {
+    return s ? q36_session_set_directional_steering(
+            s, s->directional_steering_attn_scale, scale) : 1;
 }
 
 void q36_session_set_display_progress(q36_session *s, q36_session_progress_fn fn, void *ud) {
@@ -10648,10 +10910,14 @@ static int q36_session_prefill_range(q36_session *s, const q36_tokens *prompt, i
             return 1;
         }
         compute_logits = (i + n) == prompt->len;
+        /* The default captures the final prompt row across chunk boundaries.
+         * Explicit positions can capture earlier prompt rows and ordinary decode. */
+        q36_dump_select(s, (uint32_t)i, (uint32_t)n, compute_logits);
 #ifndef Q36_NO_GPU
         if (q36_engine_uses_vulkan_runtime(s->engine)) {
             ok = q36_forward_tokens_vulkan(s, prompt->v + i, (uint32_t)n,
                                            (uint32_t)i, compute_logits);
+            if (ok && s->dump_active) ok = q36_dump_activations_gpu(s);
         } else
 #endif
         {
@@ -10661,6 +10927,7 @@ static int q36_session_prefill_range(q36_session *s, const q36_tokens *prompt, i
                   ? q36_forward_token_cpu(s, prompt->v[i], (uint32_t)i, compute_logits)
                   : q36_forward_tokens_cpu(s, prompt->v + i, (uint32_t)n, (uint32_t)i, compute_logits));
         }
+        s->dump_active = false;
         if (!ok) {
             if (err && errlen) snprintf(err, errlen, "%s prefill failed at token %d",
                                          q36_backend_name(s->engine->backend), i);
@@ -11093,13 +11360,20 @@ static int q36_session_eval_internal(q36_session *s, int token, bool update_mtp,
     }
     s->mtp_draft_valid = false;
     pos = (uint32_t)s->checkpoint.len;
-    if (!(q36_engine_uses_vulkan_runtime(s->engine)
+    q36_dump_select(s, pos, 1, false);
+    bool ok = (q36_engine_uses_vulkan_runtime(s->engine)
 #ifndef Q36_NO_GPU
           ? q36_forward_token_vulkan(s, token, pos, true)
 #else
           ? false
 #endif
-          : q36_forward_token_cpu(s, token, pos, true))) {
+          : q36_forward_token_cpu(s, token, pos, true));
+#ifndef Q36_NO_GPU
+    if (ok && s->dump_active && q36_engine_uses_vulkan_runtime(s->engine))
+        ok = q36_dump_activations_gpu(s);
+#endif
+    s->dump_active = false;
+    if (!ok) {
         if (err && errlen) snprintf(err, errlen, "%s decode failed at pos %d",
                                      q36_backend_name(s->engine->backend),
                                      s->checkpoint.len);
@@ -11187,7 +11461,7 @@ static bool q36_sessions_eval_batch_vulkan_supported(q36_decode_item *items,
     const char *enabled = getenv("Q36_VK_SESSION_BATCH");
     if ((enabled && enabled[0] && !strcmp(enabled, "0")) ||
         !items || count < 2 || count > 8 || !e ||
-        !q36_backend_uses_graph(e->backend) || e->ssd_streaming) {
+        !q36_backend_uses_graph(e->backend) || e->ssd_streaming || e->activation_dump_prefix) {
         return false;
     }
     for (int i = 0; i < count; i++) {

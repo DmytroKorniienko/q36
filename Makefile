@@ -417,6 +417,11 @@ help:
 	@echo "  make cpu          Build CPU-only ./q36, ./q36-server, ./q36-bench, ./q36-agent, ./q36-eval, and ./q36_test"
 	@echo "  make q36-quality-score  Build the OpenRouter/Q36 local scorer"
 	@echo "  make test         Build and run tests"
+	@echo "  make test-steering  Test per-session steering and activation captures on the 27B model"
+	@echo "  make test-steering-agent  Test agent tools and cache isolation with the trained 27B direction"
+	@echo "  make test-steering-security  Test a local SQL-injection audit, repair, and regression test"
+	@echo "  make test-steering-server  Test HTTP, streaming, tools, and steering disk-cache separation"
+	@echo "  make steering-probe  Build the refusal-vector probability and KL validator"
 	@echo "  make test-release Run the complete model, Vulkan, reference, streaming, benchmark, and build gates"
 	@echo "  make benchmark-session-batch  Benchmark old, 1/2/4/8-slot, and ordered-fallback server decode"
 	@echo "  make benchmark-qwen27b  Benchmark q36 at 128, 2048, and 4096 prompt tokens, then llama.cpp at its fitting context"
@@ -630,6 +635,37 @@ test: all q36_agent_test $(SAMPLING_TEST) test-quality
 
 test-quick: test
 
+.PHONY: test-steering
+test-steering: all
+	./q36_test --steering-sessions --model $(QWEN27B_MODEL)
+	python3 tests/test_directional_steering.py --model $(QWEN27B_MODEL)
+
+.PHONY: test-steering-agent
+test-steering-agent: all
+	python3 tests/test_agent_steering.py --model $(QWEN27B_MODEL) --include-aggressive
+
+.PHONY: test-steering-security
+test-steering-security: all
+	python3 tests/test_agent_security.py --model $(QWEN27B_MODEL)
+
+.PHONY: test-steering-server
+test-steering-server: all
+	python3 tests/test_server_steering.py --model $(QWEN27B_MODEL)
+
+ifeq ($(UNAME_S),Darwin)
+STEERING_CORE = $(METAL_CORE_OBJS)
+STEERING_LIBS = $(METAL_LDLIBS)
+else
+STEERING_CORE = $(CORE_OBJS)
+STEERING_LIBS = $(GPU_LDLIBS)
+endif
+
+.PHONY: steering-probe
+steering-probe: dir-steering/tools/probe
+
+dir-steering/tools/probe: dir-steering/tools/probe.c q36.h q36_ssd.o q36_prompt_prefix.o $(STEERING_CORE)
+	$(CC) $(filter-out -ffast-math,$(GPU_CFLAGS)) -o $@ dir-steering/tools/probe.c q36_ssd.o q36_prompt_prefix.o $(STEERING_CORE) $(STEERING_LIBS)
+
 test-unit: test
 
 test-metal: metal q36_agent_test_metal $(SAMPLING_TEST)
@@ -813,7 +849,7 @@ q36_agent_test_metal: q36_agent_test_metal.o q36_help.o q36_kvstore.o q36_ssd.o 
 	$(CC) $(METAL_LDFLAGS) -o $@ q36_agent_test_metal.o q36_help.o q36_kvstore.o q36_ssd.o q36_prompt_prefix.o q36_web.o linenoise.o $(METAL_CORE_OBJS) $(METAL_LDLIBS)
 
 clean:
-	rm -f q36 q36-server q36-bench q36-agent q36-eval q36_test q36_reference_test q36_llama_test q36_agent_test q36_agent_test_metal $(SAMPLING_TEST) tests/test_sampling.o tests/test_prompt_prefix tests/test_quality_api gguf-tools/quality-testing/score_openrouter gguf-tools/quality-testing/score_openrouter.o *.o $(VULKAN_SHADERS)
+	rm -f q36 q36-server q36-bench q36-agent q36-eval q36_test q36_reference_test q36_llama_test q36_agent_test q36_agent_test_metal $(SAMPLING_TEST) tests/test_sampling.o tests/test_prompt_prefix tests/test_quality_api dir-steering/tools/probe gguf-tools/quality-testing/score_openrouter gguf-tools/quality-testing/score_openrouter.o *.o $(VULKAN_SHADERS)
 
 q36_prompt_prefix.o: q36_prompt_prefix.c q36_prompt_prefix.h q36.h
 	$(CC) $(CPU_CFLAGS) -c -o $@ q36_prompt_prefix.c

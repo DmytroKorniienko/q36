@@ -15,6 +15,9 @@
 /parity-report*
 /gguf/
 /ds4/
+/dir-steering/out/
+/dir-steering/tools/__pycache__/
+/dir-steering/tools/probe
 /llama.cpp/
 tests/__pycache__/
 *.o

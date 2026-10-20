@@ -10521,7 +10521,7 @@ static void usage(FILE *fp) {
         "  --quality\n"
         "      Prefer exact kernels where faster approximate paths exist; MTP uses strict verification.\n"
         "  --dir-steering-file FILE\n"
-        "      Load a 40 x 2048 f32 direction matrix for directional steering.\n"
+        "      Load one hidden-width f32 direction per model layer.\n"
         "  --dir-steering-ffn F\n"
         "      Apply steering after FFN outputs: y -= F*v*dot(v,y). Default with file: 1\n"
         "  --dir-steering-attn F\n"
@@ -10844,10 +10844,6 @@ int main(int argc, char **argv) {
     s.default_tokens = cfg.default_tokens;
     s.disable_exact_tool_replay = cfg.disable_exact_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
-    if (cfg.kv_disk_dir) {
-        kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
-                      cfg.kv_cache_reject_different_quant, cfg.kv_cache);
-    }
     if (s.disable_exact_tool_replay) {
         server_log(Q36_LOG_DEFAULT,
                    "q36-server: exact tool replay disabled; tool history uses canonical JSON rendering");
@@ -10878,6 +10874,15 @@ int main(int argc, char **argv) {
         }
     }
     s.session = s.slots[0].session;
+    if (cfg.kv_disk_dir) {
+        char name[40];
+        uint64_t key = q36_session_directional_steering_key(s.session);
+        snprintf(name, sizeof(name), "steering-%016llx", (unsigned long long)key);
+        char *dir = key ? path_join(cfg.kv_disk_dir, name) : xstrdup(cfg.kv_disk_dir);
+        kv_cache_open(&s.kv, dir, cfg.kv_disk_space_mb,
+                      cfg.kv_cache_reject_different_quant, cfg.kv_cache);
+        free(dir);
+    }
     if (s.batched_mode) {
         server_log(Q36_LOG_DEFAULT,
                    "q36-server: batched mode resident_sessions=%d prefill_quantum=%d mixed_prefill_quantum=%d decode_coalesce_us=%ld",

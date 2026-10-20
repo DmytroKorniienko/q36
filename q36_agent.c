@@ -374,6 +374,7 @@ typedef struct {
     bool post_think_gap;
     bool tool_preflight_error;
     char tool_preflight_error_msg[256];
+    int unsteered_tool_tokens;
 } agent_stream_renderer;
 
 typedef struct {
@@ -4162,10 +4163,9 @@ static bool agent_fp_remaining(FILE *fp, uint64_t *remaining) {
 
 /* Agent sessions deliberately use a different policy from q36-server:
  *
- * - sysprompt.kv is a fixed bootstrap checkpoint for the current tool/system
- *   prompt.  Because its name is fixed, the current rendered text is compared
- *   with the text stored in the file before loading.  A mismatch simply rebuilds
- *   and overwrites the file.
+ * - sysprompt.kv is the bootstrap checkpoint for the current tool/system
+ *   prompt. Steered variants include the bank/strength key in their filename.
+ *   The rendered text must also match before loading; a mismatch rebuilds it.
  * - conversation sessions are explicit saves only.  Their stable file name is
  *   SHA1(title || created_at_le64).kv, where title is the first user prompt and
  *   created_at is preserved across future saves.  The title is stored in an
@@ -4683,6 +4683,30 @@ static void worker_answer_queued_user_drain(agent_worker *w, char *text) {
     pthread_mutex_unlock(&w->mu);
 }
 
+/* Read source and observations without steering their stored representations.
+ * When starting a reply, steer the final prefix token too: its logits decide
+ * the first response token. Tool arguments are decoded separately below. */
+static int agent_session_sync(agent_worker *w, const q36_tokens *tokens,
+                               const q36_vision_span *images, size_t image_count,
+                               bool reply, char *err, size_t err_len) {
+    float attn = q36_session_directional_steering_attn(w->session);
+    float ffn = q36_session_directional_steering_ffn(w->session);
+    bool active = attn != 0 || ffn != 0;
+    q36_tokens prefix = *tokens;
+    if (active && reply && prefix.len > 1) prefix.len--;
+    if (active) q36_session_set_directional_steering(w->session, 0, 0);
+    int rc = image_count ?
+        q36_session_sync_vision(w->session, &prefix, images, image_count, err, err_len) :
+        q36_session_sync(w->session, &prefix, err, err_len);
+    if (active) q36_session_set_directional_steering(w->session, attn, ffn);
+    if (rc == 0 && prefix.len < tokens->len) {
+        rc = image_count ?
+            q36_session_sync_vision(w->session, tokens, images, image_count, err, err_len) :
+            q36_session_sync(w->session, tokens, err, err_len);
+    }
+    return rc;
+}
+
 /* Synchronize the live Q36 session to a transcript.  This is the agent's main
  * cache-saving operation: if the requested transcript extends the live session,
  * only the suffix is prefetched; otherwise the Q36 session rebuilds from the
@@ -4719,22 +4743,27 @@ static int agent_worker_sync_tokens(agent_worker *w, const q36_tokens *tokens,
                                      publish_progress ? worker_progress_cb : NULL,
                                      publish_progress ? w : NULL);
     q36_session_set_cancel(w->session, worker_cancel_session_cb, w);
-    int rc = w->image_count ?
-        q36_session_sync_vision(w->session, tokens, w->images, w->image_count, err, err_len) :
-        q36_session_sync(w->session, tokens, err, err_len);
+    int rc = agent_session_sync(w, tokens, w->images, w->image_count,
+                               false, err, err_len);
     q36_session_set_cancel(w->session, NULL, NULL);
     q36_session_set_progress(w->session, NULL, NULL);
     q36_session_set_display_progress(w->session, NULL, NULL);
     return rc;
 }
 
-/* Start a new session at the system/tool prompt.  A fixed sysprompt.kv
- * checkpoint avoids paying this prefill cost repeatedly, but only when the
- * rendered prompt text still matches the file.  The same fixed path is shared
- * by model variants; agent_kv_load_path() checks the model id, so switching
- * model families rebuilds this cache instead of restoring incompatible KV. */
+/* Reuse the system checkpoint only for matching text and steering settings.
+ * agent_kv_load_path() also checks model identity before restoring its KV. */
 static bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t err_len) {
     agent_worker_images_clear(w);
+    /* Do not reuse older checkpoints whose whole prompt was steered. */
+    if (w->cache_dir) {
+        char name[64] = "sysprompt.kv";
+        uint64_t key = q36_session_directional_steering_key(w->session);
+        if (key) snprintf(name, sizeof(name), "sysprompt-decode-steering-%016llx.kv",
+                          (unsigned long long)key);
+        free(w->sysprompt_path);
+        w->sysprompt_path = q36_kvstore_path_join(w->cache_dir, name);
+    }
     q36_tokens sys = {0};
     bool thinking = agent_worker_build_system_tokens(w, &sys);
 
@@ -6781,6 +6810,50 @@ static bool agent_edit_upto_forcer_should_replace(agent_edit_upto_forcer *forcer
     return false;
 }
 
+/* Diagnose whitespace without accepting a fuzzy edit. Only quote indentation
+ * from a file line whose remaining contents are unique. */
+static void agent_edit_indent_hint(const char *data, size_t len,
+                                   const char *old, size_t old_len,
+                                   char *err, size_t err_len) {
+    size_t start = 0;
+    for (int checked = 0; start < old_len && checked < 16; checked++) {
+        size_t end = start;
+        while (end < old_len && old[end] != '\n') end++;
+        size_t text = start, spaces = 0, tabs = 0;
+        while (text < end && (old[text] == ' ' || old[text] == '\t')) {
+            if (old[text++] == ' ') spaces++; else tabs++;
+        }
+        if (text < end) {
+            size_t found_spaces = 0, found_tabs = 0;
+            int found_line = 0, matches = 0, line = 1;
+            for (size_t pos = 0; pos < len; line++) {
+                size_t stop = pos;
+                while (stop < len && data[stop] != '\n') stop++;
+                size_t content = pos, ns = 0, nt = 0;
+                while (content < stop && (data[content] == ' ' || data[content] == '\t')) {
+                    if (data[content++] == ' ') ns++; else nt++;
+                }
+                if (stop - content == end - text &&
+                    !memcmp(data + content, old + text, end - text)) {
+                    found_spaces = ns;
+                    found_tabs = nt;
+                    found_line = line;
+                    if (++matches > 1) break;
+                }
+                pos = stop < len ? stop + 1 : len;
+            }
+            if (matches == 1 && (found_spaces != spaces || found_tabs != tabs)) {
+                snprintf(err, err_len,
+                    "old text anchor not found. File line %d has %zu leading spaces and %zu tabs; "
+                    "old has %zu spaces and %zu tabs. Read raw=true and copy the indentation exactly.",
+                    found_line, found_spaces, found_tabs, spaces, tabs);
+                return;
+            }
+        }
+        start = end < old_len ? end + 1 : old_len;
+    }
+}
+
 static bool agent_edit_find_old_span(const char *data, size_t len,
                                      const char *old, bool allow_upto,
                                      const char **match,
@@ -6792,8 +6865,11 @@ static bool agent_edit_find_old_span(const char *data, size_t len,
     if (!allow_upto || !upto) {
         *anchored = false;
         if (!agent_find_unique(data, len, old, old_len, match, "old text",
-                               err, err_len))
+                               err, err_len)) {
+            if (old_len && !agent_memmem_simple(data, len, old, old_len))
+                agent_edit_indent_hint(data, len, old, old_len, err, err_len);
             return false;
+        }
         *match_len = old_len;
         return true;
     }
@@ -7285,7 +7361,23 @@ static void test_agent_hints_state(void) {
     free(tools);
 }
 
+static void test_agent_steering_command(void) {
+    float scale = 0.0f;
+    AGENT_TEST_ASSERT(parse_steering_level("-100", &scale) && scale == -100.0f);
+    AGENT_TEST_ASSERT(parse_steering_level("0", &scale) && scale == 0.0f);
+    AGENT_TEST_ASSERT(parse_steering_level("1.25", &scale) && scale == 1.25f);
+    AGENT_TEST_ASSERT(parse_steering_level("100", &scale) && scale == 100.0f);
+    AGENT_TEST_ASSERT(!parse_steering_level("", &scale));
+    AGENT_TEST_ASSERT(!parse_steering_level("101", &scale));
+    AGENT_TEST_ASSERT(!parse_steering_level("nan", &scale));
+    AGENT_TEST_ASSERT(!parse_steering_level("1x", &scale));
+    AGENT_TEST_ASSERT(agent_slash_command_known("/steer"));
+    AGENT_TEST_ASSERT(agent_slash_command_known("/steer 1"));
+    AGENT_TEST_ASSERT(!agent_slash_command_known("/steering"));
+}
+
 static void q36_agent_unit_tests_run(void) {
+    test_agent_steering_command();
     test_agent_hints_state();
     test_agent_cache_lengths_are_bounded_by_file();
     test_agent_edit_upto_tail_newline_is_not_part_of_anchor();
@@ -9062,13 +9154,8 @@ static bool agent_worker_compact_transcript(agent_worker *w, const char *reason,
            (uint64_t)w->images[summary_images].token_start +
            w->images[summary_images].embedding.token_count < (uint64_t)summary_bottom)
         summary_images++;
-    int sync_rc;
-    if (summary_images) {
-        sync_rc = q36_session_sync_vision(w->session, &prompt,
-                                         w->images, summary_images, err, err_len);
-    } else {
-        sync_rc = q36_session_sync(w->session, &prompt, err, err_len);
-    }
+    int sync_rc = agent_session_sync(w, &prompt, w->images, summary_images,
+                                    true, err, err_len);
     q36_session_set_cancel(w->session, NULL, NULL);
     q36_session_set_progress(w->session, NULL, NULL);
     q36_session_set_display_progress(w->session, NULL, NULL);
@@ -9343,6 +9430,11 @@ static bool agent_worker_compact_if_needed(agent_worker *w, const char *reason,
     return agent_worker_compact(w, reason, err, err_len);
 }
 
+static bool agent_stream_generating_tool(const agent_stream_renderer *sr) {
+    return sr && !sr->qwen_tool_ignored &&
+           (sr->qwen_tool_active || sr->qwen_tool_start_len > 1);
+}
+
 static int worker_accept_generated_token(agent_worker *w,
                                          int token,
                                          int *generated,
@@ -9350,8 +9442,19 @@ static int worker_accept_generated_token(agent_worker *w,
                                          agent_stream_renderer *stream,
                                          char *err,
                                          size_t err_len) {
-    if (q36_session_eval(w->session, token, err, err_len) != 0)
-        return 1;
+    /* Steering can change exact copies in tool arguments. Keep it for deciding
+     * what to do, then decode the tool stanza without steering.
+     * Restore even on failure so interrupts and the next turn keep /steer. */
+    float attn = q36_session_directional_steering_attn(w->session);
+    float ffn = q36_session_directional_steering_ffn(w->session);
+    bool suspend = (attn != 0 || ffn != 0) && agent_stream_generating_tool(stream);
+    if (suspend) q36_session_set_directional_steering(w->session, 0, 0);
+    int rc = q36_session_eval(w->session, token, err, err_len);
+    if (suspend) {
+        q36_session_set_directional_steering(w->session, attn, ffn);
+        stream->unsteered_tool_tokens++;
+    }
+    if (rc != 0) return 1;
 
     q36_tokens_push(&w->transcript, token);
 
@@ -9599,9 +9702,8 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
         q36_session_set_progress(w->session, worker_progress_cb, w);
         q36_session_set_display_progress(w->session, worker_progress_cb, w);
         q36_session_set_cancel(w->session, worker_cancel_session_cb, w);
-        int sync_rc = w->image_count ?
-            q36_session_sync_vision(w->session, prompt_for_sync, w->images, w->image_count, err, sizeof(err)) :
-            q36_session_sync(w->session, prompt_for_sync, err, sizeof(err));
+        int sync_rc = agent_session_sync(w, prompt_for_sync, w->images, w->image_count,
+                                        true, err, sizeof(err));
         q36_session_set_cancel(w->session, NULL, NULL);
         q36_session_set_progress(w->session, NULL, NULL);
         q36_session_set_display_progress(w->session, NULL, NULL);
@@ -9761,8 +9863,9 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
             }
         }
 
-        agent_trace(w, "generation finished tool_round=%d generated=%d carried=%d context_limited=%d",
-                    tool_round, generated, carried_generation, context_limited);
+        agent_trace(w, "generation finished tool_round=%d generated=%d carried=%d context_limited=%d unsteered_tool_tokens=%d",
+                    tool_round, generated, carried_generation, context_limited,
+                    stream.unsteered_tool_tokens);
         bool interrupted = worker_should_interrupt(w);
         const bool partial_tool = stream.qwen_tool_active || stream.qwen_tool_start_len > 0 ||
                                   qwen_tool.state != AGENT_QWEN_TOOL_SEARCH;
@@ -11606,7 +11709,6 @@ static int agent_worker_init(agent_worker *w, q36_engine *engine, agent_config *
         .cancel_privdata = w,
     };
     w->web = q36_web_create(&web_cfg);
-    w->sysprompt_path = q36_kvstore_path_join(w->cache_dir, "sysprompt.kv");
     if (cfg->gen.trace_path && cfg->gen.trace_path[0]) {
         w->trace = fopen(cfg->gen.trace_path, "ab");
         if (!w->trace) {

@@ -7502,6 +7502,127 @@ done:
     q36_engine_close(engine);
 }
 
+static void test_steering_sessions(void) {
+    if (test_is_cpu_only_build() || !test_model_available(test_model_path())) {
+        test_skip("steering-sessions", "requires a model and GPU backend");
+        return;
+    }
+    q36_engine_options opt = {.model_path = test_model_path(), .backend = Q36_BACKEND_CPU};
+    q36_engine *engine = NULL;
+    TEST_ASSERT(q36_engine_open(&engine, &opt) == 0);
+    if (!engine) return;
+    int layers = q36_qwen35_n_layer(), width = q36_qwen35_n_embd();
+    q36_engine_close(engine);
+    engine = NULL;
+    size_t count = (size_t)layers * width;
+    float *bank = calloc(count, sizeof(float));
+    TEST_ASSERT(bank != NULL);
+    if (!bank) return;
+    for (int i = 0; i < layers; i++) bank[(size_t)i * width] = 1.0f;
+    char path[] = "/tmp/q36-steering-sessions-XXXXXX";
+    int fd = mkstemp(path);
+    TEST_ASSERT(fd >= 0);
+    if (fd < 0) { free(bank); return; }
+    FILE *fp = fdopen(fd, "wb");
+    TEST_ASSERT(fp != NULL);
+    if (!fp) { close(fd); unlink(path); free(bank); return; }
+    TEST_ASSERT(fwrite(bank, sizeof(float), count, fp) == count);
+    TEST_ASSERT(fclose(fp) == 0);
+    free(bank);
+    opt.backend = test_default_backend();
+    opt.context_size = 256;
+    opt.session_count = 3;
+    opt.prefill_chunk = 8;
+    opt.directional_steering_file = path;
+    TEST_ASSERT(q36_engine_open(&engine, &opt) == 0);
+    unlink(path);
+    if (!engine) return;
+    q36_session *sessions[2] = {0};
+    q36_session *fresh = NULL;
+    float *oracle[2] = {0};
+    q36_tokens prompt = {0};
+    char err[192] = {0};
+    q36_encode_chat_prompt(engine, "", "Explain DNS.", Q36_THINK_NONE, &prompt);
+    for (int i = 0; i < 2; i++) {
+        TEST_ASSERT(q36_session_create(&sessions[i], engine, 256) == 0);
+        if (!sessions[i]) goto done;
+    }
+    TEST_ASSERT(q36_session_directional_steering_key(sessions[0]) == 0);
+    TEST_ASSERT(q36_session_set_directional_steering(sessions[0], 0.25f, 0.5f) == 0);
+    uint64_t steering_key = q36_session_directional_steering_key(sessions[0]);
+    TEST_ASSERT(steering_key != 0);
+    TEST_ASSERT(q36_session_set_directional_steering(sessions[0], 0, 0) == 0);
+    TEST_ASSERT(q36_session_directional_steering_key(sessions[0]) == 0);
+    TEST_ASSERT(q36_session_set_directional_steering(sessions[0], 0, 0.5f) == 0);
+    uint64_t zero_attn_key = q36_session_directional_steering_key(sessions[0]);
+    TEST_ASSERT(q36_session_set_directional_steering(sessions[0], -0.0f, 0.5f) == 0);
+    TEST_ASSERT(q36_session_directional_steering_key(sessions[0]) == zero_attn_key);
+    TEST_ASSERT(q36_session_set_directional_steering(sessions[0], 0.25f, 0.5f) == 0);
+    TEST_ASSERT(q36_session_directional_steering_key(sessions[0]) == steering_key);
+    TEST_ASSERT(q36_session_directional_steering_ffn(sessions[1]) == 0.0f);
+    TEST_ASSERT(q36_session_set_directional_steering(sessions[1], -0.25f, -0.5f) == 0);
+    TEST_ASSERT(q36_session_directional_steering_key(sessions[1]) != steering_key);
+    TEST_ASSERT(q36_session_directional_steering_ffn(sessions[0]) == 0.5f);
+    TEST_ASSERT(q36_session_create(&fresh, engine, 256) == 0);
+    TEST_ASSERT(fresh && q36_session_directional_steering_ffn(fresh) == 0.0f);
+    q36_session_free(fresh);
+    fresh = NULL;
+    TEST_ASSERT(q36_session_set_directional_steering(sessions[0], NAN, 0) != 0);
+    TEST_ASSERT(q36_session_set_directional_steering_ffn(sessions[0], 101) != 0);
+    TEST_ASSERT(q36_session_directional_steering_key(sessions[0]) == steering_key);
+    q36_decode_item items[2] = {0};
+    for (int i = 0; i < 2; i++) {
+        TEST_ASSERT(q36_session_sync(sessions[i], &prompt, err, sizeof(err)) == 0);
+        items[i].session = sessions[i];
+        items[i].token = q36_session_argmax(sessions[i]);
+    }
+    /* Use homogeneous batches as the oracle: single-token and batched
+     * quant kernels have different rounding policies on dense models. */
+    const float attn[2] = {0.25f, -0.25f}, ffn[2] = {0.5f, -0.5f};
+    for (int i = 0; i < 2; i++) {
+        for (int j = 0; j < 2; j++) {
+            TEST_ASSERT(q36_session_set_directional_steering(sessions[j], attn[j], ffn[j]) == 0);
+            q36_session_invalidate(sessions[j]);
+            TEST_ASSERT(q36_session_sync(sessions[j], &prompt, err, sizeof(err)) == 0);
+            TEST_ASSERT(q36_session_set_directional_steering(sessions[j], attn[i], ffn[i]) == 0);
+        }
+        TEST_ASSERT(q36_sessions_eval_batch(items, 2, err, sizeof(err)) == 0);
+        int vocab = 0;
+        const float *logits = q36_session_logits(sessions[i], &vocab);
+        oracle[i] = malloc((size_t)vocab * sizeof(float));
+        TEST_ASSERT(oracle[i] != NULL);
+        if (!oracle[i]) goto done;
+        memcpy(oracle[i], logits, (size_t)vocab * sizeof(float));
+    }
+    for (int i = 0; i < 2; i++) {
+        TEST_ASSERT(q36_session_set_directional_steering(sessions[i], attn[i], ffn[i]) == 0);
+        q36_session_invalidate(sessions[i]);
+        TEST_ASSERT(q36_session_sync(sessions[i], &prompt, err, sizeof(err)) == 0);
+    }
+    setenv("Q36_VK_SESSION_BATCH_LOG", "1", 1);
+    TEST_ASSERT(q36_sessions_eval_batch(items, 2, err, sizeof(err)) == 0);
+    for (int i = 0; i < 2; i++) {
+        int vocab = 0;
+        const float *logits = q36_session_logits(sessions[i], &vocab);
+        test_logit_comparison cmp = test_compare_logits(oracle[i], logits, vocab);
+        fprintf(stderr, "q36-test: steering session %d max_abs=%g rms=%g\n", i, cmp.max_abs, cmp.rms);
+        TEST_ASSERT(cmp.nonfinite == 0 && cmp.max_abs <= 1e-5f);
+        TEST_ASSERT(q36_session_argmax(sessions[i]) == test_sample_argmax_local(oracle[i], vocab));
+    }
+    TEST_ASSERT(q36_session_directional_steering_ffn(sessions[0]) == 0.5f);
+    TEST_ASSERT(q36_session_directional_steering_ffn(sessions[1]) == -0.5f);
+    unsetenv("Q36_VK_SESSION_BATCH_LOG");
+
+done:
+    q36_session_free(fresh);
+    for (int i = 0; i < 2; i++) {
+        free(oracle[i]);
+        q36_session_free(sessions[i]);
+    }
+    q36_tokens_free(&prompt);
+    q36_engine_close(engine);
+}
+
 static void test_server_unit_group(void) {
     q36_server_unit_tests_run();
 }
@@ -7544,6 +7665,7 @@ static const q36_test_entry test_entries[] = {
 #endif
     {"--vulkan-kernels", "vulkan-kernels", "isolated Vulkan-kernel numeric regressions", test_vulkan_kernels},
     {"--dense-quant-model-rows", "dense-quant-model-rows", "dense model quant kernels against CPU-dequantized GGUF rows", test_dense_quant_model_rows},
+    {"--steering-sessions", "steering-sessions", "independent steering strengths in native session batches", test_steering_sessions},
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
 };
 

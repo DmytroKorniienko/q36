@@ -115,7 +115,7 @@ static void usage(FILE *fp) {
         "  --quality\n"
         "      Prefer exact kernels where faster approximate paths exist; MTP uses strict verification.\n"
         "  --dir-steering-file FILE\n"
-        "      Load a 40 x 2048 f32 direction matrix for directional steering.\n"
+        "      Load one hidden-width f32 direction per model layer.\n"
         "  --dir-steering-ffn F\n"
         "      Apply steering after FFN outputs: y -= F*v*dot(v,y). Default with file: 1\n"
         "  --dir-steering-attn F\n"
@@ -1091,10 +1091,13 @@ static void repl_chat_free(repl_chat *chat) {
 }
 
 static int repl_chat_set_ctx(q36_engine *engine, repl_chat *chat, int ctx_size) {
+    float steering = q36_session_directional_steering_ffn(chat->session);
     q36_session_free(chat->session);
     chat->session = NULL;
     chat->ctx_size = 0;
-    return repl_chat_create_session(engine, chat, ctx_size);
+    int rc = repl_chat_create_session(engine, chat, ctx_size);
+    if (rc == 0) rc = q36_session_set_directional_steering_ffn(chat->session, steering);
+    return rc;
 }
 
 /* Run one interactive turn.  The transcript is tentatively extended with user
@@ -1278,7 +1281,7 @@ static int run_repl(q36_engine *engine, cli_config *cfg) {
     history_file_path(hist, sizeof(hist));
     linenoiseSetMultiLine(1);
     linenoiseHistorySetMaxLen(512);
-    linenoiseHistoryLoad(hist);
+    if (isatty(STDIN_FILENO)) linenoiseHistoryLoad(hist);
     print_repl_help();
 
     int rc = 0;
@@ -1297,8 +1300,10 @@ static int run_repl(q36_engine *engine, cli_config *cfg) {
             linenoiseFree(line);
             continue;
         }
-        linenoiseHistoryAdd(cmd);
-        linenoiseHistorySave(hist);
+        if (isatty(STDIN_FILENO)) {
+            linenoiseHistoryAdd(cmd);
+            linenoiseHistorySave(hist);
+        }
 
         if (!strcmp(cmd, "/help")) {
             print_repl_help();

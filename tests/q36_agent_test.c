@@ -84,6 +84,29 @@ static void test_atomic_file_tools(void) {
     AGENT_TEST_ASSERT(!anchored && match_len == 6 && !memcmp(match, "[upto]", 6));
 }
 
+static void test_edit_indent_feedback(void) {
+    const char *data = "def f():\n    return 1\n";
+    const char *match = NULL;
+    size_t match_len = 0;
+    bool anchored = false;
+    char err[256] = {0};
+    AGENT_TEST_ASSERT(!agent_edit_find_old_span(data, strlen(data),
+        "def f():\n  return 1\n", false, &match, &match_len, &anchored, err, sizeof(err)));
+    AGENT_TEST_ASSERT(match == NULL && strstr(err, "File line 2 has 4 leading spaces and 0 tabs"));
+    AGENT_TEST_ASSERT(strstr(err, "old has 2 spaces and 0 tabs") && strstr(err, "raw=true"));
+    AGENT_TEST_ASSERT(agent_edit_find_old_span(data, strlen(data), data, false,
+        &match, &match_len, &anchored, err, sizeof(err)));
+    AGENT_TEST_ASSERT(match == data && match_len == strlen(data));
+    data = "\treturn 1\n";
+    AGENT_TEST_ASSERT(!agent_edit_find_old_span(data, strlen(data), "  return 1\n", false,
+        &match, &match_len, &anchored, err, sizeof(err)));
+    AGENT_TEST_ASSERT(strstr(err, "0 leading spaces and 1 tabs"));
+    data = "def f():\n    return 1\n\ndef g():\n\treturn 1\n";
+    AGENT_TEST_ASSERT(!agent_edit_find_old_span(data, strlen(data), "\n  return 1\n", false,
+        &match, &match_len, &anchored, err, sizeof(err)));
+    AGENT_TEST_ASSERT(!strcmp(err, "old text anchor not found"));
+}
+
 static void test_streaming_file_tools(void) {
     char path[] = "/tmp/q36-agent-read-XXXXXX";
     int fd = mkstemp(path);
@@ -618,6 +641,7 @@ static void test_tool_markup_in_text(void) {
                 AGENT_TEST_ASSERT(!stream.qwen_tool_in_think);
                 AGENT_TEST_ASSERT(parser.state == AGENT_QWEN_TOOL_SEARCH);
                 AGENT_TEST_ASSERT(!agent_stream_wants_greedy_sampling(&stream));
+                AGENT_TEST_ASSERT(!agent_stream_generating_tool(&stream));
                 agent_stream_text(&stream, text + split, n - split, false);
             } else {
                 for (size_t i = 0; i < n; i++) {
@@ -625,6 +649,7 @@ static void test_tool_markup_in_text(void) {
                     AGENT_TEST_ASSERT(!stream.qwen_tool_in_think);
                     AGENT_TEST_ASSERT(parser.state == AGENT_QWEN_TOOL_SEARCH);
                     AGENT_TEST_ASSERT(!agent_stream_wants_greedy_sampling(&stream));
+                    AGENT_TEST_ASSERT(!agent_stream_generating_tool(&stream));
                 }
             }
             agent_stream_text(&stream, NULL, 0, true);
@@ -632,6 +657,7 @@ static void test_tool_markup_in_text(void) {
             AGENT_TEST_ASSERT(!stream.qwen_tool_in_think);
             AGENT_TEST_ASSERT(parser.state == AGENT_QWEN_TOOL_SEARCH);
             AGENT_TEST_ASSERT(parser.calls.len == 0);
+            AGENT_TEST_ASSERT(!agent_stream_generating_tool(&stream));
             char *out = agent_tail_capture_take(&capture, NULL);
             AGENT_TEST_ASSERT(!strstr(out, "tool call ignored") &&
                               !strstr(out, "invalid tool call"));
@@ -664,8 +690,11 @@ static void test_tool_markup_blocks(void) {
                 agent_stream_text(&stream, text, split, false);
                 agent_stream_text(&stream, text + split, n - split, false);
             } else {
-                for (size_t i = 0; i < n; i++)
+                for (size_t i = 0; i < n; i++) {
                     agent_stream_text(&stream, text + i, 1, false);
+                    if (t == 0 && parser.state == AGENT_QWEN_TOOL_PARAM_VALUE)
+                        AGENT_TEST_ASSERT(agent_stream_generating_tool(&stream));
+                }
             }
             agent_stream_text(&stream, NULL, 0, true);
             renderer_finish(&renderer);
@@ -992,6 +1021,7 @@ int main(int argc, char **argv) {
     test_compaction_boundaries();
     test_observation_error_is_not_context_exhaustion();
     test_atomic_file_tools();
+    test_edit_indent_feedback();
     test_streaming_file_tools();
     test_background_jobs();
     test_shell_terminal_controls();
