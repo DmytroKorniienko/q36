@@ -255,6 +255,7 @@ typedef struct {
     q36_vk_kernel dense_iq3_xxs_bm64_mmq;
     q36_vk_kernel dense_iq3_s_decode;
     q36_vk_kernel dense_iq3_s_decode_batch[7];
+    q36_vk_kernel dense_iq3_s_verify_tail[3];
     q36_vk_kernel dense_iq3_s_decode_full;
     q36_vk_kernel dense_iq3_s_decode_r4;
     q36_vk_kernel dense_iq3_s_decode_r8;
@@ -288,6 +289,7 @@ typedef struct {
     q36_vk_kernel dense_kquant_bm64_mmq;
     q36_vk_kernel dense_kquant_small[3];
     q36_vk_kernel predequant_b16;
+    q36_vk_kernel preexpand_i16;
     q36_vk_kernel dense_kquant_verify[5][7];
     q36_vk_kernel dense_kquant_decode;
     q36_vk_kernel dense_kquant_decode_r2;
@@ -2982,6 +2984,7 @@ int q36_gpu_init(void) {
     q36_vk.dense_kquant_small[0] = Q36_VK_KERNEL("vulkan/dense_kquant_mmq_n2.spv", 4, 28, 1u << 2);
     q36_vk.dense_kquant_small[1] = Q36_VK_KERNEL("vulkan/dense_kquant_mmq_n4.spv", 4, 28, 1u << 2);
     q36_vk.dense_kquant_small[2] = Q36_VK_KERNEL("vulkan/dense_kquant_mmq_n8.spv", 4, 28, 1u << 2);
+    q36_vk.preexpand_i16 = Q36_VK_KERNEL("vulkan/preexpand_i16.spv", 2, 4, 1u << 1);
     q36_vk.predequant_b16 = Q36_VK_KERNEL("vulkan/predequant_b16.spv", 2, 4, 1u << 1);
     const char *verify_paths[] = {
         "vulkan/dense_q2k_verify.spv", "vulkan/dense_q3k_verify.spv",
@@ -3184,6 +3187,19 @@ int q36_gpu_init(void) {
         q36_vk.dense_q5k_decode.path = "vulkan/dense_q5k_decode_dot.spv";
         q36_vk.dense_kquant_decode_r2.path = "vulkan/dense_q6k_decode_dot.spv";
         q36_vk.mtp_head_q5k.path = "vulkan/mtp_head_q5k_dot.spv";
+    }
+    if (q36_vk.bc250) {
+        /* Three/four-token panels amortize native i16 multiply-adds here;
+         * emulated byte dots still win for two tokens. Keep bounded kernels
+         * lazy for smaller projections and partial output groups. */
+        for (unsigned i = 0; i < 3; i++) {
+            q36_vk.dense_iq3_s_verify_tail[i] = q36_vk.dense_iq3_s_decode_batch[i];
+            q36_vk.dense_iq3_s_decode_batch[i].path = "vulkan/dense_iq3_s_verify_full.spv";
+            if (i > 0 && feat2.features.shaderInt16) {
+                q36_vk.dense_iq3_s_decode_batch[i].path = "vulkan/dense_iq3_s_verify_i16.spv";
+                q36_vk.dense_iq3_s_decode_batch[i].bindings = 5;
+            }
+        }
     }
     q36_vk.subgroup_size_control = subgroup_size_query.subgroupSizeControl &&
         subgroup_size_query.computeFullSubgroups &&
@@ -3422,6 +3438,7 @@ void q36_gpu_cleanup(void) {
     for (unsigned i = 0; i < 3; i++)
         q36_vk_kernel_destroy(&q36_vk.dense_kquant_small[i]);
     q36_vk_kernel_destroy(&q36_vk.predequant_b16);
+    q36_vk_kernel_destroy(&q36_vk.preexpand_i16);
     for (unsigned i = 0; i < 5; i++)
         for (unsigned j = 0; j < 7; j++)
             q36_vk_kernel_destroy(&q36_vk.dense_kquant_verify[i][j]);
@@ -3439,6 +3456,8 @@ void q36_gpu_cleanup(void) {
     q36_vk_kernel_destroy(&q36_vk.dense_iq3_s_decode);
     for (unsigned i = 0; i < 7; i++)
         q36_vk_kernel_destroy(&q36_vk.dense_iq3_s_decode_batch[i]);
+    for (unsigned i = 0; i < 3; i++)
+        q36_vk_kernel_destroy(&q36_vk.dense_iq3_s_verify_tail[i]);
     q36_vk_kernel_destroy(&q36_vk.dense_iq3_s_mmq_r4);
     q36_vk_kernel_destroy(&q36_vk.dense_iq3_xxs_mmq);
     q36_vk_kernel_destroy(&q36_vk.dense_iq3_xxs_bm96_mmq);
@@ -4524,6 +4543,8 @@ void q36_gpu_set_micro_batch(bool enabled) {
     for (unsigned i = 0; i < 5; i++)
         for (unsigned j = 0; j < 7; j++)
             q36_vk_kernel_init(&q36_vk.dense_kquant_verify[i][j]);
+    if (q36_vk.bc250 && q36_vk.dense_iq3_s_decode_batch[1].bindings == 5u)
+        q36_vk_kernel_init(&q36_vk.preexpand_i16);
     q36_vk_kernel_init(&q36_vk.matmul_q8_0_f32b_nx);
     q36_vk_kernel_init(&q36_vk.mtp_head_mask);
     q36_vk_kernel_init(&q36_vk.mtp_head_q5k);
@@ -5053,7 +5074,8 @@ static q36_gpu_tensor *q36_vk_packed_weight_get_unlocked(const unsigned char *so
  * gigabyte.  Reusing a ring slot while an old batch still reads it is
  * safe because the write-after-read hazard inserts a barrier.  The
  * one-entry cache lets gate/up (same activation, same q8 write_gen)
- * share one panel and one expansion dispatch. */
+ * share one panel and one expansion dispatch. Raw i16 verification shares
+ * this ring with scaled f16 prefill panels; the cache key includes the mode. */
 enum { Q36_VK_B16_RING = 2 };
 static struct { q36_gpu_tensor *t; uint64_t bytes; } q36_vk_b16_ring[Q36_VK_B16_RING];
 static uint32_t q36_vk_b16_next;
@@ -5064,6 +5086,7 @@ static struct {
     uint32_t n_tok;
     uint32_t blocks;
     q36_gpu_tensor *b16;
+    bool raw;
 } q36_vk_b16_last;
 
 static void q36_vk_b16_ring_destroy_unlocked(void) {
@@ -5078,7 +5101,7 @@ static void q36_vk_b16_ring_destroy_unlocked(void) {
 
 static q36_gpu_tensor *q36_vk_predequant_b16_unlocked(const q36_gpu_tensor *q8,
                                                       uint32_t n_tok,
-                                                      uint32_t blocks) {
+                                                      uint32_t blocks, bool raw) {
     const uint64_t total = (uint64_t)n_tok * blocks;
     const uint64_t bytes = total * 512u;
     uint64_t root_off = 0;
@@ -5086,7 +5109,7 @@ static q36_gpu_tensor *q36_vk_predequant_b16_unlocked(const q36_gpu_tensor *q8,
     if (root && q36_vk_b16_last.b16 &&
         q36_vk_b16_last.root == root && q36_vk_b16_last.root_off == root_off &&
         q36_vk_b16_last.write_gen == root->write_gen &&
-        q36_vk_b16_last.n_tok == n_tok && q36_vk_b16_last.blocks == blocks) {
+        q36_vk_b16_last.n_tok == n_tok && q36_vk_b16_last.blocks == blocks && q36_vk_b16_last.raw == raw) {
         return q36_vk_b16_last.b16;
     }
     q36_gpu_tensor *b16 = NULL;
@@ -5112,7 +5135,8 @@ static q36_gpu_tensor *q36_vk_predequant_b16_unlocked(const q36_gpu_tensor *q8,
     }
     struct { uint32_t total_blocks; } push = { (uint32_t)total };
     const q36_gpu_tensor *bindings[2] = { q8, b16 };
-    if (!q36_vk_run_unlocked("predequant_b16", &q36_vk.predequant_b16,
+    if (!q36_vk_run_unlocked(raw ? "preexpand_i16" : "predequant_b16",
+                             raw ? &q36_vk.preexpand_i16 : &q36_vk.predequant_b16,
                              bindings, &push, sizeof(push),
                              (uint32_t)((total * 64u + 255u) / 256u), 1, 1)) {
         return NULL;
@@ -5123,6 +5147,7 @@ static q36_gpu_tensor *q36_vk_predequant_b16_unlocked(const q36_gpu_tensor *q8,
     q36_vk_b16_last.n_tok = n_tok;
     q36_vk_b16_last.blocks = blocks;
     q36_vk_b16_last.b16 = b16;
+    q36_vk_b16_last.raw = raw;
     return b16;
 }
 
@@ -5279,7 +5304,7 @@ int q36_gpu_matmul_k_quant_q8_scaled_tensor(q36_gpu_tensor *out,
                 (uint32_t)blocks, (uint32_t)row_bytes, weight_type, scale,
             };
             q36_gpu_tensor *b16 = q36_vk_predequant_b16_unlocked(
-                q8, (uint32_t)n_tok, (uint32_t)blocks);
+                q8, (uint32_t)n_tok, (uint32_t)blocks, false);
             const q36_gpu_tensor *bindings[4] = { weights, q8, out, b16 };
             const char *op = q36_vk_prof_iq3_shape(
                 weight_type, (uint32_t)n_tok, (uint32_t)in_dim,
@@ -8247,9 +8272,22 @@ int q36_gpu_matmul_iq_quant_q8_scaled_tensor(q36_gpu_tensor *out,
                 struct { uint32_t out_dim, blocks, row_bytes; float scale; uint32_t n_tok; }
                     push = { out_dim, blocks, row_bytes, scale, n_tok };
                 unsigned i = (unsigned)n_tok - 2u;
-                ok = q36_vk_run_unlocked("dense_iq3_verify", weight_type == Q36_VK_TENSOR_IQ3_S ?
-                    &q36_vk.dense_iq3_s_decode_batch[i] : &q36_vk.dense_iq3_xxs_decode_batch[i],
-                    bindings, &push, sizeof(push), ((uint32_t)out_dim + 3u) / 4u, 1, 1);
+                q36_vk_kernel *kernel = weight_type == Q36_VK_TENSOR_IQ3_S ?
+                    &q36_vk.dense_iq3_s_decode_batch[i] : &q36_vk.dense_iq3_xxs_decode_batch[i];
+                bool raw = kernel->bindings == 5 && in_dim >= 4096u &&
+                           out_dim >= 4096u && out_dim % 8u == 0u;
+                if (q36_vk.bc250 && weight_type == Q36_VK_TENSOR_IQ3_S &&
+                    n_tok <= 4u && !raw && (out_dim % 4u != 0u || kernel->bindings == 5))
+                    kernel = &q36_vk.dense_iq3_s_verify_tail[i];
+                if (raw) {
+                    q36_gpu_tensor *expanded = q36_vk_predequant_b16_unlocked(q8, n_tok, blocks, true);
+                    const q36_gpu_tensor *raw_bindings[5] = { weights, q8, out, tables, expanded };
+                    ok = expanded && q36_vk_run_unlocked("dense_iq3_verify", kernel,
+                        raw_bindings, &push, sizeof(push), (uint32_t)out_dim / 8u, 1, 1);
+                } else {
+                    ok = q36_vk_run_unlocked("dense_iq3_verify", kernel,
+                        bindings, &push, sizeof(push), ((uint32_t)out_dim + 3u) / 4u, 1, 1);
+                }
             } else if (n_tok == 1u) {
                 struct {
                     uint32_t out_dim;
@@ -8332,7 +8370,7 @@ int q36_gpu_matmul_iq_quant_q8_scaled_tensor(q36_gpu_tensor *out,
                     weight_type, (uint32_t)n_tok, (uint32_t)in_dim,
                     (uint32_t)out_dim, "dense_iq3_mmq");
                 q36_gpu_tensor *b16 = q36_vk_predequant_b16_unlocked(
-                    q8, (uint32_t)n_tok, (uint32_t)blocks);
+                    q8, (uint32_t)n_tok, (uint32_t)blocks, false);
                 const q36_gpu_tensor *mmq_bindings[5] = {
                     weights, q8, out, tables, b16,
                 };

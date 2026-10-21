@@ -3266,13 +3266,12 @@ cleanup:
     free(want);
 }
 
-static void test_vulkan_small_one(uint32_t type, uint32_t block_bytes,
-                                  uint32_t out_dim) {
+static void test_vulkan_small_dims(uint32_t type, uint32_t block_bytes,
+                                  uint32_t out_dim, uint32_t in_dim) {
     /* Nine tokens select the large tile as an independent oracle. Odd block
      * counts and row counts cross alignment and every small tile boundary.
      * Q8 uses padded reference rows to select the original wide kernel. */
     enum { tokens = 9 };
-    const uint32_t in_dim = type == 8 ? 736u : 768u;
     const uint32_t blocks = (type == 8 || type == 20) ? in_dim / 32u : in_dim / 256u;
     const uint32_t ref_rows = type == 8 ? 131 : out_dim;
     const size_t ref_bytes = (size_t)tokens * ref_rows * sizeof(float);
@@ -3292,6 +3291,7 @@ static void test_vulkan_small_one(uint32_t type, uint32_t block_bytes,
         for (uint32_t block = 0; block < blocks; block++) {
             uint8_t *p = weights + row * row_bytes + block * block_bytes;
             uint16_t d = test_float_to_f16(0.0001f * (float)(1 + row % 7 + block));
+            if (type == 21 && in_dim >= 5120u && ((row + block) & 1u)) d ^= 0x8000u;
             for (uint32_t i = 0; i < block_bytes; i++)
                 p[i] = (uint8_t)(row * 29u + block * 71u + i * 13u);
             uint32_t d_off = type == 10 ? 80 : type == 11 ? 108 : type == 14 ? 208 : 0;
@@ -3300,8 +3300,11 @@ static void test_vulkan_small_one(uint32_t type, uint32_t block_bytes,
                 memcpy(p + d_off + 2, &d, sizeof(d));
         }
     }
-    for (uint32_t i = 0; i < tokens * in_dim; i++)
+    for (uint32_t i = 0; i < tokens * in_dim; i++) {
         input[i] = sinf((float)i * 0.031f) * (0.25f + (float)(i % 11) * 0.03125f);
+        if (type == 21 && in_dim >= 5120u && i / in_dim < 2u)
+            input[i] = i / in_dim == 0u ? 1.0f : -1.0f;
+    }
     TEST_ASSERT(q36_gpu_init() != 0);
     q36_gpu_set_quality(false);
     q36_gpu_set_dense_model(true);
@@ -3403,6 +3406,31 @@ static void test_vulkan_small_one(uint32_t type, uint32_t block_bytes,
         }
         q36_gpu_set_micro_batch(false);
     }
+    if (type == 21 && in_dim >= 5120u) {
+        /* Reusing the same Q8 input across prefill/verify must distinguish
+         * scaled f16 panels from raw i16 panels in both directions. */
+        const uint32_t n = 3;
+        const size_t bytes = (size_t)n * out_dim * sizeof(float);
+        q36_gpu_tensor *q8 = q36_gpu_tensor_alloc((uint64_t)n * blocks * 296u);
+        TEST_ASSERT(q8 != NULL);
+        if (q8) {
+            TEST_ASSERT(q36_gpu_quantize_q8_k_tensor(q8, x, in_dim, n) != 0);
+            TEST_ASSERT(q36_gpu_matmul_iq_quant_q8_scaled_tensor(
+                ref, weights, weight_bytes, 0, type, in_dim, out_dim, q8, n, scales[1]) != 0);
+            q36_gpu_set_micro_batch(true);
+            TEST_ASSERT(q36_gpu_matmul_iq_quant_q8_scaled_tensor(
+                out, weights, weight_bytes, 0, type, in_dim, out_dim, q8, n, scales[1]) != 0);
+            TEST_ASSERT(q36_gpu_tensor_read(out, 0, got, bytes) != 0);
+            TEST_ASSERT(memcmp(got, want, bytes) == 0);
+            q36_gpu_set_micro_batch(false);
+            TEST_ASSERT(q36_gpu_matmul_iq_quant_q8_scaled_tensor(
+                out, weights, weight_bytes, 0, type, in_dim, out_dim, q8, n, scales[1]) != 0);
+            TEST_ASSERT(q36_gpu_tensor_read(out, 0, got, bytes) != 0);
+            TEST_ASSERT(q36_gpu_tensor_read(ref, 0, want, bytes) != 0);
+            TEST_ASSERT(memcmp(got, want, bytes) == 0);
+        }
+        q36_gpu_tensor_free(q8);
+    }
 cleanup:
     q36_gpu_tensor_free(x);
     q36_gpu_tensor_free(out);
@@ -3413,6 +3441,11 @@ cleanup:
     free(input);
     free(got);
     free(want);
+}
+
+static void test_vulkan_small_one(uint32_t type, uint32_t block_bytes,
+                                  uint32_t out_dim) {
+    test_vulkan_small_dims(type, block_bytes, out_dim, type == 8 ? 736u : 768u);
 }
 #endif
 
@@ -3429,6 +3462,12 @@ static void test_vulkan_small_tiles(void) {
         test_vulkan_small_one(types[i], bytes[i], 131);
         test_vulkan_small_one(types[i], bytes[i], 48);
     }
+    const uint32_t iq3_shapes[][2] = {
+        {5120, 6144}, {5120, 10240}, {5120, 12288}, {5120, 17408},
+        {6144, 5120}, {17408, 5120},
+    };
+    for (unsigned i = 0; i < sizeof(iq3_shapes) / sizeof(iq3_shapes[0]); i++)
+        test_vulkan_small_dims(21, 110, iq3_shapes[i][1], iq3_shapes[i][0]);
 #endif
 }
 

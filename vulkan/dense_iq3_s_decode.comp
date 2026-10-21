@@ -19,6 +19,9 @@ layout(set = 0, binding = 0) readonly buffer Weights { uint8_t wb[]; };
 layout(set = 0, binding = 1) readonly buffer Q8K { uint q8[]; };
 layout(set = 0, binding = 2) writeonly buffer Output { float y[]; };
 layout(set = 0, binding = 3) readonly buffer Tables { uint tables[]; };
+#ifdef Q36_I16
+layout(set = 0, binding = 4) readonly buffer I16 { uint raw_values[]; };
+#endif
 
 #ifndef Q36_TOKENS
 #define Q36_TOKENS 1
@@ -52,8 +55,13 @@ const uint ROWS = Q36_ROWS;
 const uint Q8K_WORDS = 74u;
 const uint TAB_IQ3S_GRID = 2592u;
 
+#ifdef Q36_I16
+shared uvec2 grid_lut[512];
+shared uvec2 sign_lut[16];
+#else
 shared uint grid_lut[512];
 shared uint sign_lut[16];
+#endif
 
 uint load_u8(uint off) {
     return uint(wb[off]);
@@ -70,10 +78,12 @@ uint load_u32(uint off) {
            (uint(wb[off + 2u]) << 16u) | (uint(wb[off + 3u]) << 24u);
 }
 
+#ifndef Q36_I16
 int signed_bytes(uint grid, uint signs) {
     /* Odd magnitudes negate by toggling every bit except the low bit. */
     return int(grid ^ sign_lut[signs & 15u]);
 }
+#endif
 
 void main(void) {
     uint lid = gl_LocalInvocationID.x;
@@ -82,19 +92,36 @@ void main(void) {
     float acc[N_TOKENS][ROWS];
     UNROLL for (uint t = 0u; t < N_TOKENS; t++)
         UNROLL for (uint r = 0u; r < ROWS; r++) acc[t][r] = 0.0;
+#ifdef Q36_I16
+    UNROLL for (uint i = lid; i < 512u; i += 64u) {
+        uint g = q36_iq3s_grid[i];
+        grid_lut[i] = uvec2((g & 255u) | ((g & 65280u) << 8u),
+                           ((g >> 16u) & 255u) | ((g >> 8u) & 0x00ff0000u));
+    }
+    if (lid < 16u)
+        sign_lut[lid] = uvec2(((lid & 1u) != 0u ? 0x0000fffeu : 0u) |
+                             ((lid & 2u) != 0u ? 0xfffe0000u : 0u),
+                             ((lid & 4u) != 0u ? 0x0000fffeu : 0u) |
+                             ((lid & 8u) != 0u ? 0xfffe0000u : 0u));
+#else
     UNROLL for (uint i = lid; i < 512u; i += 64u)
         grid_lut[i] = q36_iq3s_grid[i];
     if (lid < 16u)
         sign_lut[lid] = (((lid * 0x00204081u) & 0x01010101u) * 254u);
+#endif
     barrier();
 
     for (uint b = lid >> 3u; b < pc.blocks; b += 8u) {
+#ifndef Q36_I16
         uint qbase = b * Q8K_WORDS + 2u + 8u * itid;
         int qv[N_TOKENS][8];
+#endif
         float yd[N_TOKENS];
         UNROLL for (uint t = 0u; t < N_TOKENS; t++) {
             uint offset = t * pc.blocks * Q8K_WORDS;
+#ifndef Q36_I16
             UNROLL for (uint l = 0u; l < 8u; l++) qv[t][l] = int(q8[offset + qbase + l]);
+#endif
             yd[t] = uintBitsToFloat(q8[offset + b * Q8K_WORDS]);
         }
 
@@ -110,11 +137,37 @@ void main(void) {
             uint signs4 = load_u32(base + 74u + 4u * itid);
             /* These 32 byte products sum exactly in f32; packed integer dots
              * preserve the decode result before applying float scales. */
+#ifdef Q36_I16
+            /* Each half accumulates 16 products: 16 * 15 * 128 = 30720,
+             * within signed i16. Combine as i32 before the original FMA. */
+            i16vec2 sum[N_TOKENS];
+            UNROLL for (uint t = 0u; t < N_TOKENS; t++) sum[t] = i16vec2(0);
+#else
             int sum[N_TOKENS];
             UNROLL for (uint t = 0u; t < N_TOKENS; t++) sum[t] = 0;
+#endif
             UNROLL for (uint l = 0u; l < 4u; l++) {
                 uint qs = l < 2u ? qs0 >> (16u * l) : qs1 >> (16u * (l - 2u));
                 uint signs = (signs4 >> (8u * l)) & 255u;
+#ifdef Q36_I16
+                uvec2 grid0 = grid_lut[(qs & 255u) |
+                                      ((qh << (8u - 2u * l)) & 256u)];
+                uvec2 grid1 = grid_lut[((qs >> 8u) & 255u) |
+                                      ((qh << (7u - 2u * l)) & 256u)];
+                uvec2 p0 = grid0 ^ sign_lut[signs & 15u];
+                uvec2 p1 = grid1 ^ sign_lut[signs >> 4u];
+                i16vec2 w0 = unpackInt2x16(int(p0.x));
+                i16vec2 w1 = unpackInt2x16(int(p0.y));
+                i16vec2 w2 = unpackInt2x16(int(p1.x));
+                i16vec2 w3 = unpackInt2x16(int(p1.y));
+                UNROLL for (uint t = 0u; t < N_TOKENS; t++) {
+                    uint raw = (t * pc.blocks + b) * 128u + 16u * itid + 4u * l;
+                    sum[t] += w0 * unpackInt2x16(int(raw_values[raw]));
+                    sum[t] += w1 * unpackInt2x16(int(raw_values[raw + 1u]));
+                    sum[t] += w2 * unpackInt2x16(int(raw_values[raw + 2u]));
+                    sum[t] += w3 * unpackInt2x16(int(raw_values[raw + 3u]));
+                }
+#else
                 uint grid0 = grid_lut[(qs & 255u) |
                                       ((qh << (8u - 2u * l)) & 256u)];
                 uint grid1 = grid_lut[((qs >> 8u) & 255u) |
@@ -125,12 +178,18 @@ void main(void) {
                     sum[t] += dotPacked4x8EXT(weight0, qv[t][2u * l]);
                     sum[t] += dotPacked4x8EXT(weight1, qv[t][2u * l + 1u]);
                 }
+#endif
             }
             uint sc = load_u8(base + 106u + (itid >> 1u));
             int ls = 2 * int((itid & 1u) == 0u ? sc & 15u : sc >> 4u) + 1;
             float wd = unpackHalf2x16(load_u16(base)).x;
             UNROLL for (uint t = 0u; t < N_TOKENS; t++)
+#ifdef Q36_I16
+                acc[t][r] = fma(wd * yd[t] * float(ls),
+                                float(int(sum[t].x) + int(sum[t].y)), acc[t][r]);
+#else
                 acc[t][r] = fma(wd * yd[t] * float(ls), float(sum[t]), acc[t][r]);
+#endif
         }
     }
 
