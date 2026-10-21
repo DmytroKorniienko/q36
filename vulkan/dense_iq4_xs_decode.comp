@@ -18,6 +18,12 @@ layout(set = 0, binding = 2) writeonly buffer Output { float y[]; };
 #endif
 
 #if Q36_TOKENS > 1
+layout(constant_id = 0) const uint N_TOKENS = Q36_TOKENS;
+#else
+#define N_TOKENS 1
+#endif
+
+#if Q36_TOKENS > 1
 #define UNROLL [[unroll]]
 #else
 #define UNROLL
@@ -77,8 +83,8 @@ void main(void) {
     uint lid = gl_LocalInvocationID.x;
     uint itid = lid & 7u;
     uint first_row = gl_WorkGroupID.x * ROWS;
-    float acc[Q36_TOKENS][ROWS];
-    UNROLL for (uint t = 0u; t < Q36_TOKENS; t++)
+    float acc[N_TOKENS][ROWS];
+    UNROLL for (uint t = 0u; t < N_TOKENS; t++)
         UNROLL for (uint r = 0u; r < ROWS; r++) acc[t][r] = 0.0;
     if (lid < 16u) {
 #if Q36_TOKENS > 1
@@ -92,15 +98,12 @@ void main(void) {
     for (uint b = lid >> 3u; b < pc.blocks; b += 8u) {
         uint qbase = b * Q8K_WORDS + 2u + 8u * itid;
 #if Q36_TOKENS > 1
-        int qv[Q36_TOKENS][8];
+        int qv[N_TOKENS][8];
 #else
-        vec4 qv[Q36_TOKENS][8];
+        vec4 qv[N_TOKENS][8];
 #endif
-        float yd[Q36_TOKENS];
-        UNROLL for (uint t = 0u; t < Q36_TOKENS; t++) {
-#if Q36_TOKENS > 1
-            if (t >= pc.n_tok) continue;
-#endif
+        float yd[N_TOKENS];
+        UNROLL for (uint t = 0u; t < N_TOKENS; t++) {
             uint offset = t * pc.blocks * Q8K_WORDS;
 #if Q36_TOKENS > 1
             UNROLL for (uint l = 0u; l < 8u; l++) qv[t][l] = int(q8[offset + qbase + l]);
@@ -122,11 +125,11 @@ void main(void) {
             /* These 32 byte products sum exactly in f32; packed integer dots
              * preserve the decode result before applying float scales. */
 #if Q36_TOKENS > 1
-            int sum[Q36_TOKENS];
-            UNROLL for (uint t = 0u; t < Q36_TOKENS; t++) sum[t] = 0;
+            int sum[N_TOKENS];
+            UNROLL for (uint t = 0u; t < N_TOKENS; t++) sum[t] = 0;
 #else
-            float sum[Q36_TOKENS];
-            UNROLL for (uint t = 0u; t < Q36_TOKENS; t++) sum[t] = 0.0;
+            float sum[N_TOKENS];
+            UNROLL for (uint t = 0u; t < N_TOKENS; t++) sum[t] = 0.0;
 #endif
             UNROLL for (uint l = 0u; l < 4u; l++) {
                 uint packed = ww[base + 2u + 4u * ib + l];
@@ -137,9 +140,8 @@ void main(void) {
                 vec4 w0 = unpack_iq4(packed, 0u);
                 vec4 w1 = unpack_iq4(packed, 4u);
 #endif
-                UNROLL for (uint t = 0u; t < Q36_TOKENS; t++) {
+                UNROLL for (uint t = 0u; t < N_TOKENS; t++) {
 #if Q36_TOKENS > 1
-                    if (t >= pc.n_tok) continue;
                     sum[t] += dotPacked4x8EXT(w0, qv[t][l]) +
                               dotPacked4x8EXT(w1, qv[t][l + 4u]);
 #else
@@ -161,15 +163,12 @@ void main(void) {
             int ls = int((sl >> (4u * (ib & 1u))) & 15u) |
                      int(((sh >> (2u * ib)) & 3u) << 4u);
             float wd = unpackHalf2x16(meta0).x;
-            UNROLL for (uint t = 0u; t < Q36_TOKENS; t++)
+            UNROLL for (uint t = 0u; t < N_TOKENS; t++)
             acc[t][r] = fma(wd * yd[t] * float(ls - 32), float(sum[t]), acc[t][r]);
         }
     }
 
-    UNROLL for (uint t = 0u; t < Q36_TOKENS; t++) {
-#if Q36_TOKENS > 1
-        if (t >= pc.n_tok) continue;
-#endif
+    UNROLL for (uint t = 0u; t < N_TOKENS; t++) {
         UNROLL for (uint r = 0u; r < ROWS; r++) {
             float total = subgroupAdd(acc[t][r]);
             uint row = first_row + r;

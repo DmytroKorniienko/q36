@@ -298,37 +298,44 @@ output tokens and Q8_0 K / Q4_0 V cache give these generation rates:
 
 | Context | Story, plain → MTP t/s | Gain | C source, plain → MTP t/s | Gain |
 | ---: | ---: | ---: | ---: | ---: |
-| 128 | 22.09 → 27.80 | 1.26× | 22.20 → 25.64 | 1.15× |
-| 2048 | 21.66 → 31.02 | 1.43× | 21.65 → 26.22 | 1.21× |
-| 3968 | 21.29 → 25.65 | 1.20× | 21.29 → 27.43 | 1.29× |
-| 4096 | 21.25 → 29.61 | 1.39× | 21.29 → 29.01 | 1.36× |
-| 8192, fresh | 20.52 → 29.32 | 1.43× | — | — |
+| 128 | 22.06 → 30.15 | 1.37× | 22.09 → 27.46 | 1.24× |
+| 2048 | 21.62 → 32.26 | 1.49× | 21.68 → 28.97 | 1.34× |
+| 3968 | 21.26 → 26.64 | 1.25× | 21.43 → 30.72 | 1.43× |
+| 4096 | 21.23 → 31.87 | 1.50× | 21.29 → 30.57 | 1.44× |
 
-The first four rows are incremental sweeps; the 8K pair starts directly at
-8K. The fresh 8K repeat measured 29.48 t/s. These prompts do not demonstrate
-a general 1.5–2× gain. Compared with the previous MTP implementation, short
-C-source generation improves by 20%, while its 4K point is about 2% slower
-in both repetitions. Peak GPU allocation grows by 465 MiB at 4K and 518 MiB
-at 8K, about 20 MiB less than before. Runs peak at 71°C across this set.
-Plain decode remains the default. Commands, correctness logs and measurements
-are in [the local benchmark artifacts](tests/test-vectors/local/q38-mtp-20261020-v3/README.md).
+Compared with `d608931`, greedy throughput improves by 4–10% across
+these cases, using the faster of two previous-build controls at each
+frontier. The verifier specializes exact block sizes and K-quant types,
+and reuses the Q8 activation sums. It adds no tensor or weight buffers.
+All 141 shared ordinary/prefill and scaled-IQ2 shaders remain byte-identical.
 
-With opportunistic MTP at temperature 1, the same cache and output lengths
-yield these gains over ordinary sampling, using seeds 1 and 42:
+With opportunistic MTP at temperature 1, seeds 1 and 42 give these gains
+over ordinary sampling:
 
 | Context | Story gain, both seeds | C-source gain, both seeds |
 | ---: | ---: | ---: |
-| 128 | 1.28–1.30× | 1.11–1.12× |
-| 2048 | 1.29–1.31× | 1.21–1.32× |
-| 3968 | 1.17–1.19× | 1.18–1.28× |
-| 4096 | 1.27–1.29× | 1.31–1.44× |
+| 128 | 1.24–1.36× | 1.17–1.37× |
+| 2048 | 1.42× | 1.38–1.51× |
+| 3968 | 1.22–1.27× | 1.25–1.37× |
+| 4096 | 1.35–1.60× | 1.37–1.50× |
 
-Fresh 8K with seed 1 improves from 19.93 to 28.34 t/s (1.42×). Verified
-greedy tails account for 39–66% of output tokens across these trials. The
-arms generate different sequences because of those tails. Peak extra GPU
-allocation is 465 MiB at 4K and 501 MiB at 8K; runs peak at 71°C. This
-still falls short of a general 1.5–2× gain. Commands, state checks and saved
-example outputs are in [the opportunistic sampling artifacts](tests/test-vectors/local/q38-mtp-20261020-v4/README.md).
+Fresh 8K with seed 1 improves from 20.03 to 31.56 t/s (1.58×). Verified
+greedy tails account for 39%–72% of output tokens in these trials. The
+arms generate different sequences; adaptive timing can also change block
+boundaries and sampled continuations with the same seed. These two prompts
+do not demonstrate a general 1.5–2× gain or an attained hardware limit.
+
+Peak extra Vulkan tensor allocation is 465 MiB at 4K and
+501 MiB at 8K. Recorded benchmark temperature peaks at 72°C.
+Greedy and sampled replay, quantized KV, checkpoint restore, scalar
+fallback, MoE regression, separate engines at 8K, and fresh 16-thread
+CPU/Vulkan parity through top-64 all pass. Every MTP replay has zero
+target-logit difference. Plain decoding remains the default. Commands,
+raw measurements and frozen sources are in
+[the local benchmark artifacts](tests/test-vectors/local/q38-mtp-20261020-v5/README.md).
+
+The seed-42 2048-context code case was 6% slower than previous
+opportunistic MTP. Adaptive block choices and sampled continuations vary.
 
 ## Speed
 

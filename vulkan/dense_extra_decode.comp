@@ -19,6 +19,12 @@ layout(set = 0, binding = 3) readonly buffer Tables { uint tables[]; };
 #define Q36_TOKENS 1
 #endif
 
+#if Q36_TOKENS > 1 && (!defined(Q36_TYPE) || (Q36_TYPE != 17 && Q36_TYPE != 22))
+layout(constant_id = 0) const uint N_TOKENS = Q36_TOKENS;
+#else
+#define N_TOKENS Q36_TOKENS
+#endif
+
 #if Q36_TOKENS > 1
 #define UNROLL [[unroll]]
 #else
@@ -312,8 +318,8 @@ void main(void) {
 void main(void) {
     uint lid = gl_LocalInvocationID.x, group = lid & 7u;
     uint first_row = gl_WorkGroupID.x * ROWS;
-    float acc[Q36_TOKENS][ROWS];
-    UNROLL for (uint t = 0u; t < Q36_TOKENS; t++)
+    float acc[N_TOKENS][ROWS];
+    UNROLL for (uint t = 0u; t < N_TOKENS; t++)
         UNROLL for (uint r = 0u; r < ROWS; r++) acc[t][r] = 0.0;
     for (uint b = lid >> 3u; b < pc.blocks; b += 8u) {
         UNROLL for (uint r = 0u; r < ROWS; r++) {
@@ -321,16 +327,15 @@ void main(void) {
             if (row >= pc.out_dim) continue;
             uint base = row * pc.row_bytes + b * 66u;
             uint scales = load_u32(base + 6u + 8u * group);
-            float sum[Q36_TOKENS];
-            UNROLL for (uint t = 0u; t < Q36_TOKENS; t++) sum[t] = 0.0;
+            float sum[N_TOKENS];
+            UNROLL for (uint t = 0u; t < N_TOKENS; t++) sum[t] = 0.0;
             UNROLL for (uint l = 0u; l < 4u; l++) {
                 uint entry = load_u8(base + 2u + 8u * group + l);
                 uint signs = table_u8(TAB_KSIGNS_BYTES + ((scales >> (7u * l)) & 127u));
                 uint table = TAB_IQ2XXS;
                 int w0 = signed_bytes(tables[table + 2u * entry], signs);
                 int w1 = signed_bytes(tables[table + 2u * entry + 1u], signs >> 4u);
-                UNROLL for (uint t = 0u; t < Q36_TOKENS; t++) {
-                    if (t >= pc.n_tok) continue;
+                UNROLL for (uint t = 0u; t < N_TOKENS; t++) {
                     uint qbase = (t * pc.blocks + b) * Q8K_WORDS + 2u + 8u * group + 2u * l;
                     float v0 = float(dotPacked4x8EXT(w0, int(q8[qbase])));
                     float v1 = float(dotPacked4x8EXT(w1, int(q8[qbase + 1u])));
@@ -338,8 +343,7 @@ void main(void) {
                     sum[t] += v1;
                 }
             }
-            UNROLL for (uint t = 0u; t < Q36_TOKENS; t++) {
-                if (t >= pc.n_tok) continue;
+            UNROLL for (uint t = 0u; t < N_TOKENS; t++) {
                 float yd = uintBitsToFloat(q8[(t * pc.blocks + b) * Q8K_WORDS]);
                 float v = sum[t];
                 v *= unpackHalf2x16(load_u16(base)).x * (0.5 + float(scales >> 28u)) * 0.25;
@@ -347,8 +351,7 @@ void main(void) {
             }
         }
     }
-    UNROLL for (uint t = 0u; t < Q36_TOKENS; t++) {
-        if (t >= pc.n_tok) continue;
+    UNROLL for (uint t = 0u; t < N_TOKENS; t++) {
         UNROLL for (uint r = 0u; r < ROWS; r++) {
             float total = subgroupAdd(acc[t][r]);
             uint row = first_row + r;
@@ -361,15 +364,12 @@ void main(void) {
     uint lid = gl_LocalInvocationID.x;
     uint lane8 = lid & 7u;
     uint first_row = gl_WorkGroupID.x * ROWS;
-    float acc[Q36_TOKENS][ROWS];
-    UNROLL for (uint t = 0u; t < Q36_TOKENS; t++)
+    float acc[N_TOKENS][ROWS];
+    UNROLL for (uint t = 0u; t < N_TOKENS; t++)
         UNROLL for (uint r = 0u; r < ROWS; r++) acc[t][r] = 0.0;
 
     for (uint b = lid >> 3u; b < pc.blocks; b += 8u) {
-        UNROLL for (uint t = 0u; t < Q36_TOKENS; t++) {
-#if Q36_TOKENS > 1
-            if (t >= pc.n_tok) continue;
-#endif
+        UNROLL for (uint t = 0u; t < N_TOKENS; t++) {
             uint token_offset = t * pc.blocks * Q8K_WORDS;
             uint qbase = b * Q8K_WORDS + 2u + 8u * lane8;
             float yd = uintBitsToFloat(q8[token_offset + b * Q8K_WORDS]);
@@ -384,10 +384,7 @@ void main(void) {
         }
     }
 
-    UNROLL for (uint t = 0u; t < Q36_TOKENS; t++) {
-#if Q36_TOKENS > 1
-        if (t >= pc.n_tok) continue;
-#endif
+    UNROLL for (uint t = 0u; t < N_TOKENS; t++) {
         UNROLL for (uint r = 0u; r < ROWS; r++) {
             float total = subgroupAdd(acc[t][r]);
             uint row = first_row + r;

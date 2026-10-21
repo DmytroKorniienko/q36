@@ -24,6 +24,10 @@ layout(set = 0, binding = 3) readonly buffer Mask { uint ages[]; };
 #define Q36_TOKENS 1
 #endif
 
+#if Q36_TOKENS > 1
+layout(constant_id = 0) const uint N_TOKENS = Q36_TOKENS;
+#endif
+
 layout(push_constant) uniform Push {
     uint in_dim;
     uint out_dim;
@@ -48,7 +52,11 @@ const uint Q6_K = 14u;
 const uint ROWS = Q36_ROWS;
 const uint Q8K_WORDS = 74u;
 
-#ifdef Q36_Q3K_ONLY
+#ifdef Q36_Q2K_ONLY
+#define QTYPE Q2_K
+#elif defined(Q36_Q6K_ONLY)
+#define QTYPE Q6_K
+#elif defined(Q36_Q3K_ONLY)
 #define QTYPE Q3_K
 #elif defined(Q36_Q4K_ONLY)
 #define QTYPE Q4_K
@@ -362,8 +370,8 @@ void main(void) {
     uint lid = gl_LocalInvocationID.x;
     uint part_id = lid & 15u;
     uint first_row = gl_WorkGroupID.x * ROWS;
-    float acc[Q36_TOKENS][ROWS];
-    [[unroll]] for (uint t = 0u; t < Q36_TOKENS; t++)
+    float acc[N_TOKENS][ROWS];
+    [[unroll]] for (uint t = 0u; t < N_TOKENS; t++)
         [[unroll]] for (uint r = 0u; r < ROWS; r++) acc[t][r] = 0.0;
 
     for (uint b = lid >> 4u; b < pc.blocks; b += 4u) {
@@ -420,8 +428,7 @@ void main(void) {
             } else {
                 [[unroll]] for (uint i = 0u; i < 4u; i++) w[i] = dequant_word(row, b, 4u * part_id + i);
             }
-            [[unroll]] for (uint t = 0u; t < Q36_TOKENS; t++) {
-                if (t >= pc.n_tok) continue;
+            [[unroll]] for (uint t = 0u; t < N_TOKENS; t++) {
                 uint qbase = (t * pc.blocks + b) * Q8K_WORDS;
                 float yd = uintBitsToFloat(q8[qbase]);
                 float qsum = 0.0, qdot = 0.0;
@@ -429,11 +436,13 @@ void main(void) {
                     [[unroll]] for (uint i = 0u; i < 4u; i++)
                         qdot += dot(w[i], unpack_i8(q8[qbase + 2u + 4u * part_id + i]));
                 } else {
-                    int isum = 0, idot = 0;
+                    /* Q8_K already stores the exact sum of each sixteen bytes. */
+                    uint sums = q8[qbase + 66u + (part_id >> 1u)];
+                    int isum = bitfieldExtract(int(sums), int((part_id & 1u) * 16u), 16);
+                    int idot = 0;
                     [[unroll]] for (uint i = 0u; i < 4u; i++) {
                         int q = int(q8[qbase + 2u + 4u * part_id + i]);
                         idot += dotPacked4x8EXT(packed_w[i], q);
-                        isum += dotPacked4x8EXT(0x01010101, q);
                     }
                     qsum = float(isum);
                     qdot = float(idot);
@@ -447,8 +456,7 @@ void main(void) {
             }
         }
     }
-    [[unroll]] for (uint t = 0u; t < Q36_TOKENS; t++) {
-        if (t >= pc.n_tok) continue;
+    [[unroll]] for (uint t = 0u; t < N_TOKENS; t++) {
         [[unroll]] for (uint r = 0u; r < ROWS; r++) {
             float total = subgroupAdd(acc[t][r]);
             uint row = first_row + r;
