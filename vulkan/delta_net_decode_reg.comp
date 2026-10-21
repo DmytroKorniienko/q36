@@ -30,6 +30,23 @@ const uint LANES = 8u;
 const uint COLS = 8u;
 const uint ROWS = N / LANES;
 
+#ifdef Q36_MTP_VERIFY
+/* RADV may remove a float16 cast round trip, and packHalf can round toward
+ * zero. Round the bits to match the scalar kernel's half stores instead. */
+float round_state(float v) {
+    uint bits = floatBitsToUint(v), a = bits & 0x7fffffffu;
+    uint sign = bits & 0x80000000u;
+    if (a >= 0x7f800000u) return v;
+    if (a <= 0x33000000u) return uintBitsToFloat(sign);
+    if (a < 0x33800000u) return uintBitsToFloat(sign | 0x33800000u);
+    uint shift = max(13u, 126u - min(a >> 23u, 126u));
+    uint mask = (1u << shift) - 1u;
+    a = (a + (mask >> 1u) + ((a >> shift) & 1u)) & ~mask;
+    if (a >= 0x47800000u) a = 0x7f800000u;
+    return uintBitsToFloat(sign | a);
+}
+#endif
+
 void main(void) {
     uint h = gl_WorkGroupID.x;
     uint lid = gl_LocalInvocationID.x;
@@ -66,6 +83,12 @@ void main(void) {
         }
         outj = subgroupClusteredAdd(outj, LANES);
         if (lane == 0u) y[vec + j] = outj * norm;
+#ifdef Q36_MTP_VERIFY
+        /* Plain decode stores half state after every token. Keep that rounding
+         * while retaining the state in registers across the verify window. */
+        if (tok + 1u < pc.n_tok)
+            for (uint r = 0u; r < ROWS; r++) state[r] = round_state(state[r]);
+#endif
     }
 
     for (uint r = 0u; r < ROWS; r++) {

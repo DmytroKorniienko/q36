@@ -2399,6 +2399,87 @@ done:
 #endif
 }
 
+static void test_vulkan_delta_verify(void) {
+#if !defined(Q36_NO_GPU) && !defined(Q36_METAL)
+    enum { heads = 2, dim = 128, width = heads * dim, tokens = 8,
+           state_count = heads * dim * dim };
+    float input[3][tokens * width], gates[tokens * heads * 2];
+    union { float f[state_count]; uint16_t h[state_count]; } initial;
+    float a[state_count], b[state_count];
+    q36_gpu_tensor *x[4] = {0}, *state[2] = {0}, *out[2] = {0};
+    q36_gpu_set_quality(false);
+    for (unsigned i = 0; i < tokens * width; i++) {
+        input[0][i] = sinf(i * 0.13f) * 0.08f;
+        input[1][i] = cosf(i * 0.17f) * 0.08f;
+        input[2][i] = sinf(i * 0.19f) * 0.3f;
+    }
+    for (unsigned t = 0; t < tokens; t++)
+        for (unsigned h = 0; h < heads; h++) {
+            gates[2 * t * heads + h] = 0.93f + h * 0.02f;
+            gates[(2 * t + 1) * heads + h] = 0.61f - t * 0.03f;
+        }
+    for (unsigned i = 0; i < 4; i++) {
+        uint64_t bytes = i == 3 ? sizeof(gates) : sizeof(input[0]);
+        x[i] = q36_gpu_tensor_alloc(bytes);
+        TEST_ASSERT(x[i]);
+        if (!x[i]) goto done;
+        TEST_ASSERT(q36_gpu_tensor_write(x[i], 0, i == 3 ? gates : input[i], bytes));
+    }
+    for (unsigned half = 0; half < 2; half++) {
+        uint64_t state_bytes = state_count * (half ? sizeof(uint16_t) : sizeof(float));
+        for (unsigned i = 0; i < state_count; i++) {
+            float v = sinf(i * 0.07f) * 0.125f;
+            if (half) initial.h[i] = test_float_to_f16(v);
+            else initial.f[i] = v;
+        }
+        for (unsigned i = 0; i < 2; i++) {
+            state[i] = q36_gpu_tensor_alloc(state_bytes);
+            out[i] = q36_gpu_tensor_alloc(sizeof(input[0]));
+            TEST_ASSERT(state[i] && out[i]);
+            if (!state[i] || !out[i]) goto done;
+        }
+        for (unsigned n = 2; n <= tokens; n++) {
+            for (unsigned i = 0; i < 2; i++)
+                TEST_ASSERT(q36_gpu_tensor_write(state[i], 0, &initial, state_bytes));
+            q36_gpu_set_micro_batch(false);
+            for (unsigned t = 0; t < n; t++) {
+                q36_gpu_tensor *row[5];
+                for (unsigned i = 0; i < 5; i++) {
+                    uint64_t bytes = (i == 3 ? 2u * heads : width) * sizeof(float);
+                    row[i] = q36_gpu_tensor_view(i == 4 ? out[0] : x[i], t * bytes, bytes);
+                    TEST_ASSERT(row[i]);
+                }
+                TEST_ASSERT(q36_gpu_delta_net_decode_tensor(state[0], row[0], row[1],
+                    row[2], row[3], row[4], heads, dim, 1));
+                for (unsigned i = 0; i < 5; i++) q36_gpu_tensor_free(row[i]);
+            }
+            q36_gpu_set_micro_batch(true);
+            TEST_ASSERT(q36_gpu_delta_net_decode_tensor(state[1], x[0], x[1], x[2],
+                x[3], out[1], heads, dim, n));
+            q36_gpu_set_micro_batch(false);
+            TEST_ASSERT(q36_gpu_tensor_read(state[0], 0, a, state_bytes));
+            TEST_ASSERT(q36_gpu_tensor_read(state[1], 0, b, state_bytes));
+            TEST_ASSERT(memcmp(a, b, state_bytes) == 0);
+            uint64_t out_bytes = (uint64_t)n * width * sizeof(float);
+            TEST_ASSERT(q36_gpu_tensor_read(out[0], 0, a, out_bytes));
+            TEST_ASSERT(q36_gpu_tensor_read(out[1], 0, b, out_bytes));
+            TEST_ASSERT(memcmp(a, b, out_bytes) == 0);
+        }
+        for (unsigned i = 0; i < 2; i++) {
+            q36_gpu_tensor_free(state[i]); state[i] = NULL;
+            q36_gpu_tensor_free(out[i]); out[i] = NULL;
+        }
+    }
+done:
+    q36_gpu_set_micro_batch(false);
+    for (unsigned i = 0; i < 4; i++) q36_gpu_tensor_free(x[i]);
+    for (unsigned i = 0; i < 2; i++) {
+        q36_gpu_tensor_free(state[i]);
+        q36_gpu_tensor_free(out[i]);
+    }
+#endif
+}
+
 static void test_vulkan_delta_qkv(void) {
 #ifdef Q36_NO_GPU
     test_skip("vulkan-kernels", "CPU-only build");
@@ -4517,6 +4598,7 @@ static void test_vulkan_kernels(void) {
     test_vulkan_kv_store_quant();
     test_vulkan_rms_norm_rope_kv_quant();
     test_vulkan_recurrent_conv_decode();
+    test_vulkan_delta_verify();
     test_vulkan_delta_qkv();
     test_vulkan_shared_ffn_decode();
     test_vulkan_kquant_matvec();

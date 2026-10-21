@@ -11927,13 +11927,16 @@ static int q36_session_eval_speculative(q36_session *s, int first_token,
             q36_session_invalidate(s);
             return -1;
         }
+        /* The seed's draft KV already used the true preceding target hidden. */
+        bool seed_only = commit_n == 1 && !target_saved;
         uint64_t logits_bytes = (uint64_t)Q36_N_VOCAB * sizeof(float);
         if (rt->mtp_head_mask)
             q36_gpu_mtp_head_mask_tensor(rt->mtp_head_mask, rt->spec_logits,
                                           rt->top2, Q36_N_VOCAB, (uint32_t)commit_n);
         if (!q36_gpu_tensor_copy(rt->logits, 0, rt->spec_logits,
                                   (uint64_t)(commit_n - 1) * logits_bytes, logits_bytes) ||
-            !q36_mtp_catchup(s, verify, (uint32_t)commit_n, start_pos, target_saved)) {
+            !(seed_only ? q36_vulkan_update_last_h(rt, 0) :
+                q36_mtp_catchup(s, verify, (uint32_t)commit_n, start_pos, target_saved))) {
             if (err && errlen) snprintf(err, errlen, "MTP frontier adopt failed at pos %u", start_pos);
             q36_session_invalidate(s);
             return -1;
