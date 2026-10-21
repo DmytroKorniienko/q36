@@ -2406,7 +2406,7 @@ static void test_vulkan_delta_verify(void) {
     float input[3][tokens * width], gates[tokens * heads * 2];
     union { float f[state_count]; uint16_t h[state_count]; } initial;
     float a[state_count], b[state_count];
-    q36_gpu_tensor *x[4] = {0}, *state[2] = {0}, *out[2] = {0};
+    q36_gpu_tensor *x[4] = {0}, *state[2] = {0}, *out[2] = {0}, *source = NULL;
     q36_gpu_set_quality(false);
     for (unsigned i = 0; i < tokens * width; i++) {
         input[0][i] = sinf(i * 0.13f) * 0.08f;
@@ -2438,7 +2438,11 @@ static void test_vulkan_delta_verify(void) {
             TEST_ASSERT(state[i] && out[i]);
             if (!state[i] || !out[i]) goto done;
         }
-        for (unsigned n = 2; n <= tokens; n++) {
+        source = q36_gpu_tensor_alloc(state_bytes);
+        TEST_ASSERT(source);
+        if (!source) goto done;
+        TEST_ASSERT(q36_gpu_tensor_write(source, 0, &initial, state_bytes));
+        for (unsigned n = 1; n <= tokens; n++) {
             for (unsigned i = 0; i < 2; i++)
                 TEST_ASSERT(q36_gpu_tensor_write(state[i], 0, &initial, state_bytes));
             q36_gpu_set_micro_batch(false);
@@ -2464,7 +2468,32 @@ static void test_vulkan_delta_verify(void) {
             TEST_ASSERT(q36_gpu_tensor_read(out[0], 0, a, out_bytes));
             TEST_ASSERT(q36_gpu_tensor_read(out[1], 0, b, out_bytes));
             TEST_ASSERT(memcmp(a, b, out_bytes) == 0);
+            /* The spare destination contains unrelated speculative state. */
+            for (unsigned fallback = 0; fallback < (n == 1 ? 2u : 1u); fallback++) {
+                memset(b, 0, state_bytes);
+                TEST_ASSERT(q36_gpu_tensor_write(state[1], 0, b, state_bytes));
+                q36_gpu_set_micro_batch(!fallback);
+                TEST_ASSERT(q36_gpu_delta_net_decode_from_tensor(state[1], source,
+                    x[0], x[1], x[2], x[3], out[1], heads, dim, n, true));
+                q36_gpu_set_micro_batch(false);
+                TEST_ASSERT(q36_gpu_tensor_read(state[0], 0, a, state_bytes));
+                TEST_ASSERT(q36_gpu_tensor_read(state[1], 0, b, state_bytes));
+                TEST_ASSERT(memcmp(a, b, state_bytes) == 0);
+                TEST_ASSERT(q36_gpu_tensor_read(out[0], 0, a, out_bytes));
+                TEST_ASSERT(q36_gpu_tensor_read(out[1], 0, b, out_bytes));
+                TEST_ASSERT(memcmp(a, b, out_bytes) == 0);
+                TEST_ASSERT(q36_gpu_tensor_read(source, 0, b, state_bytes));
+                TEST_ASSERT(memcmp(&initial, b, state_bytes) == 0);
+            }
+            q36_gpu_set_micro_batch(true);
+            TEST_ASSERT(q36_gpu_delta_net_decode_from_tensor(state[1], source,
+                x[0], x[1], x[2], x[3], out[1], heads, dim, n, false));
+            q36_gpu_set_micro_batch(false);
+            TEST_ASSERT(q36_gpu_tensor_read(state[0], 0, a, state_bytes));
+            TEST_ASSERT(q36_gpu_tensor_read(state[1], 0, b, state_bytes));
+            TEST_ASSERT(memcmp(a, b, state_bytes) == 0);
         }
+        q36_gpu_tensor_free(source); source = NULL;
         for (unsigned i = 0; i < 2; i++) {
             q36_gpu_tensor_free(state[i]); state[i] = NULL;
             q36_gpu_tensor_free(out[i]); out[i] = NULL;
@@ -2472,6 +2501,7 @@ static void test_vulkan_delta_verify(void) {
     }
 done:
     q36_gpu_set_micro_batch(false);
+    q36_gpu_tensor_free(source);
     for (unsigned i = 0; i < 4; i++) q36_gpu_tensor_free(x[i]);
     for (unsigned i = 0; i < 2; i++) {
         q36_gpu_tensor_free(state[i]);

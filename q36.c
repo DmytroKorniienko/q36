@@ -7902,13 +7902,14 @@ static bool q36_forward_full_attn_vulkan(q36_session *s,
 static q36_gpu_tensor *q36_vulkan_row(q36_gpu_tensor *t, uint32_t row,
                                       uint64_t width);
 
-static bool q36_forward_recurrent_vulkan(q36_session *s,
+static bool q36_forward_recurrent_vulkan_into(q36_session *s,
                                          const q36_layer_weights *l,
                                          uint32_t il,
                                          uint32_t n_tok,
                                          const q36_gpu_tensor *inp,
                                          q36_gpu_tensor *out,
-                                         bool inp_q8_ready) {
+                                         bool inp_q8_ready,
+                                         bool saved_inputs) {
     q36_engine *e;
     q36_vulkan_runtime *rt;
     q36_vulkan_recurrent_cache *cache;
@@ -8074,7 +8075,7 @@ static bool q36_forward_recurrent_vulkan(q36_session *s,
         return false;
     }
 recurrent_update:
-    if (rt->spec_verifying) {
+    if (rt->spec_verifying && !saved_inputs) {
         const q36_gpu_tensor *src[4] = {rt->recur_q, rt->recur_k, rt->recur_v, rt->recur_gb};
         uint32_t widths[4] = {Q36_N_SSM_INNER, Q36_N_SSM_INNER,
             Q36_N_SSM_INNER, 2u * Q36_N_SSM_DT_RANK};
@@ -8089,7 +8090,16 @@ recurrent_update:
         fprintf(stderr, "q36: recurrent gate non-finite at layer=%u\n", il);
         return false;
     }
-    if (!q36_gpu_delta_net_decode_tensor(cache->state,
+    bool updated;
+#ifndef Q36_METAL
+    if (rt->spec_verifying && rt->spec_row == 0)
+        updated = q36_gpu_delta_net_decode_from_tensor(cache->state,
+            rt->spec_recurrent[il].state, rt->recur_q, rt->recur_k,
+            rt->recur_v, rt->recur_gb, rt->recur_proj,
+            Q36_N_SSM_DT_RANK, Q36_N_SSM_STATE, n_tok, true);
+    else
+#endif
+    updated = q36_gpu_delta_net_decode_tensor(cache->state,
                                          rt->recur_q,
                                          rt->recur_k,
                                          rt->recur_v,
@@ -8097,7 +8107,8 @@ recurrent_update:
                                          rt->recur_proj,
                                          Q36_N_SSM_DT_RANK,
                                          Q36_N_SSM_STATE,
-                                         n_tok)) {
+                                         n_tok);
+    if (!updated) {
         return false;
     }
     if (e->quality && !q36_gpu_tensor_all_finite(rt->recur_proj, n_tok * Q36_N_SSM_INNER)) {
@@ -8144,6 +8155,45 @@ recurrent_update:
         return false;
     }
     return true;
+}
+
+static bool q36_forward_recurrent_vulkan(q36_session *s,
+                                         const q36_layer_weights *l,
+                                         uint32_t il, uint32_t n_tok,
+                                         const q36_gpu_tensor *inp,
+                                         q36_gpu_tensor *out,
+                                         bool inp_q8_ready) {
+    if (!s || !s->runtime) return false;
+#ifndef Q36_METAL
+    q36_vulkan_runtime *rt = s->runtime;
+    if (rt->spec_verifying) {
+        q36_gpu_tensor **slots[] = {&rt->recur_q, &rt->recur_k, &rt->recur_v, &rt->recur_gb};
+        q36_gpu_tensor *saved[4], *rows[4];
+        uint32_t widths[] = {Q36_N_SSM_INNER, Q36_N_SSM_INNER,
+            Q36_N_SSM_INNER, 2u * Q36_N_SSM_DT_RANK};
+        uint64_t offset = (uint64_t)Q36_MTP_VERIFY_MAX * Q36_N_SSM_CONV_DIM * sizeof(float);
+        bool ok = true;
+        /* Produce replay inputs in their final storage, avoiding four copies
+         * per layer. Restore scratch views even when a dispatch fails. */
+        for (unsigned i = 0; i < 4; i++) {
+            uint64_t bytes = widths[i] * sizeof(float);
+            saved[i] = *slots[i];
+            rows[i] = q36_gpu_tensor_view(rt->spec_inputs[il],
+                offset + rt->spec_row * bytes, n_tok * bytes);
+            if (!rows[i]) ok = false;
+            offset += Q36_MTP_VERIFY_MAX * bytes;
+            *slots[i] = rows[i];
+        }
+        if (ok) ok = q36_forward_recurrent_vulkan_into(s, l, il, n_tok, inp,
+                                                        out, inp_q8_ready, true);
+        for (unsigned i = 0; i < 4; i++) {
+            *slots[i] = saved[i];
+            q36_gpu_tensor_free(rows[i]);
+        }
+        return ok;
+    }
+#endif
+    return q36_forward_recurrent_vulkan_into(s, l, il, n_tok, inp, out, inp_q8_ready, false);
 }
 
 /* Forward n_tok prompt tokens at positions pos0..pos0+n_tok-1 through the
@@ -8753,11 +8803,26 @@ static bool q36_vulkan_spec_frontier_copy(q36_vulkan_recurrent_cache *dst,
                                           const q36_vulkan_recurrent_cache *src) {
     if (!dst || !src || !dst->conv || !src->conv || !dst->state || !src->state) return false;
     if (!q36_gpu_tensor_copy(dst->conv, 0, src->conv, 0, q36_vulkan_recurrent_conv_bytes())) return false;
+#ifdef Q36_METAL
     if (q36_gpu_tensor_bytes(dst->state) != q36_gpu_tensor_bytes(src->state) ||
         !q36_gpu_tensor_copy(dst->state, 0, src->state, 0,
                              q36_gpu_tensor_bytes(src->state))) return false;
+#endif
     return true;
 }
+
+#ifndef Q36_METAL
+/* Keep the frontier untouched; verification and rejection replay read it
+ * directly while writing the other already allocated state buffer. */
+static void q36_vulkan_spec_swap_states(q36_vulkan_runtime *rt) {
+    for (uint32_t il = 0; il < Q36_N_LAYER; il++) {
+        if (q36_layer_is_full_attention(il)) continue;
+        q36_gpu_tensor *state = rt->recurrent[il].state;
+        rt->recurrent[il].state = rt->spec_recurrent[il].state;
+        rt->spec_recurrent[il].state = state;
+    }
+}
+#endif
 
 static bool q36_vulkan_spec_frontier_snapshot(q36_vulkan_runtime *rt) {
     if (!rt) return false;
@@ -8765,6 +8830,9 @@ static bool q36_vulkan_spec_frontier_snapshot(q36_vulkan_runtime *rt) {
         if (q36_layer_is_full_attention(il)) continue;
         if (!q36_vulkan_spec_frontier_copy(&rt->spec_recurrent[il], &rt->recurrent[il])) return false;
     }
+#ifndef Q36_METAL
+    q36_vulkan_spec_swap_states(rt);
+#endif
     return true;
 }
 
@@ -8774,6 +8842,9 @@ static bool q36_vulkan_spec_frontier_restore(q36_vulkan_runtime *rt) {
         if (q36_layer_is_full_attention(il)) continue;
         if (!q36_vulkan_spec_frontier_copy(&rt->recurrent[il], &rt->spec_recurrent[il])) return false;
     }
+#ifndef Q36_METAL
+    q36_vulkan_spec_swap_states(rt);
+#endif
     return true;
 }
 
@@ -8782,7 +8853,9 @@ static bool q36_vulkan_spec_frontier_restore(q36_vulkan_runtime *rt) {
  * avoids reading the model weights a second time. */
 static bool q36_vulkan_replay_recurrent(q36_session *s, uint32_t n_tok) {
     q36_vulkan_runtime *rt = s->runtime;
+#ifdef Q36_METAL
     if (!q36_vulkan_spec_frontier_restore(rt)) return false;
+#endif
     bool ok = true;
     q36_gpu_set_micro_batch(true);
     for (uint32_t il = 0; ok && il < Q36_N_LAYER; il++) {
@@ -8806,10 +8879,19 @@ static bool q36_vulkan_replay_recurrent(q36_session *s, uint32_t n_tok) {
                     (hist - n_tok) * row_bytes);
         if (ok) ok = q36_gpu_tensor_copy(rt->recurrent[il].conv,
                           (hist - tail) * row_bytes, rows[0],
-                          (n_tok - tail) * row_bytes, tail * row_bytes) &&
-                     q36_gpu_delta_net_decode_tensor(rt->recurrent[il].state,
+                          (n_tok - tail) * row_bytes, tail * row_bytes);
+        if (ok) {
+#ifndef Q36_METAL
+            ok = q36_gpu_delta_net_decode_from_tensor(rt->recurrent[il].state,
+                          rt->spec_recurrent[il].state,
+                          rows[1], rows[2], rows[3], rows[4], rt->recur_proj,
+                          Q36_N_SSM_DT_RANK, Q36_N_SSM_STATE, n_tok, false);
+#else
+            ok = q36_gpu_delta_net_decode_tensor(rt->recurrent[il].state,
                           rows[1], rows[2], rows[3], rows[4], rt->recur_proj,
                           Q36_N_SSM_DT_RANK, Q36_N_SSM_STATE, n_tok);
+#endif
+        }
         for (unsigned i = 0; i < 5; i++) q36_gpu_tensor_free(rows[i]);
     }
     q36_gpu_set_micro_batch(false);

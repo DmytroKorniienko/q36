@@ -103,6 +103,8 @@ VULKAN_SHADERS := \
 	vulkan/delta_net_decode_reg.spv \
 	vulkan/delta_net_decode_reg_f16.spv \
 	vulkan/delta_net_verify_reg_f16.spv \
+	vulkan/delta_net_verify_from.spv \
+	vulkan/delta_net_verify_from_f16.spv \
 	vulkan/attn_scores.spv \
 	vulkan/attn_post.spv \
 	vulkan/attn_reduce.spv \
@@ -426,6 +428,12 @@ vulkan/delta_net_decode_reg_f16.spv: vulkan/delta_net_decode_reg.comp
 
 vulkan/delta_net_verify_reg_f16.spv: vulkan/delta_net_decode_reg.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_STATE_F16=1 -DQ36_MTP_VERIFY=1 -o $@ $<
+
+vulkan/delta_net_verify_from.spv: vulkan/delta_net_decode_reg.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_STATE_SOURCE=1 -o $@ $<
+
+vulkan/delta_net_verify_from_f16.spv: vulkan/delta_net_decode_reg.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_STATE_SOURCE=1 -DQ36_STATE_F16=1 -DQ36_MTP_VERIFY=1 -o $@ $<
 
 vulkan/attn_decode_fused.spv: vulkan/attn_decode_fused.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<

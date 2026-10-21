@@ -571,6 +571,21 @@ int q36_gpu_delta_net_gates_tensor(
 
 /* q36_delta_net_decode(): n_tok recurrent state updates + readouts, applied
  * strictly in token order. */
+#ifndef Q36_METAL
+/* Preserve initial state; readout=false permits omitting unused outputs. */
+int q36_gpu_delta_net_decode_from_tensor(
+    q36_gpu_tensor *state,
+    const q36_gpu_tensor *initial,
+    const q36_gpu_tensor *q,
+    const q36_gpu_tensor *k,
+    const q36_gpu_tensor *v,
+    const q36_gpu_tensor *gb,
+    q36_gpu_tensor *out,
+    uint32_t n_heads,
+    uint32_t state_dim,
+    uint32_t n_tok,
+    bool readout);
+#endif
 int q36_gpu_delta_net_decode_tensor(
         q36_gpu_tensor       *state,
         const q36_gpu_tensor *q,
