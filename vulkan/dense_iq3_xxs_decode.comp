@@ -7,7 +7,11 @@
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 
-layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+#ifndef Q36_WAVES
+#define Q36_WAVES 1
+#endif
+/* Independent 64-lane rows share the grid while keeping fewer values live. */
+layout(local_size_x = 64 * Q36_WAVES, local_size_y = 1, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) readonly buffer Weights { uint16_t wh[]; };
 layout(set = 0, binding = 1) readonly buffer Q8K { uint q8[]; };
@@ -68,16 +72,17 @@ int signed_bytes(uint grid, uint signs) {
 }
 
 void main(void) {
-    uint lid = gl_LocalInvocationID.x;
+    uint lid = gl_LocalInvocationID.x & 63u;
     uint itid = lid & 7u;
-    uint first_row = gl_WorkGroupID.x * ROWS;
+    uint first_row = (gl_WorkGroupID.x * Q36_WAVES +
+                      gl_LocalInvocationID.x / 64u) * ROWS;
     float acc[N_TOKENS][ROWS];
     UNROLL for (uint t = 0u; t < N_TOKENS; t++)
         UNROLL for (uint r = 0u; r < ROWS; r++) acc[t][r] = 0.0;
-    UNROLL for (uint i = lid; i < 256u; i += 64u)
+    UNROLL for (uint i = gl_LocalInvocationID.x; i < 256u; i += 64u * Q36_WAVES)
         grid_lut[i] = tables[TAB_IQ3XXS_GRID + i];
     /* Build each byte mask once instead of spreading signs for every grid. */
-    if (lid < 16u) {
+    if (gl_LocalInvocationID.x < 16u) {
         uint bits = (lid * 0x00204081u) & 0x01010101u;
         sign_lut[lid] = uvec2(bits * 255u, bits);
     }

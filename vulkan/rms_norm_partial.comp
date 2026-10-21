@@ -1,4 +1,5 @@
 #version 460
+#extension GL_EXT_control_flow_attributes : require
 
 layout(local_size_x = 32) in;
 layout(binding = 0) readonly buffer A { float a[]; };
@@ -7,20 +8,32 @@ layout(binding = 2) writeonly buffer Sum { float s[]; };
 layout(binding = 3) writeonly buffer Partial { double partial[]; };
 layout(push_constant) uniform Push { uint n; uint has_weight; float eps; } pc;
 
+void add_square(uint base, uint i, inout double ss) {
+#ifdef Q36_ADD
+    float v = a[base + i] + b[base + i];
+    s[base + i] = v;
+#else
+    float v = a[base + i];
+#endif
+    ss += double(v) * double(v);
+}
+
 /* Eight groups share the original 256 strided sums. Each lane keeps its
  * serial FP64 accumulation, while small decode batches occupy more CUs. */
 void main(void) {
     uint lid = gl_WorkGroupID.x * 32u + gl_LocalInvocationID.x;
     uint row = gl_WorkGroupID.y, base = row * pc.n;
     double ss = 0.0;
-    for (uint i = lid; i < pc.n; i += 256u) {
-#ifdef Q36_ADD
-        float v = a[base + i] + b[base + i];
-        s[base + i] = v;
-#else
-        float v = a[base + i];
-#endif
-        ss += double(v) * double(v);
+    /* Fixed widths remove serial loop overhead without changing any sum. */
+    if (pc.n == 5120u) {
+        [[unroll]] for (uint k = 0u; k < 20u; k++)
+            add_square(base, lid + 256u * k, ss);
+    } else if (pc.n == 4096u) {
+        [[unroll]] for (uint k = 0u; k < 16u; k++)
+            add_square(base, lid + 256u * k, ss);
+    } else {
+        for (uint i = lid; i < pc.n; i += 256u)
+            add_square(base, i, ss);
     }
     partial[row * 256u + lid] = ss;
 }

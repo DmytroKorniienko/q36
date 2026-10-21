@@ -3172,6 +3172,10 @@ int q36_gpu_init(void) {
     q36_vk.have_storage8 = storage8_query.storageBuffer8BitAccess != 0;
     q36_vk.have_f16 = q36_vk.have_storage16 && f16_query.shaderFloat16;
     q36_vk.have_int_dot = int_dot_query.shaderIntegerDotProduct != 0;
+    if (!q36_vk.have_int_dot || !q36_vk.have_f16) {
+        q36_vk.dense_extra_decode.path = "vulkan/dense_extra_decode_float.spv";
+        q36_vk.dense_iq2_s_decode.path = "vulkan/dense_iq2_s_decode_float.spv";
+    }
     q36_vk.subgroup_size_control = subgroup_size_query.subgroupSizeControl &&
         subgroup_size_query.computeFullSubgroups &&
         subgroup_size_props.minSubgroupSize <= 32u &&

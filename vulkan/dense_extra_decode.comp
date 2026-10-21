@@ -64,7 +64,7 @@ const uint TAB_IQ2S = 544u;
 const uint TAB_IQ1S = 3360u;
 const uint TAB_IQ2XS = 7456u;
 
-#if Q36_TOKENS > 1 && defined(Q36_TYPE) && (Q36_TYPE == 16 || Q36_TYPE == 17 || Q36_TYPE == 22)
+#if !defined(Q36_TYPE) || Q36_TYPE == 16 || Q36_TYPE == 17 || Q36_TYPE == 22
 #define Q36_SIGN_LUT
 shared uvec2 sign_lut[16];
 
@@ -120,12 +120,12 @@ int signed_bytes(uint word, uint signs) {
 #endif
 }
 
-float grid_dot(uint word, uint signs, uint bit0, vec4 q) {
-#if Q36_TOKENS > 1
-    int w = signed_bytes(word, signs >> bit0);
-    return float(dotPacked4x8EXT(w, pack32(i8vec4(q))));
+/* Byte products sum exactly before the original per-grid float scales. */
+float grid_dot(uint word, uint signs, uint bit0, int q) {
+#if Q36_TOKENS > 1 || defined(Q36_INT_DOT)
+    return float(dotPacked4x8EXT(signed_bytes(word, signs >> bit0), q));
 #else
-    return dot(signed_grid(word, signs, bit0), q);
+    return dot(unpack_i8(uint(signed_bytes(word, signs >> bit0))), unpack_i8(uint(q)));
 #endif
 }
 
@@ -206,7 +206,7 @@ vec4 dequant_word(uint row, uint qb, uint word) {
     return d * v;
 }
 
-float block_dot(uint row, uint qb, uint group, vec4 qv[8]) {
+float block_dot(uint row, uint qb, uint group, int qv[8]) {
     uint base = row * pc.row_bytes;
     float sum = 0.0;
     float d;
@@ -260,8 +260,8 @@ float block_dot(uint row, uint qb, uint group, vec4 qv[8]) {
         UNROLL for (uint l = 0u; l < 4u; l++) {
             uint entry = load_u8(base + 2u + 4u * group + l) |
                          (((qh >> (3u * l)) & 7u) << 8u);
-            sum += dot(unpack_i8(tables[TAB_IQ1S + entry * 2u]) + delta, qv[2u * l]);
-            sum += dot(unpack_i8(tables[TAB_IQ1S + entry * 2u + 1u]) + delta, qv[2u * l + 1u]);
+            sum += dot(unpack_i8(tables[TAB_IQ1S + entry * 2u]) + delta, unpack_i8(uint(qv[2u * l])));
+            sum += dot(unpack_i8(tables[TAB_IQ1S + entry * 2u + 1u]) + delta, unpack_i8(uint(qv[2u * l + 1u])));
         }
         return d * sum;
     }
@@ -275,7 +275,7 @@ float block_dot(uint row, uint qb, uint group, vec4 qv[8]) {
                       iq4_value((packed >> (shift + 8u)) & 15u),
                       iq4_value((packed >> (shift + 16u)) & 15u),
                       iq4_value((packed >> (shift + 24u)) & 15u));
-        sum += dot(v, qv[i]);
+        sum += dot(v, unpack_i8(uint(qv[i])));
     }
     return d * sum;
 }
@@ -382,6 +382,9 @@ void main(void) {
 }
 #else
 void main(void) {
+#ifdef Q36_SIGN_LUT
+    init_signs();
+#endif
     uint lid = gl_LocalInvocationID.x;
     uint lane8 = lid & 7u;
     uint first_row = gl_WorkGroupID.x * ROWS;
@@ -394,8 +397,8 @@ void main(void) {
             uint token_offset = t * pc.blocks * Q8K_WORDS;
             uint qbase = b * Q8K_WORDS + 2u + 8u * lane8;
             float yd = uintBitsToFloat(q8[token_offset + b * Q8K_WORDS]);
-            vec4 qv[8];
-            UNROLL for (uint i = 0u; i < 8u; i++) qv[i] = unpack_i8(q8[token_offset + qbase + i]);
+            int qv[8];
+            UNROLL for (uint i = 0u; i < 8u; i++) qv[i] = int(q8[token_offset + qbase + i]);
             UNROLL for (uint r = 0u; r < ROWS; r++) {
                 uint row = first_row + r;
                 if (row >= pc.out_dim) continue;
