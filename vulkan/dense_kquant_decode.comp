@@ -221,6 +221,12 @@ vec4 unpack_i8(uint v) {
 }
 
 #if Q36_TOKENS == 1
+#ifdef Q36_INT_DOT
+#define SCALAR_UNROLL [[unroll]]
+#else
+#define SCALAR_UNROLL
+#endif
+
 void main(void) {
     uint lid = gl_LocalInvocationID.x;
     uint itid = lid & 15u;
@@ -233,19 +239,31 @@ void main(void) {
     }
 #endif
     float acc[ROWS];
-    for (uint r = 0u; r < ROWS; r++) acc[r] = 0.0;
+    SCALAR_UNROLL for (uint r = 0u; r < ROWS; r++) acc[r] = 0.0;
 
-    for (uint b = lid >> 4u; b < pc.blocks; b += 4u) {
+    SCALAR_UNROLL for (uint b = lid >> 4u; b < pc.blocks; b += 4u) {
+#ifdef Q36_INT_DOT
+        int qvec[4];
+        SCALAR_UNROLL for (uint i = 0u; i < 4u; i++)
+            qvec[i] = int(q8[b * Q8K_WORDS + 2u + 4u * itid + i]);
+#else
         vec4 qvec[4];
-        for (uint i = 0u; i < 4u; i++)
+        SCALAR_UNROLL for (uint i = 0u; i < 4u; i++)
             qvec[i] = unpack_i8(q8[b * Q8K_WORDS + 2u + 4u * itid + i]);
+#endif
         float qsum = 0.0;
         if (QTYPE == Q4_K || QTYPE == Q5_K || QTYPE == Q6_K) {
-            for (uint i = 0u; i < 4u; i++)
+#ifdef Q36_INT_DOT
+            /* Q8_K stores the exact sum of these sixteen activation bytes. */
+            uint sums = q8[b * Q8K_WORDS + 66u + (itid >> 1u)];
+            qsum = float(bitfieldExtract(int(sums), int((itid & 1u) * 16u), 16));
+#else
+            SCALAR_UNROLL for (uint i = 0u; i < 4u; i++)
                 qsum += qvec[i].x + qvec[i].y + qvec[i].z + qvec[i].w;
+#endif
         }
         float yd = uintBitsToFloat(q8[b * Q8K_WORDS]);
-        for (uint r = 0u; r < ROWS; r++) {
+        SCALAR_UNROLL for (uint r = 0u; r < ROWS; r++) {
             uint row = first_row + r;
 #if Q36_BOUNDS
             if (row >= pc.out_dim) continue;
@@ -257,14 +275,18 @@ void main(void) {
                 uint mn;
                 k4_scale_min(base, group, sc, mn);
                 float qdot = 0.0;
-                for (uint i = 0u; i < 4u; i++) {
+                SCALAR_UNROLL for (uint i = 0u; i < 4u; i++) {
                     uint idx = 16u * itid + 4u * i;
                     uint ql = load_u32(base + 16u + (group >> 1u) * 32u +
                                        (idx & 31u));
                     uint packed = (group & 1u) == 0u ?
                         ql & 0x0f0f0f0fu : (ql >> 4u) & 0x0f0f0f0fu;
+#ifdef Q36_INT_DOT
+                    qdot += float(dotPacked4x8EXT(int(packed), qvec[i]));
+#else
                     vec4 xv = qvec[i];
                     qdot += dot(unpack_i8(packed), xv);
+#endif
                 }
                 float part = load_f16(base) * float(sc) * qdot -
                              load_f16(base + 2u) * float(mn) * qsum;
@@ -279,11 +301,16 @@ void main(void) {
                 uint shift = 2u * (group >> 1u);
                 uint m = 1u << (half_id * 4u + (group >> 1u));
                 float qdot = 0.0;
-                for (uint i = 0u; i < 4u; i++) {
+                SCALAR_UNROLL for (uint i = 0u; i < 4u; i++) {
                     uint idx = 16u * itid + 4u * i;
                     uint qs = (load_u32(base + 32u + half_id * 32u + (idx & 31u)) >> shift) &
                               0x03030303u;
                     uint hm = load_u32(base + (idx & 31u));
+#ifdef Q36_INT_DOT
+                    uint negative = ((hm >> (half_id * 4u + (group >> 1u))) & 0x01010101u) ^ 0x01010101u;
+                    uint packed = qs | (negative * 252u);
+                    qdot += float(dotPacked4x8EXT(int(packed), qvec[i]));
+#else
                     vec4 wv = vec4(float(qs & 255u), float((qs >> 8u) & 255u),
                                    float((qs >> 16u) & 255u), float(qs >> 24u)) -
                         4.0 * vec4((hm & (m << 0u)) != 0u ? 0.0 : 1.0,
@@ -291,6 +318,7 @@ void main(void) {
                                    (hm & (m << 16u)) != 0u ? 0.0 : 1.0,
                                    (hm & (m << 24u)) != 0u ? 0.0 : 1.0);
                     qdot += dot(wv, qvec[i]);
+#endif
                 }
                 acc[r] = fma(yd * load_f16(base + 108u) * float(sc), qdot, acc[r]);
                 continue;
@@ -302,7 +330,7 @@ void main(void) {
                 uint mn;
                 k4_scale_min(base, group, sc, mn);
                 float qdot = 0.0;
-                for (uint i = 0u; i < 4u; i++) {
+                SCALAR_UNROLL for (uint i = 0u; i < 4u; i++) {
                     uint idx = 16u * itid + 4u * i;
                     uint ql = load_u32(base + 48u + (group >> 1u) * 32u +
                                        (idx & 31u));
@@ -310,7 +338,11 @@ void main(void) {
                         ql & 0x0f0f0f0fu : (ql >> 4u) & 0x0f0f0f0fu;
                     uint qh = load_u32(base + 16u + (idx & 31u));
                     uint packed = low | (((qh >> group) & 0x01010101u) << 4u);
+#ifdef Q36_INT_DOT
+                    qdot += float(dotPacked4x8EXT(int(packed), qvec[i]));
+#else
                     qdot += dot(unpack_i8(packed), qvec[i]);
+#endif
                 }
                 float part = load_f16(base) * float(sc) * qdot -
                              load_f16(base + 2u) * float(mn) * qsum;
@@ -320,7 +352,7 @@ void main(void) {
             if (QTYPE == Q6_K) {
                 uint base = row * pc.row_bytes + 210u * b;
                 float qdot = 0.0;
-                for (uint i = 0u; i < 4u; i++) {
+                SCALAR_UNROLL for (uint i = 0u; i < 4u; i++) {
                     uint idx = 16u * itid + 4u * i;
                     uint half_block = idx >> 7u;
                     uint in_idx = idx & 127u;
@@ -334,11 +366,15 @@ void main(void) {
                                            (ql >> 4u) & 0x0f0f0f0fu;
                     uint packed = low |
                         (((qh >> (2u * sel)) & 0x03030303u) << 4u);
+#ifdef Q36_INT_DOT
+                    qdot += float(dotPacked4x8EXT(int(packed), qvec[i]));
+#else
                     vec4 xv = qvec[i];
                     qdot += dot(vec4(float(packed & 255u),
                                      float((packed >> 8u) & 255u),
                                      float((packed >> 16u) & 255u),
                                      float(packed >> 24u)), xv);
+#endif
                 }
                 float part = load_f16(base + 208u) *
                              float(load_i8(base + 192u + itid)) *
@@ -347,14 +383,18 @@ void main(void) {
                 continue;
             }
             float part = 0.0;
-            for (uint i = 0u; i < 4u; i++)
+            SCALAR_UNROLL for (uint i = 0u; i < 4u; i++)
                 part += dot(dequant_word(row, b, 4u * itid + i),
+#ifdef Q36_INT_DOT
+                            unpack_i8(uint(qvec[i])));
+#else
                             qvec[i]);
+#endif
             acc[r] = fma(yd, part, acc[r]);
         }
     }
 
-    for (uint r = 0u; r < ROWS; r++) {
+    SCALAR_UNROLL for (uint r = 0u; r < ROWS; r++) {
         float total = subgroupAdd(acc[r]);
         uint row = first_row + r;
         if (lid == 0u

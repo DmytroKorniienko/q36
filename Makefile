@@ -128,6 +128,7 @@ VULKAN_SHADERS := \
 	vulkan/top2.spv \
 	vulkan/mtp_head_mask.spv \
 	vulkan/mtp_head_q5k.spv \
+	vulkan/mtp_head_q5k_dot.spv \
 	vulkan/moe_gate_up_f32b.spv \
 	vulkan/moe_gate_up_decode.spv \
 	vulkan/moe_down_q2k_f32b.spv \
@@ -150,6 +151,7 @@ VULKAN_SHADERS := \
 	vulkan/dense_iq3_s_decode.spv \
 	vulkan/dense_iq3_s_decode_full.spv \
 	vulkan/dense_iq3_s_decode_r4.spv \
+	vulkan/dense_iq3_s_decode_r8.spv \
 	vulkan/dense_iq3_s_verify.spv \
 	vulkan/dense_iq3_s_decode_r1.spv \
 	vulkan/dense_iq3_s_mmq.spv \
@@ -201,11 +203,15 @@ VULKAN_SHADERS := \
 	vulkan/dense_q5k_verify.spv \
 	vulkan/dense_q6k_verify.spv \
 	vulkan/dense_kquant_decode_r2.spv \
+	vulkan/dense_q6k_decode_dot.spv \
 	vulkan/dense_q5k_decode_r1.spv \
 	vulkan/dense_q4k_decode_r1.spv \
 	vulkan/dense_q3k_decode.spv \
+	vulkan/dense_q3k_decode_dot.spv \
 	vulkan/dense_q4k_decode.spv \
+	vulkan/dense_q4k_decode_dot.spv \
 	vulkan/dense_q5k_decode.spv \
+	vulkan/dense_q5k_decode_dot.spv \
 	vulkan/moe_reduce.spv \
 	vulkan/ffn_tail.spv
 
@@ -280,6 +286,9 @@ vulkan/dense_iq3_s_verify.spv: vulkan/dense_iq3_s_decode.comp q36_iq3s_grid_valu
 
 vulkan/dense_iq3_s_decode_r4.spv: vulkan/dense_iq3_s_decode.comp q36_iq3s_grid_values.inc
 	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_ROWS=4 -DQ36_BOUNDS=0 -o $@ $<
+
+vulkan/dense_iq3_s_decode_r8.spv: vulkan/dense_iq3_s_decode.comp q36_iq3s_grid_values.inc
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_ROWS=8 -o $@ $<
 
 vulkan/dense_iq3_s_decode_r1.spv: vulkan/dense_iq3_s_decode.comp q36_iq3s_grid_values.inc
 	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_ROWS=1 -DQ36_BOUNDS=0 -o $@ $<
@@ -382,6 +391,21 @@ vulkan/dense_q4k_decode.spv: vulkan/dense_kquant_decode.comp
 
 vulkan/dense_q5k_decode.spv: vulkan/dense_kquant_decode.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_Q5K_ONLY=1 -DQ36_BOUNDS=0 -o $@ $<
+
+vulkan/dense_q3k_decode_dot.spv: vulkan/dense_kquant_decode.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_INT_DOT=1 -DQ36_Q3K_ONLY=1 -DQ36_ROWS=2 -DQ36_BOUNDS=0 -o $@ $<
+
+vulkan/dense_q4k_decode_dot.spv: vulkan/dense_kquant_decode.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_INT_DOT=1 -DQ36_Q4K_ONLY=1 -DQ36_BOUNDS=0 -o $@ $<
+
+vulkan/dense_q5k_decode_dot.spv: vulkan/dense_kquant_decode.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_INT_DOT=1 -DQ36_Q5K_ONLY=1 -DQ36_BOUNDS=0 -o $@ $<
+
+vulkan/dense_q6k_decode_dot.spv: vulkan/dense_kquant_decode.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_INT_DOT=1 -DQ36_Q6K_ONLY=1 -DQ36_ROWS=2 -DQ36_BOUNDS=0 -o $@ $<
+
+vulkan/mtp_head_q5k_dot.spv: vulkan/dense_kquant_decode.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_INT_DOT=1 -DQ36_Q5K_ONLY=1 -DQ36_HEAD_MASK=1 -o $@ $<
 
 vulkan/matmul_q8_0_f32b.spv: vulkan/matmul_q8_0_f32b.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<

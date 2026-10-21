@@ -257,6 +257,7 @@ typedef struct {
     q36_vk_kernel dense_iq3_s_decode_batch[7];
     q36_vk_kernel dense_iq3_s_decode_full;
     q36_vk_kernel dense_iq3_s_decode_r4;
+    q36_vk_kernel dense_iq3_s_decode_r8;
     q36_vk_kernel dense_iq3_s_decode_r1;
     q36_vk_kernel dense_iq3_s_mmq;
     q36_vk_kernel dense_iq3_s_bm96_mmq;
@@ -2939,6 +2940,7 @@ int q36_gpu_init(void) {
     q36_vk.dense_iq3_s_decode = Q36_VK_KERNEL("vulkan/dense_iq3_s_decode.spv", 4, 16, 1u << 2);
     q36_vk.dense_iq3_s_decode_full = Q36_VK_KERNEL("vulkan/dense_iq3_s_decode_full.spv", 4, 16, 1u << 2);
     q36_vk.dense_iq3_s_decode_r4 = Q36_VK_KERNEL("vulkan/dense_iq3_s_decode_r4.spv", 4, 16, 1u << 2);
+    q36_vk.dense_iq3_s_decode_r8 = Q36_VK_KERNEL("vulkan/dense_iq3_s_decode_r8.spv", 4, 16, 1u << 2);
     q36_vk.dense_iq3_s_decode_r1 = Q36_VK_KERNEL("vulkan/dense_iq3_s_decode_r1.spv", 4, 16, 1u << 2);
     q36_vk.dense_iq3_s_mmq = Q36_VK_KERNEL("vulkan/dense_iq3_s_mmq.spv", 5, 20, 1u << 2);
     q36_vk.dense_iq3_s_bm96_mmq = Q36_VK_KERNEL("vulkan/dense_iq3_s_bm96_mmq.spv", 5, 20, 1u << 2);
@@ -3175,6 +3177,13 @@ int q36_gpu_init(void) {
     if (!q36_vk.have_int_dot || !q36_vk.have_f16) {
         q36_vk.dense_extra_decode.path = "vulkan/dense_extra_decode_float.spv";
         q36_vk.dense_iq2_s_decode.path = "vulkan/dense_iq2_s_decode_float.spv";
+    }
+    if (q36_vk.bc250 && q36_vk.have_int_dot && q36_vk.have_f16) {
+        q36_vk.dense_q3k_decode.path = "vulkan/dense_q3k_decode_dot.spv";
+        q36_vk.dense_q4k_decode.path = "vulkan/dense_q4k_decode_dot.spv";
+        q36_vk.dense_q5k_decode.path = "vulkan/dense_q5k_decode_dot.spv";
+        q36_vk.dense_kquant_decode_r2.path = "vulkan/dense_q6k_decode_dot.spv";
+        q36_vk.mtp_head_q5k.path = "vulkan/mtp_head_q5k_dot.spv";
     }
     q36_vk.subgroup_size_control = subgroup_size_query.subgroupSizeControl &&
         subgroup_size_query.computeFullSubgroups &&
@@ -3424,6 +3433,7 @@ void q36_gpu_cleanup(void) {
     q36_vk_kernel_destroy(&q36_vk.dense_q4k_decode);
     q36_vk_kernel_destroy(&q36_vk.dense_q5k_decode);
     q36_vk_kernel_destroy(&q36_vk.dense_iq3_s_decode_r4);
+    q36_vk_kernel_destroy(&q36_vk.dense_iq3_s_decode_r8);
     q36_vk_kernel_destroy(&q36_vk.dense_iq3_s_decode_r1);
     q36_vk_kernel_destroy(&q36_vk.dense_iq3_s_decode_full);
     q36_vk_kernel_destroy(&q36_vk.dense_iq3_s_decode);
@@ -3875,6 +3885,7 @@ static void q36_vk_prepare_dense_kernels(void) {
         &q36_vk.dense_iq3_s_decode_full,
         &q36_vk.dense_iq3_s_decode_r1,
         &q36_vk.dense_iq3_s_decode_r4,
+        &q36_vk.dense_iq3_s_decode_r8,
         &q36_vk.dense_iq3_xxs_decode_r4,
         &q36_vk.dense_q4k_decode,
         &q36_vk.dense_kquant_decode,
@@ -5220,16 +5231,19 @@ int q36_gpu_matmul_k_quant_q8_scaled_tensor(q36_gpu_tensor *out,
                            out_dim % 4u == 0u;
             bool q5_full = weight_type == Q36_VK_TENSOR_Q5_K &&
                            out_dim % 4u == 0u;
+            bool dot_decode = q36_vk.bc250 && q36_vk.have_int_dot && q36_vk.have_f16;
             q36_vk_kernel *kernel = q4_full ? &q36_vk.dense_q4k_decode :
                                    q5_full ? &q36_vk.dense_q5k_decode :
                                              &q36_vk.dense_kquant_decode;
             uint32_t rows = 4u;
             if (weight_type == Q36_VK_TENSOR_Q3_K && out_dim % 4u == 0u) {
                 kernel = &q36_vk.dense_q3k_decode;
+                if (dot_decode) rows = 2u;
             } else if ((q4_full || q5_full) && in_dim <= 5120u && out_dim <= 1024u) {
                 kernel = q4_full ? &q36_vk.dense_q4k_decode_r1 : &q36_vk.dense_q5k_decode_r1;
                 rows = 1u;
-            } else if (weight_type == Q36_VK_TENSOR_Q6_K && in_dim <= 5120u && out_dim % 2u == 0u) {
+            } else if (weight_type == Q36_VK_TENSOR_Q6_K && out_dim % 2u == 0u &&
+                       (in_dim <= 5120u || dot_decode)) {
                 kernel = &q36_vk.dense_kquant_decode_r2;
                 rows = 2u;
             }
@@ -8248,6 +8262,9 @@ int q36_gpu_matmul_iq_quant_q8_scaled_tensor(q36_gpu_tensor *out,
                 };
                 bool rows1 = weight_type == Q36_VK_TENSOR_IQ3_S &&
                              out_dim == 48u;
+                /* Eight outputs amortize the grid and wider Q8 input loads. */
+                bool rows8 = q36_vk.bc250 && weight_type == Q36_VK_TENSOR_IQ3_S &&
+                             out_dim == 5120u && in_dim >= 5120u;
                 bool rows4 = weight_type == Q36_VK_TENSOR_IQ3_S &&
                              ((out_dim == 5120 && in_dim >= 6144) ||
                               out_dim == 6144 ||
@@ -8260,6 +8277,7 @@ int q36_gpu_matmul_iq_quant_q8_scaled_tensor(q36_gpu_tensor *out,
                     (xxs_rows4 ? &q36_vk.dense_iq3_xxs_decode_r4 :
                                  &q36_vk.dense_iq3_xxs_decode) :
                     (rows1 ? &q36_vk.dense_iq3_s_decode_r1 :
+                     rows8 ? &q36_vk.dense_iq3_s_decode_r8 :
                      rows4 ? &q36_vk.dense_iq3_s_decode_r4 :
                      full_rows5 ? &q36_vk.dense_iq3_s_decode_full :
                                   &q36_vk.dense_iq3_s_decode);
@@ -8272,6 +8290,7 @@ int q36_gpu_matmul_iq_quant_q8_scaled_tensor(q36_gpu_tensor *out,
                     op,
                     kernel, bindings, &push, sizeof(push),
                     rows1 ? (uint32_t)out_dim :
+                    rows8 ? ((uint32_t)out_dim + 7u) / 8u :
                     rows4 || xxs_rows4 ?
                         ((uint32_t)out_dim + 3u) / 4u :
                         ((uint32_t)out_dim + 4u) / 5u,

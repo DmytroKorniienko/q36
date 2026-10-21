@@ -3188,10 +3188,11 @@ static void test_vulkan_kquant_matvec(void) {
 
 #if !defined(Q36_NO_GPU) && !defined(Q36_METAL)
 static void test_vulkan_decode_one(uint32_t type, uint32_t block_bytes,
-                                  uint32_t in_dim) {
+                                  uint32_t in_dim, uint32_t out_dim) {
     /* An odd padded row count selects the existing generic decode kernel.
      * The first 1024 rows must be identical, including negative scales. */
-    enum { tokens = 1, out_dim = 1024, ref_rows = 1027 };
+    enum { tokens = 1 };
+    const uint32_t ref_rows = out_dim + 3u;
     const uint32_t blocks = in_dim / (type == 20 ? 32u : 256u);
     const size_t ref_bytes = (size_t)tokens * ref_rows * sizeof(float);
     const uint32_t row_bytes = blocks * block_bytes;
@@ -4734,9 +4735,15 @@ static void test_vulkan_kernels(void) {
     const uint32_t decode_types[] = {11, 12, 13, 14, 18, 20, 21, 22},
                    decode_bytes[] = {110, 144, 176, 210, 98, 18, 110, 82};
     for (unsigned i = 0; i < sizeof(decode_types) / sizeof(decode_types[0]); i++) {
-        test_vulkan_decode_one(decode_types[i], decode_bytes[i], 768);
-        test_vulkan_decode_one(decode_types[i], decode_bytes[i], 5120);
+        test_vulkan_decode_one(decode_types[i], decode_bytes[i], 768, 1024);
+        test_vulkan_decode_one(decode_types[i], decode_bytes[i], 5120, 1024);
     }
+    test_vulkan_decode_one(21, 110, 5120, 5120);
+    test_vulkan_decode_one(21, 110, 17408, 5120);
+    test_vulkan_decode_one(12, 144, 5120, 4096);
+    test_vulkan_decode_one(13, 176, 5120, 4096);
+    test_vulkan_decode_one(14, 210, 6144, 4096);
+    test_vulkan_decode_one(14, 210, 17408, 4096);
 #endif
     test_vulkan_small_tiles();
 }
