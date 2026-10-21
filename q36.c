@@ -11840,6 +11840,14 @@ static int q36_session_eval_speculative(q36_session *s, int first_token,
             e->backend == Q36_BACKEND_VULKAN && !e->ssd_streaming &&
             e->mtp_margin <= 0.0f && mtp_cap > 2 &&
             q36_gpu_gdn_front_supported(Q36_N_EMBD, Q36_N_SSM_GROUP, Q36_N_SSM_DT_RANK);
+        /* After an unlikely sampled seed, probe before paying for deep
+         * recursion. Sampling already made these target logits available. */
+        if (confident && s->gpu_top2_valid && s->logits_host_valid &&
+            (uint32_t)first_token < Q36_N_VOCAB) {
+            int top = s->gpu_top2[0];
+            if (top == excluded_id) top = s->gpu_top2[1];
+            if (s->logits[top] - s->logits[first_token] > 1.0f) mtp_cap = 2;
+        }
         start_pos = (uint32_t)s->checkpoint.len;
         if (!q36_session_reserve_kv(s, start_pos + (uint32_t)draft_cap, start_pos)) {
             if (err && errlen) snprintf(err, errlen, "failed to grow MTP KV cache");

@@ -51,6 +51,9 @@ const uint Q8K_WORDS = 74u;
 const uint TAB_IQ3XXS_GRID = 3104u;
 
 shared uint grid_lut[256];
+#if Q36_TOKENS > 1
+shared uvec2 sign_lut[16];
+#endif
 
 uint load_u8(uint off) {
     return (uint(wh[off >> 1u]) >> ((off & 1u) * 8u)) & 255u;
@@ -72,10 +75,12 @@ vec4 unpack_i8(uint v) {
                 float(bitfieldExtract(int(v), 24, 8)));
 }
 
+#if Q36_TOKENS > 1
 int signed_bytes(uint grid, uint signs) {
-    uint bits = ((signs & 15u) * 0x00204081u) & 0x01010101u;
-    return int((grid ^ (bits * 255u)) + bits);
+    uvec2 mask = sign_lut[signs & 15u];
+    return int((grid ^ mask.x) + mask.y);
 }
+#endif
 
 void main(void) {
     uint lid = gl_LocalInvocationID.x;
@@ -86,6 +91,13 @@ void main(void) {
         UNROLL for (uint r = 0u; r < ROWS; r++) acc[t][r] = 0.0;
     UNROLL for (uint i = lid; i < 256u; i += 64u)
         grid_lut[i] = tables[TAB_IQ3XXS_GRID + i];
+#if Q36_TOKENS > 1
+    /* Build each byte mask once instead of spreading signs for every grid. */
+    if (lid < 16u) {
+        uint bits = (lid * 0x00204081u) & 0x01010101u;
+        sign_lut[lid] = uvec2(bits * 255u, bits);
+    }
+#endif
     barrier();
 
     for (uint b = lid >> 3u; b < pc.blocks; b += 8u) {
@@ -150,8 +162,8 @@ void main(void) {
                     uint q = 4u * part + 2u * l;
                     UNROLL for (uint t = 0u; t < N_TOKENS; t++) {
 #if Q36_TOKENS > 1
-                        sum[t] += dotPacked4x8EXT(w0, qv[t][q]) +
-                                  dotPacked4x8EXT(w1, qv[t][q + 1u]);
+                        sum[t] += dotPacked4x8EXT(w0, qv[t][q]);
+                        sum[t] += dotPacked4x8EXT(w1, qv[t][q + 1u]);
 #else
                         vec4 q0 = qv[t][q];
                         vec4 q1 = qv[t][q + 1u];

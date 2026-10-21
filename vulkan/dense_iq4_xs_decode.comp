@@ -74,8 +74,10 @@ vec4 unpack_iq4(uint v, uint shift) {
 
 #if Q36_TOKENS > 1
 int packed_iq4(uint v, uint shift) {
-    uint a = ((v >> shift) & 15u) | (((v >> (shift + 8u)) & 15u) << 4u);
-    uint b = ((v >> (shift + 16u)) & 15u) | (((v >> (shift + 24u)) & 15u) << 4u);
+    uint pairs = (v >> shift) & 0x0f0f0f0fu;
+    pairs |= pairs >> 4u;
+    uint a = pairs & 255u;
+    uint b = (pairs >> 16u) & 255u;
     return int(pair_lut[a] | (pair_lut[b] << 16u));
 }
 #endif
@@ -143,8 +145,8 @@ void main(void) {
 #endif
                 UNROLL for (uint t = 0u; t < N_TOKENS; t++) {
 #if Q36_TOKENS > 1
-                    sum[t] += dotPacked4x8EXT(w0, qv[t][l]) +
-                              dotPacked4x8EXT(w1, qv[t][l + 4u]);
+                    sum[t] += dotPacked4x8EXT(w0, qv[t][l]);
+                    sum[t] += dotPacked4x8EXT(w1, qv[t][l + 4u]);
 #else
                     vec4 q0 = qv[t][l];
                     vec4 q1 = qv[t][l + 4u];

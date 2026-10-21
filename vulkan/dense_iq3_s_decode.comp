@@ -57,6 +57,9 @@ const uint Q8K_WORDS = 74u;
 const uint TAB_IQ3S_GRID = 2592u;
 
 shared uint grid_lut[512];
+#if Q36_TOKENS > 1
+shared uint sign_lut[16];
+#endif
 
 uint load_u8(uint off) {
     return uint(wb[off]);
@@ -80,12 +83,12 @@ vec4 unpack_i8(uint v) {
                 float(bitfieldExtract(int(v), 24, 8)));
 }
 
+#if Q36_TOKENS > 1
 int signed_bytes(uint grid, uint signs) {
-    /* Spread the four sign bits to the low bit of each byte. */
-    uint bits = ((signs & 15u) * 0x00204081u) & 0x01010101u;
-    /* Grid magnitudes are nonzero, so negation cannot carry across bytes. */
-    return int((grid ^ (bits * 255u)) + bits);
+    /* Odd magnitudes negate by toggling every bit except the low bit. */
+    return int(grid ^ sign_lut[signs & 15u]);
 }
+#endif
 
 void main(void) {
     uint lid = gl_LocalInvocationID.x;
@@ -96,6 +99,10 @@ void main(void) {
         UNROLL for (uint r = 0u; r < ROWS; r++) acc[t][r] = 0.0;
     UNROLL for (uint i = lid; i < 512u; i += 64u)
         grid_lut[i] = q36_iq3s_grid[i];
+#if Q36_TOKENS > 1
+    if (lid < 16u)
+        sign_lut[lid] = (((lid * 0x00204081u) & 0x01010101u) * 254u);
+#endif
     barrier();
 
     for (uint b = lid >> 3u; b < pc.blocks; b += 8u) {
@@ -159,8 +166,8 @@ void main(void) {
 #endif
                 UNROLL for (uint t = 0u; t < N_TOKENS; t++) {
 #if Q36_TOKENS > 1
-                    sum[t] += dotPacked4x8EXT(weight0, qv[t][2u * l]) +
-                              dotPacked4x8EXT(weight1, qv[t][2u * l + 1u]);
+                    sum[t] += dotPacked4x8EXT(weight0, qv[t][2u * l]);
+                    sum[t] += dotPacked4x8EXT(weight1, qv[t][2u * l + 1u]);
 #else
                     vec4 q0 = qv[t][2u * l];
                     vec4 q1 = qv[t][2u * l + 1u];
