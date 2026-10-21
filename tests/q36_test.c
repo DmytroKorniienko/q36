@@ -4427,25 +4427,6 @@ done:
 }
 
 static void test_mtp_lookup(void) {
-    q36_mtp_policy policy = {0};
-    for (int phase = 0; phase < 3; phase++) {
-        int winner = phase == 0 ? 2 : phase == 1 ? 4 : 3;
-        int selected = 0;
-        for (int step = 0; step < 256; step++) {
-            int depth = q36_mtp_policy_depth(&policy, 4);
-            TEST_ASSERT(depth >= 2 && depth <= 4);
-            q36_mtp_policy_observe(&policy, depth, depth,
-                                    depth * (depth == winner ? 1.0 : 4.0));
-            if (step >= 160 && depth == winner) selected++;
-        }
-        TEST_ASSERT(selected >= 80);
-    }
-    for (int cap = 1; cap <= 4; cap++) {
-        int depth = q36_mtp_policy_depth(&policy, cap);
-        TEST_ASSERT(depth >= 1 && depth <= cap);
-    }
-    for (int i = 0; i < 3; i++) TEST_ASSERT(policy.samples[i] > 0);
-
     int history[27], ambiguous[43];
     for (int i = 0; i < 12; i++) history[i] = ambiguous[i] = ambiguous[16 + i] = i;
     for (int i = 0; i < 11; i++) history[16 + i] = ambiguous[32 + i] = i;
@@ -7595,6 +7576,12 @@ static void test_think_tool_recovery_live(void) {
     test_close_engine(false);
 }
 
+static bool test_mtp_boundary_after_first(void *ud, int token) {
+    int *calls = ud;
+    (void)token;
+    return ++(*calls) > 1;
+}
+
 static void test_mtp_verifier_replay_sampling(bool sampled) {
     if (test_is_cpu_only_build()) {
         test_skip("mtp-verifier", "MTP requires Vulkan");
@@ -7762,6 +7749,22 @@ static void test_mtp_verifier_replay_sampling(bool sampled) {
     if (min_env) TEST_ASSERT(longest >= atoi(min_env));
     if (draft > 2) TEST_ASSERT(partial > 0);
     int accepted[17];
+    int boundary_calls = 0;
+    int boundary_token = q36_session_argmax(spec);
+    int boundary_n = q36_session_eval_speculative_argmax_with_boundary(spec,
+        boundary_token, 8, -1, accepted, 17,
+        test_mtp_boundary_after_first, &boundary_calls, err, sizeof(err));
+    TEST_ASSERT(boundary_calls >= 2);
+    TEST_ASSERT(boundary_n == 1 && accepted[0] == boundary_token);
+    TEST_ASSERT(q36_session_eval(plain, boundary_token, err, sizeof(err)) == 0);
+    TEST_ASSERT(q36_session_pos(spec) == q36_session_pos(plain));
+    const float *boundary_logits = q36_session_logits(spec, NULL);
+    const float *plain_logits = q36_session_logits(plain, NULL);
+    TEST_ASSERT(boundary_logits && plain_logits);
+    if (boundary_logits && plain_logits) {
+        for (int i = 0; i < q36_qwen35_n_vocab(); i++)
+            TEST_ASSERT(fabsf(boundary_logits[i] - plain_logits[i]) <= 1.0e-6f);
+    }
     int pos = q36_session_pos(spec), first = q36_session_argmax(spec);
     TEST_ASSERT(q36_session_eval_speculative_argmax(spec, first, 0, -1,
         accepted, 17, err, sizeof(err)) == 0);

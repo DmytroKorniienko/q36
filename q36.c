@@ -809,7 +809,6 @@ typedef struct {
     q36_gpu_tensor *mtp_cur;
     q36_gpu_tensor *mtp_logits;
     q36_gpu_tensor *mtp_head_mask;
-    q36_mtp_policy mtp_policy;
     q36_gpu_tensor *mtp_target_h;
     uint32_t spec_row;
     bool mtp_enabled;
@@ -5925,7 +5924,6 @@ static bool q36_vulkan_runtime_reset(q36_vulkan_runtime *rt) {
     uint64_t state_dim = (uint64_t)Q36_N_SSM_STATE * Q36_N_SSM_STATE * Q36_N_SSM_DT_RANK;
     uint64_t state_bytes;
     if (!rt) return false;
-    memset(&rt->mtp_policy, 0, sizeof(rt->mtp_policy));
     state_bytes = state_dim * (rt->recur_state_f16 ? sizeof(uint16_t) : sizeof(float));
     if (!q36_gpu_tensor_zero(rt->hidden) || !q36_gpu_tensor_zero(rt->next_hidden)) return false;
     if (rt->last_h && !q36_gpu_tensor_zero(rt->last_h)) return false;
@@ -9017,8 +9015,7 @@ static bool q36_mtp_pick(q36_session *s, int excluded_id, int *token, float *mar
         if (!q36_gpu_tensor_read(rt->top2, 0, ids, sizeof(ids)) || ids[0] < 0 || ids[1] < 0)
             return false;
         *token = ids[0];
-        *margin = 0.0f;
-        if (s->engine->mtp_margin > 0.0f) {
+        if (margin) {
             for (unsigned i = 0; i < 2; i++)
                 if (!q36_gpu_tensor_read(rt->mtp_logits, (uint64_t)ids[i] * sizeof(float),
                                           values + i, sizeof(float))) return false;
@@ -11787,6 +11784,7 @@ int q36_sessions_eval_batch_with_prefill(
 static int q36_session_eval_speculative(q36_session *s, int first_token,
                                         int max_tokens, int eos_token, int excluded_id,
                                         int *accepted, int accepted_cap,
+                                        q36_token_boundary_fn boundary, void *ud,
                                         char *err, size_t errlen) {
     q36_engine *e;
     if (!s || !accepted || accepted_cap <= 0 || max_tokens <= 0) return 0;
@@ -11822,7 +11820,8 @@ static int q36_session_eval_speculative(q36_session *s, int first_token,
         if (draft_cap > max_tokens) draft_cap = max_tokens;
         if (draft_cap > s->ctx_size - s->checkpoint.len) draft_cap = s->ctx_size - s->checkpoint.len;
         if (draft_cap > (int)rt->prefill_cap) draft_cap = (int)rt->prefill_cap;
-        if (draft_cap <= 1 || first_token == eos_token) {
+        if (draft_cap <= 1 || first_token == eos_token ||
+            (boundary && boundary(ud, first_token))) {
             if (q36_session_eval_internal(s, first_token, err, errlen)) return -1;
             accepted[0] = first_token;
             return 1;
@@ -11835,11 +11834,12 @@ static int q36_session_eval_speculative(q36_session *s, int first_token,
             int depth = atoi(depth_env);
             if (depth >= 2 && depth < mtp_cap) mtp_cap = depth;
         }
-        bool adaptive = !depth_env && Q36_MODEL_DENSE &&
+        /* Follow this prefix's MTP confidence; timing estimates can go stale
+         * when the continuation changes. */
+        bool confident = !depth_env && Q36_MODEL_DENSE &&
             e->backend == Q36_BACKEND_VULKAN && !e->ssd_streaming &&
             e->mtp_margin <= 0.0f && mtp_cap > 2 &&
             q36_gpu_gdn_front_supported(Q36_N_EMBD, Q36_N_SSM_GROUP, Q36_N_SSM_DT_RANK);
-        if (adaptive) mtp_cap = q36_mtp_policy_depth(&rt->mtp_policy, mtp_cap);
         start_pos = (uint32_t)s->checkpoint.len;
         if (!q36_session_reserve_kv(s, start_pos + (uint32_t)draft_cap, start_pos)) {
             if (err && errlen) snprintf(err, errlen, "failed to grow MTP KV cache");
@@ -11848,7 +11848,6 @@ static int q36_session_eval_speculative(q36_session *s, int first_token,
         verify[0] = first_token;
         verify_n = 1;
         prev_token = first_token;
-        double draft_start = adaptive ? q36_now_sec() : 0.0;
         int lookup_n = draft_cap <= 2 || e->mtp_margin > 0.0f || getenv("Q36_MTP_LOOKUP_OFF") ? 0 :
             q36_mtp_lookup(s->checkpoint.v, s->checkpoint.len, first_token, lookup, draft_cap);
         bool used_lookup = false;
@@ -11861,18 +11860,26 @@ static int q36_session_eval_speculative(q36_session *s, int first_token,
                 return -1;
             }
             int token;
-            if (!q36_mtp_pick(s, excluded_id, &token, &margin)) {
+            if (!q36_mtp_pick(s, excluded_id, &token,
+                                confident || e->mtp_margin > 0.0f ? &margin : NULL)) {
                 if (err && errlen) snprintf(err, errlen, "MTP sampling failed at pos %u", start_pos);
                 q36_session_invalidate(s);
                 return -1;
             }
             if (token < 0 || (e->mtp_margin > 0.0f && margin < e->mtp_margin)) break;
+            if (boundary && boundary(ud, token)) break;
+            /* Keep one proposal as a cheap probe of an uncertain prefix. */
+            if (confident && margin < 1.0f) {
+                if (verify_n > 1) break;
+                mtp_cap = 2;
+            }
             verify[verify_n++] = token;
             prev_token = token;
             /* Let MTP confirm the first continuation before reusing its tail. */
             if (verify_n == 2 && lookup_n > 2 && token == lookup[1] && token != eos_token) {
                 for (int i = 2; i < lookup_n; i++) {
-                    if (lookup[i] == excluded_id) break;
+                    if (lookup[i] == excluded_id ||
+                        (boundary && boundary(ud, lookup[i]))) break;
                     verify[verify_n++] = lookup[i];
                     if (lookup[i] == eos_token) break;
                 }
@@ -11937,10 +11944,8 @@ static int q36_session_eval_speculative(q36_session *s, int first_token,
             q36_tokens_push(&s->checkpoint, verify[i]);
         }
         s->checkpoint_valid = true;
-        if (adaptive && !used_lookup && verify_n == mtp_cap)
-            q36_mtp_policy_observe(&rt->mtp_policy, mtp_cap, commit_n,
-                                    q36_now_sec() - draft_start);
-        q36_mtp_stats_add(verify_n - 1, commit_n - 1, commit_n == verify_n, mtp_cap);
+        q36_mtp_stats_add(verify_n - 1, commit_n - 1, commit_n == verify_n,
+                            confident ? verify_n : mtp_cap);
         if (used_lookup && getenv("Q36_MTP_STATS")) {
             q36_mtp_stat_lookup++;
             q36_mtp_stat_lookup_drafted += verify_n - 2;
@@ -11951,6 +11956,8 @@ static int q36_session_eval_speculative(q36_session *s, int first_token,
 #else
     (void)eos_token;
     (void)excluded_id;
+    (void)boundary;
+    (void)ud;
     if (q36_session_eval_internal(s, first_token, err, errlen) != 0) return -1;
     accepted[0] = first_token;
     return 1;
@@ -11962,7 +11969,16 @@ int q36_session_eval_speculative_argmax(q36_session *s, int first_token,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen) {
     return q36_session_eval_speculative(s, first_token, max_tokens, eos_token, -1,
-                                        accepted, accepted_cap, err, errlen);
+                                        accepted, accepted_cap, NULL, NULL, err, errlen);
+}
+
+int q36_session_eval_speculative_argmax_with_boundary(q36_session *s, int first_token,
+                                        int max_tokens, int eos_token,
+                                        int *accepted, int accepted_cap,
+                                        q36_token_boundary_fn boundary, void *ud,
+                                        char *err, size_t errlen) {
+    return q36_session_eval_speculative(s, first_token, max_tokens, eos_token, -1,
+                                        accepted, accepted_cap, boundary, ud, err, errlen);
 }
 
 int q36_session_eval_speculative_argmax_excluding(q36_session *s, int first_token,
@@ -11970,7 +11986,7 @@ int q36_session_eval_speculative_argmax_excluding(q36_session *s, int first_toke
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen) {
     return q36_session_eval_speculative(s, first_token, max_tokens, -1, excluded_id,
-                                        accepted, accepted_cap, err, errlen);
+                                        accepted, accepted_cap, NULL, NULL, err, errlen);
 }
 
 const float *q36_session_logits(q36_session *s, int *n_vocab) {

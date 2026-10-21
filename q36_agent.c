@@ -80,6 +80,7 @@ typedef struct {
     bool top_k_set;
     bool top_p_set;
     bool min_p_set;
+    bool mtp_opportunistic;
 } agent_generation_options;
 
 typedef struct {
@@ -651,8 +652,7 @@ static agent_config parse_options(int argc, char **argv) {
         .engine = {
             .model_path = Q36_DEFAULT_MODEL_PATH,
             .backend = default_backend(),
-            .mtp_draft_tokens = 1,
-            .mtp_margin = 3.0f,
+            .mtp_draft_tokens = Q36_DEFAULT_MTP_DRAFT,
         },
         .gen = {
             .system = "You are a helpful coding assistant running inside q36-agent.",
@@ -671,6 +671,8 @@ static agent_config parse_options(int argc, char **argv) {
     bool ctx_set = false;
     bool cache_type_k_set = false;
     bool cache_type_v_set = false;
+    bool mtp_embedded = false;
+    int mtp_opportunistic = -1;
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
         if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
@@ -705,11 +707,16 @@ static agent_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--vision")) {
             c.engine.vision_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
-            c.engine.mtp_path = need_arg(&i, argc, argv, arg);
+            mtp_embedded = i + 1 >= argc || argv[i + 1][0] == '-';
+            c.engine.mtp_path = mtp_embedded ? NULL : argv[++i];
         } else if (!strcmp(arg, "--mtp-draft")) {
             c.engine.mtp_draft_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mtp-margin")) {
             c.engine.mtp_margin = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1000.0f);
+        } else if (!strcmp(arg, "--mtp-opportunistic")) {
+            mtp_opportunistic = 1;
+        } else if (!strcmp(arg, "--no-mtp-opportunistic")) {
+            mtp_opportunistic = 0;
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
             c.gen.ctx_size = parse_int(need_arg(&i, argc, argv, arg), arg);
             ctx_set = true;
@@ -844,6 +851,13 @@ static agent_config parse_options(int argc, char **argv) {
         }
     }
 
+    if (mtp_embedded) c.engine.mtp_path = c.engine.model_path;
+    c.gen.mtp_opportunistic = mtp_opportunistic < 0 ?
+        c.engine.mtp_path && c.engine.mtp_draft_tokens > 1 : mtp_opportunistic;
+    if (c.gen.mtp_opportunistic && (!c.engine.mtp_path || c.engine.mtp_draft_tokens <= 1)) {
+        fprintf(stderr, "q36-agent: --mtp-opportunistic requires --mtp [FILE] and --mtp-draft > 1\n");
+        exit(2);
+    }
     if (c.engine.directional_steering_file && !steering_scale_set)
         c.engine.directional_steering_ffn = 1.0f;
     if (!ctx_set) {
@@ -7254,6 +7268,34 @@ static void test_agent_thinking_budget_modes(void) {
     AGENT_TEST_ASSERT(cfg.gen.thinking_budget == 8000);
 }
 
+static void test_agent_mtp_options(void) {
+    struct {
+        int argc;
+        char *argv[14];
+        const char *path;
+        int draft;
+        float margin;
+        bool opportunistic;
+    } cases[] = {
+        {1, {"q36-agent"}, NULL, 8, 0, false},
+        {4, {"q36-agent", "--mtp", "-m", "embedded.gguf"}, "embedded.gguf", 8, 0, true},
+        {5, {"q36-agent", "-m", "main.gguf", "--mtp", "head.gguf"}, "head.gguf", 8, 0, true},
+        {9, {"q36-agent", "--mtp-draft", "3", "--mtp-margin", "2", "--no-mtp-opportunistic",
+             "--mtp", "-m", "main.gguf"}, "main.gguf", 3, 2, false},
+        {6, {"q36-agent", "--mtp", "--mtp-draft", "1", "-m", "main.gguf"}, "main.gguf", 1, 0, false},
+        {7, {"q36-agent", "--no-mtp-opportunistic", "--mtp-opportunistic",
+             "--mtp", "head.gguf", "-m", "main.gguf"}, "head.gguf", 8, 0, true},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        agent_config c = parse_options(cases[i].argc, cases[i].argv);
+        AGENT_TEST_ASSERT(c.engine.mtp_path == NULL ? cases[i].path == NULL :
+            cases[i].path && !strcmp(c.engine.mtp_path, cases[i].path));
+        AGENT_TEST_ASSERT(c.engine.mtp_draft_tokens == cases[i].draft);
+        AGENT_TEST_ASSERT(c.engine.mtp_margin == cases[i].margin);
+        AGENT_TEST_ASSERT(c.gen.mtp_opportunistic == cases[i].opportunistic);
+    }
+}
+
 static void test_agent_context_pressure_helpers(void) {
     AGENT_TEST_ASSERT(!agent_context_should_compact(100000, 69999));
     AGENT_TEST_ASSERT(agent_context_should_compact(100000, 70000));
@@ -7387,6 +7429,7 @@ static void q36_agent_unit_tests_run(void) {
     test_agent_edit_upto_prompt_is_opt_in();
     test_agent_tool_error_recovery();
     test_agent_streaming_defaults();
+    test_agent_mtp_options();
     test_agent_thinking_budget_modes();
     test_agent_context_pressure_helpers();
     test_agent_welcome_banner();
@@ -9435,13 +9478,47 @@ static bool agent_stream_generating_tool(const agent_stream_renderer *sr) {
            (sr->qwen_tool_active || sr->qwen_tool_start_len > 1);
 }
 
-static int worker_accept_generated_token(agent_worker *w,
-                                         int token,
-                                         int *generated,
-                                         double t0,
-                                         agent_stream_renderer *stream,
-                                         char *err,
-                                         size_t err_len) {
+static bool agent_mtp_boundary_text(const char *text, size_t len) {
+    return memchr(text, '<', len) || memchr(text, '>', len);
+}
+
+static bool agent_mtp_boundary(void *ud, int token) {
+    q36_engine *engine = ud;
+    if (token == q36_token_eos(engine)) return true;
+    size_t len = 0;
+    char *text = q36_token_text(engine, token, &len);
+    bool boundary = agent_mtp_boundary_text(text, len);
+    free(text);
+    return boundary;
+}
+
+static int agent_mtp_block_limit(const agent_config *cfg,
+                                 const agent_stream_renderer *stream,
+                                 bool in_think, int generated, int remaining,
+                                 bool context_limited) {
+    const agent_qwen_tool_parser *p = stream->parser;
+    /* A partial tag or structural byte may change sampling or steering.
+     * Edit-old shortening and thinking closure must inspect every frontier. */
+    if (stream->pending_len || stream->qwen_tool_start_len ||
+        p->state == AGENT_QWEN_TOOL_STRUCTURAL || p->param_close_prefix ||
+        (cfg->edit_upto && p->state == AGENT_QWEN_TOOL_PARAM_VALUE &&
+         p->current.name && !strcmp(p->current.name, "edit") &&
+         p->param_name && !strcmp(p->param_name, "old")))
+        return 1;
+    int limit = remaining;
+    if (in_think) {
+        int to_close = cfg->gen.thinking_budget - generated;
+        if (to_close <= 0) return 1;
+        if (limit > to_close) limit = to_close;
+        if (!context_limited && limit >= remaining) limit = remaining - 1;
+    }
+    return limit > 0 ? limit : 1;
+}
+
+static int worker_eval_generated_tokens(agent_worker *w, int token, int max_tokens,
+                                        int *tokens, int cap,
+                                        agent_stream_renderer *stream,
+                                        char *err, size_t err_len) {
     /* Steering can change exact copies in tool arguments. Keep it for deciding
      * what to do, then decode the tool stanza without steering.
      * Restore even on failure so interrupts and the next turn keep /steer. */
@@ -9449,13 +9526,30 @@ static int worker_accept_generated_token(agent_worker *w,
     float ffn = q36_session_directional_steering_ffn(w->session);
     bool suspend = (attn != 0 || ffn != 0) && agent_stream_generating_tool(stream);
     if (suspend) q36_session_set_directional_steering(w->session, 0, 0);
-    int rc = q36_session_eval(w->session, token, err, err_len);
+    int n;
+    if (max_tokens > 1 &&
+        (w->cfg->gen.temperature <= 0.0f || w->cfg->gen.mtp_opportunistic) &&
+        q36_engine_mtp_draft_tokens(w->engine) > 1 &&
+        !getenv("Q36_MTP_SPEC_DISABLE")) {
+        int start = q36_session_pos(w->session);
+        n = q36_session_eval_speculative_argmax_with_boundary(w->session,
+            token, max_tokens, q36_token_eos(w->engine), tokens, cap,
+            agent_mtp_boundary, w->engine, err, err_len);
+        if (n > 0) agent_trace(w, "MTP block start=%d tokens=%d", start, n);
+    } else {
+        n = q36_session_eval(w->session, token, err, err_len) == 0 ? 1 : -1;
+        tokens[0] = token;
+    }
     if (suspend) {
         q36_session_set_directional_steering(w->session, attn, ffn);
-        stream->unsteered_tool_tokens++;
+        if (n > 0) stream->unsteered_tool_tokens += n;
     }
-    if (rc != 0) return 1;
+    return n;
+}
 
+static void worker_emit_generated_token(agent_worker *w, int token,
+                                        int *generated, double t0,
+                                        agent_stream_renderer *stream) {
     q36_tokens_push(&w->transcript, token);
 
     size_t text_len = 0;
@@ -9471,6 +9565,19 @@ static int worker_accept_generated_token(agent_worker *w,
     w->status.gen_tps = dt > 0.0 ? (double)*generated / dt : 0.0;
     agent_wake_locked(w);
     pthread_mutex_unlock(&w->mu);
+}
+
+static int worker_accept_generated_token(agent_worker *w,
+                                         int token,
+                                         int *generated,
+                                         double t0,
+                                         agent_stream_renderer *stream,
+                                         char *err,
+                                         size_t err_len) {
+    int accepted;
+    if (worker_eval_generated_tokens(w, token, 1, &accepted, 1,
+                                    stream, err, err_len) != 1) return 1;
+    worker_emit_generated_token(w, accepted, generated, t0, stream);
     return 0;
 }
 
@@ -9824,12 +9931,20 @@ static int worker_run_turn(agent_worker *w, const char *user_text) {
                 }
             } else {
                 free(text);
-                if (worker_accept_generated_token(w, token, &generated, t0,
-                                                  &stream, err, sizeof(err)) != 0) {
+                int tokens[17];
+                int limit = agent_mtp_block_limit(cfg, &stream, in_think,
+                    carried_generation + generated, max_tokens - generated,
+                    context_limited);
+                int n = worker_eval_generated_tokens(w, token, limit,
+                    tokens, (int)(sizeof(tokens) / sizeof(tokens[0])),
+                    &stream, err, sizeof(err));
+                if (n <= 0) {
                     agent_qwen_tool_parser_free(&qwen_tool);
                     agent_set_error(w, err);
                     return 1;
                 }
+                for (int i = 0; i < n; i++)
+                    worker_emit_generated_token(w, tokens[i], &generated, t0, &stream);
             }
 
             greedy_sampling = agent_stream_wants_greedy_sampling(&stream);

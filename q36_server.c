@@ -10503,14 +10503,17 @@ static void usage(FILE *fp) {
         "Model and runtime:\n"
         "  -m, --model FILE\n"
         "      GGUF model path. Default: " Q36_DEFAULT_MODEL_PATH "\n"
-        "  --mtp FILE\n"
-        "      MTP support GGUF, or the same path as -m for an embedded block.\n"
+        "  --mtp [FILE]\n"
+        "      Enable tuned MTP; omit FILE to use the embedded head in -m.\n"
         "  --mtp-draft N\n"
-        "      Maximum autoregressive MTP draft tokens per speculative step. Default: 1\n"
+        "      Maximum autoregressive MTP draft tokens per speculative step. Default: 8\n"
         "  --mtp-opportunistic\n"
-        "      Sample block boundaries and accept greedy tails; changes the sampling distribution.\n"
+        "      Sample block boundaries and accept greedy tails. Default with --mtp.\n"
+        "      This changes the sampling distribution at positive temperature.\n"
+        "  --no-mtp-opportunistic\n"
+        "      Sample every token at positive temperature; keep greedy MTP.\n"
         "  --mtp-margin F\n"
-        "      Minimum recursive-draft confidence for the fast N=2 verifier. Default: 3\n"
+        "      Minimum recursive-draft confidence. Default: 0 (adaptive depth)\n"
         "  -c, --ctx N\n"
         "      Context size allocated at startup. Default: 32768\n"
         "  -ctk, --cache-type-k TYPE\n"
@@ -10641,8 +10644,7 @@ static server_config parse_options(int argc, char **argv) {
         .engine = {
             .model_path = Q36_DEFAULT_MODEL_PATH,
             .backend = default_server_backend(),
-            .mtp_draft_tokens = 1,
-            .mtp_margin = 3.0f,
+            .mtp_draft_tokens = Q36_DEFAULT_MTP_DRAFT,
         },
         .host = "127.0.0.1",
         .port = 8000,
@@ -10656,6 +10658,8 @@ static server_config parse_options(int argc, char **argv) {
     bool directional_steering_scale_set = false;
     bool cache_type_k_set = false;
     bool cache_type_v_set = false;
+    bool mtp_embedded = false;
+    int mtp_opportunistic = -1;
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
         if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
@@ -10666,11 +10670,14 @@ static server_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--vision")) {
             c.engine.vision_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
-            c.engine.mtp_path = need_arg(&i, argc, argv, arg);
+            mtp_embedded = i + 1 >= argc || argv[i + 1][0] == '-';
+            c.engine.mtp_path = mtp_embedded ? NULL : argv[++i];
         } else if (!strcmp(arg, "--mtp-draft")) {
             c.engine.mtp_draft_tokens = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mtp-opportunistic")) {
-            c.mtp_opportunistic = true;
+            mtp_opportunistic = 1;
+        } else if (!strcmp(arg, "--no-mtp-opportunistic")) {
+            mtp_opportunistic = 0;
         } else if (!strcmp(arg, "--mtp-margin")) {
             c.engine.mtp_margin = parse_float_arg(need_arg(&i, argc, argv, arg), arg, 0.0f, 1000.0f);
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
@@ -10785,9 +10792,12 @@ static server_config parse_options(int argc, char **argv) {
             exit(2);
         }
     }
+    if (mtp_embedded) c.engine.mtp_path = c.engine.model_path;
+    c.mtp_opportunistic = mtp_opportunistic < 0 ?
+        c.engine.mtp_path && c.engine.mtp_draft_tokens > 1 && !c.batched_sessions : mtp_opportunistic;
     if (c.mtp_opportunistic && (!c.engine.mtp_path || c.engine.mtp_draft_tokens <= 1 || c.batched_sessions > 0)) {
         server_log(Q36_LOG_DEFAULT,
-                   "q36-server: --mtp-opportunistic requires non-batched --mtp FILE and --mtp-draft > 1");
+                   "q36-server: --mtp-opportunistic requires non-batched --mtp [FILE] and --mtp-draft > 1");
         exit(2);
     }
     if (c.kv_cache.cold_max_tokens > 0 &&
@@ -10824,7 +10834,7 @@ int main(int argc, char **argv) {
 
     server_config cfg = parse_options(argc, argv);
     g_enable_cors = cfg.enable_cors;
-    bool mtp_requested = cfg.engine.mtp_path != NULL || cfg.engine.mtp_draft_tokens > 1;
+    bool mtp_requested = cfg.engine.mtp_path != NULL;
     if (cfg.batched_sessions > 0) {
         cfg.engine.mtp_path = NULL;
         cfg.engine.mtp_draft_tokens = 1;
@@ -14145,6 +14155,33 @@ static void test_server_streaming_options(void) {
     TEST_ASSERT(server_prefill_quantum_for(&s, true) == 64);
 }
 
+static void test_server_mtp_options(void) {
+    struct {
+        int argc;
+        char *argv[14];
+        const char *path;
+        int draft;
+        float margin;
+        bool opportunistic;
+    } cases[] = {
+        {1, {"q36-server"}, NULL, 8, 0, false},
+        {4, {"q36-server", "--mtp", "-m", "embedded.gguf"}, "embedded.gguf", 8, 0, true},
+        {5, {"q36-server", "-m", "main.gguf", "--mtp", "head.gguf"}, "head.gguf", 8, 0, true},
+        {9, {"q36-server", "--mtp-draft", "3", "--mtp-margin", "2", "--no-mtp-opportunistic",
+             "--mtp", "-m", "main.gguf"}, "main.gguf", 3, 2, false},
+        {6, {"q36-server", "--mtp", "--mtp-draft", "1", "-m", "main.gguf"}, "main.gguf", 1, 0, false},
+        {6, {"q36-server", "--mtp", "--batched-session", "4", "-m", "main.gguf"}, "main.gguf", 8, 0, false},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        server_config c = parse_options(cases[i].argc, cases[i].argv);
+        TEST_ASSERT(c.engine.mtp_path == NULL ? cases[i].path == NULL :
+            cases[i].path && !strcmp(c.engine.mtp_path, cases[i].path));
+        TEST_ASSERT(c.engine.mtp_draft_tokens == cases[i].draft);
+        TEST_ASSERT(c.engine.mtp_margin == cases[i].margin);
+        TEST_ASSERT(c.mtp_opportunistic == cases[i].opportunistic);
+    }
+}
+
 static void test_batched_prefill_round_robin(void) {
     server s = {0};
     server_slot slots[4] = {0};
@@ -14437,6 +14474,7 @@ static void q36_server_unit_tests_run(void) {
     test_context_length_error_uses_protocol_standard_shape();
     test_cors_headers_are_opt_in();
     test_server_streaming_options();
+    test_server_mtp_options();
     test_tool_prompt_args_preserve_call_order();
     test_openai_tool_args_preserve_call_order();
     test_anthropic_thinking_and_tool_args_preserve_call_order();

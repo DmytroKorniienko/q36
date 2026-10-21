@@ -51,7 +51,7 @@ const int values[16] = int[16](
     -127, -104, -83, -65, -49, -35, -22, -10,
        1,   13,  25,  38,  53,  69,  89, 113);
 #if Q36_TOKENS > 1
-shared int value_lut[16];
+shared uint pair_lut[256];
 #else
 shared float value_lut[16];
 #endif
@@ -63,19 +63,20 @@ vec4 unpack_i8(uint v) {
                 float(bitfieldExtract(int(v), 24, 8)));
 }
 
+#if Q36_TOKENS == 1
 vec4 unpack_iq4(uint v, uint shift) {
     return vec4(value_lut[(v >> (shift + 0u)) & 15u],
                 value_lut[(v >> (shift + 8u)) & 15u],
                 value_lut[(v >> (shift + 16u)) & 15u],
                 value_lut[(v >> (shift + 24u)) & 15u]);
 }
+#endif
 
 #if Q36_TOKENS > 1
 int packed_iq4(uint v, uint shift) {
-    return (value_lut[(v >> shift) & 15u] & 255) |
-           ((value_lut[(v >> (shift + 8u)) & 15u] & 255) << 8) |
-           ((value_lut[(v >> (shift + 16u)) & 15u] & 255) << 16) |
-           (value_lut[(v >> (shift + 24u)) & 15u] << 24);
+    uint a = ((v >> shift) & 15u) | (((v >> (shift + 8u)) & 15u) << 4u);
+    uint b = ((v >> (shift + 16u)) & 15u) | (((v >> (shift + 24u)) & 15u) << 4u);
+    return int(pair_lut[a] | (pair_lut[b] << 16u));
 }
 #endif
 
@@ -86,13 +87,13 @@ void main(void) {
     float acc[N_TOKENS][ROWS];
     UNROLL for (uint t = 0u; t < N_TOKENS; t++)
         UNROLL for (uint r = 0u; r < ROWS; r++) acc[t][r] = 0.0;
-    if (lid < 16u) {
 #if Q36_TOKENS > 1
-        value_lut[lid] = values[lid];
+    /* A pair per lookup halves LDS reads while constructing the same bytes. */
+    for (uint i = lid; i < 256u; i += 64u)
+        pair_lut[i] = uint(values[i & 15u] & 255) | (uint(values[i >> 4u] & 255) << 8u);
 #else
-        value_lut[lid] = float(values[lid]);
+    if (lid < 16u) value_lut[lid] = float(values[lid]);
 #endif
-    }
     barrier();
 
     for (uint b = lid >> 3u; b < pc.blocks; b += 8u) {

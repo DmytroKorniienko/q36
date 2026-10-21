@@ -67,6 +67,7 @@ typedef struct {
 #define Q36_DEFAULT_TEMPERATURE 1.0f
 #define Q36_DEFAULT_TOP_P 1.0f
 #define Q36_DEFAULT_MIN_P 0.05f
+#define Q36_DEFAULT_MTP_DRAFT 8
 
 typedef struct q36_engine q36_engine;
 typedef struct q36_session q36_session;
@@ -78,6 +79,7 @@ typedef struct {
 
 typedef void (*q36_session_progress_fn)(void *ud, const char *event, int current, int total);
 typedef bool (*q36_session_cancel_fn)(void *ud);
+typedef bool (*q36_token_boundary_fn)(void *ud, int token);
 
 #define Q36_SESSION_SYNC_INTERRUPTED 2
 
@@ -330,6 +332,13 @@ int q36_sessions_eval_batch_with_prefill(
 int q36_session_eval_speculative_argmax(q36_session *s, int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,
+                                        char *err, size_t errlen);
+/* Boundary tokens are evaluated alone so streaming callers can change policy
+ * before the next token. The callback must not change the session. */
+int q36_session_eval_speculative_argmax_with_boundary(q36_session *s, int first_token,
+                                        int max_tokens, int eos_token,
+                                        int *accepted, int accepted_cap,
+                                        q36_token_boundary_fn boundary, void *ud,
                                         char *err, size_t errlen);
 int q36_session_eval_speculative_argmax_excluding(q36_session *s, int first_token,
                                         int max_tokens, int excluded_id,

@@ -1007,6 +1007,34 @@ static void test_observation_error_is_not_context_exhaustion(void) {
     q36_tokens_free(&worker.transcript);
 }
 
+static void test_mtp_boundaries(void) {
+    agent_config cfg = {.gen = {.thinking_budget = 100}};
+    agent_qwen_tool_parser parser = {.state = AGENT_QWEN_TOOL_SEARCH};
+    agent_stream_renderer stream = {.parser = &parser};
+    AGENT_TEST_ASSERT(agent_mtp_boundary_text("</think>", 8));
+    AGENT_TEST_ASSERT(agent_mtp_boundary_text("x > y", 5));
+    AGENT_TEST_ASSERT(!agent_mtp_boundary_text("return x + y;", 13));
+    AGENT_TEST_ASSERT(agent_mtp_block_limit(&cfg, &stream, false, 0, 8, false) == 8);
+    AGENT_TEST_ASSERT(agent_mtp_block_limit(&cfg, &stream, true, 98, 8, false) == 2);
+    AGENT_TEST_ASSERT(agent_mtp_block_limit(&cfg, &stream, true, 100, 8, false) == 1);
+    AGENT_TEST_ASSERT(agent_mtp_block_limit(&cfg, &stream, true, 0, 3, false) == 2);
+    AGENT_TEST_ASSERT(agent_mtp_block_limit(&cfg, &stream, true, 0, 3, true) == 3);
+    stream.qwen_tool_start_len = 1;
+    AGENT_TEST_ASSERT(agent_mtp_block_limit(&cfg, &stream, false, 0, 8, false) == 1);
+    stream.qwen_tool_start_len = 0;
+    parser.state = AGENT_QWEN_TOOL_STRUCTURAL;
+    AGENT_TEST_ASSERT(agent_mtp_block_limit(&cfg, &stream, false, 0, 8, false) == 1);
+    parser.state = AGENT_QWEN_TOOL_PARAM_VALUE;
+    parser.current.name = "edit";
+    parser.param_name = "old";
+    cfg.edit_upto = true;
+    AGENT_TEST_ASSERT(agent_mtp_block_limit(&cfg, &stream, false, 0, 8, false) == 1);
+    cfg.edit_upto = false;
+    AGENT_TEST_ASSERT(agent_mtp_block_limit(&cfg, &stream, false, 0, 8, false) == 8);
+    parser.param_close_prefix = true;
+    AGENT_TEST_ASSERT(agent_mtp_block_limit(&cfg, &stream, false, 0, 8, false) == 1);
+}
+
 int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--password-child")) return password_child();
     if (argc == 4 && !strcmp(argv[1], "--password-driver"))
@@ -1019,6 +1047,7 @@ int main(int argc, char **argv) {
     test_worker_ownership();
     test_worker_pause_ui_waits();
     test_compaction_boundaries();
+    test_mtp_boundaries();
     test_observation_error_is_not_context_exhaustion();
     test_atomic_file_tools();
     test_edit_indent_feedback();

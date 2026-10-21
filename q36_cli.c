@@ -89,18 +89,21 @@ static void usage(FILE *fp) {
         "Model and runtime:\n"
         "  -m, --model FILE\n"
         "      GGUF model path. Default: " Q36_DEFAULT_MODEL_PATH "\n"
-        "  --mtp FILE\n"
-        "      MTP support GGUF, or the same path as -m for an embedded block.\n"
+        "  --mtp [FILE]\n"
+        "      Enable tuned MTP; omit FILE to use the embedded head in -m.\n"
         "  --prefix-file FILE\n"
         "      Preload complete USER:/ASSISTANT: conversation pairs.\n"
         "  --vision FILE\n"
         "      Qwen3-VL mmproj sidecar. It remains disk-backed.\n"
         "  --mtp-draft N\n"
-        "      Maximum autoregressive MTP draft tokens per speculative step. Default: 1\n"
+        "      Maximum autoregressive MTP draft tokens per speculative step. Default: 8\n"
         "  --mtp-opportunistic\n"
-        "      Sample block boundaries and accept greedy tails; changes the sampling distribution.\n"
+        "      Sample block boundaries and accept greedy tails. Default with --mtp.\n"
+        "      This changes the sampling distribution at positive temperature.\n"
+        "  --no-mtp-opportunistic\n"
+        "      Sample every token at positive temperature; keep greedy MTP.\n"
         "  --mtp-margin F\n"
-        "      Minimum recursive-draft confidence for the fast N=2 verifier. Default: 3\n"
+        "      Minimum recursive-draft confidence. Default: 0 (adaptive depth)\n"
         "  -c, --ctx N\n"
         "      Context size allocated for the session. Default: 32768\n"
         "  -ctk, --cache-type-k TYPE\n"
@@ -1494,8 +1497,7 @@ static cli_config parse_options(int argc, char **argv) {
         .engine = {
             .model_path = Q36_DEFAULT_MODEL_PATH,
             .backend = default_backend(),
-            .mtp_draft_tokens = 1,
-            .mtp_margin = 3.0f,
+            .mtp_draft_tokens = Q36_DEFAULT_MTP_DRAFT,
         },
         .gen = {
             .prompt = NULL,
@@ -1514,6 +1516,8 @@ static cli_config parse_options(int argc, char **argv) {
     bool directional_steering_scale_set = false;
     bool cache_type_k_set = false;
     bool cache_type_v_set = false;
+    bool mtp_embedded = false;
+    int mtp_opportunistic = -1;
     for (int i = 1; i < argc; i++) {
         const char *arg = argv[i];
         if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
@@ -1548,13 +1552,16 @@ static cli_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
-            c.engine.mtp_path = need_arg(&i, argc, argv, arg);
+            mtp_embedded = i + 1 >= argc || argv[i + 1][0] == '-';
+            c.engine.mtp_path = mtp_embedded ? NULL : argv[++i];
         } else if (!strcmp(arg, "--vision")) {
             c.engine.vision_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-draft")) {
             c.engine.mtp_draft_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mtp-opportunistic")) {
-            c.gen.mtp_opportunistic = true;
+            mtp_opportunistic = 1;
+        } else if (!strcmp(arg, "--no-mtp-opportunistic")) {
+            mtp_opportunistic = 0;
         } else if (!strcmp(arg, "--mtp-margin")) {
             c.engine.mtp_margin = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1000.0f);
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
@@ -1728,8 +1735,11 @@ static cli_config parse_options(int argc, char **argv) {
         }
     }
 
+    if (mtp_embedded) c.engine.mtp_path = c.engine.model_path;
+    c.gen.mtp_opportunistic = mtp_opportunistic < 0 ?
+        c.engine.mtp_path && c.engine.mtp_draft_tokens > 1 : mtp_opportunistic;
     if (c.gen.mtp_opportunistic && (!c.engine.mtp_path || c.engine.mtp_draft_tokens <= 1)) {
-        fprintf(stderr, "q36: --mtp-opportunistic requires --mtp FILE and --mtp-draft > 1\n");
+        fprintf(stderr, "q36: --mtp-opportunistic requires --mtp [FILE] and --mtp-draft > 1\n");
         exit(2);
     }
     if (c.engine.directional_steering_file && !directional_steering_scale_set) {

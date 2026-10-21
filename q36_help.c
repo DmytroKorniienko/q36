@@ -176,14 +176,16 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     opt(fp, c, "--simulate-used-memory NGB", "Diagnostic: lock N GiB before model load to simulate a smaller-memory machine.");
     opt(fp, c, "--prefill-chunk N",
         "GPU graph prefill chunk size. Default: auto; resident GPU resolves to 1024.");
+    if (tool == Q36_HELP_Q36 || tool == Q36_HELP_AGENT || tool == Q36_HELP_SERVER) {
+        opt(fp, c, "--mtp [FILE]", "Enable MTP; omit FILE for the embedded head in -m.");
+        opt(fp, c, "--mtp-draft N", "Maximum MTP block tokens. Default: 8");
+        opt(fp, c, "--mtp-margin F", "Draft confidence margin. Default: 0 (adaptive depth)");
+        opt(fp, c, "--mtp-opportunistic", "Default with --mtp: sample block starts, accept greedy tails; biases sampling.");
+        opt(fp, c, "--no-mtp-opportunistic", "Sample every token at positive temperature; keep greedy MTP.");
+    }
     if (full) {
-        if (tool != Q36_HELP_BENCH) {
+        if (tool == Q36_HELP_EVAL)
             opt(fp, c, "--mtp FILE", "Optional MTP support GGUF used for draft-token probes.");
-        }
-        if (tool == Q36_HELP_Q36 || tool == Q36_HELP_AGENT || tool == Q36_HELP_SERVER) {
-            opt(fp, c, "--mtp-draft N", "Maximum autoregressive MTP draft tokens. Default: 1");
-            opt(fp, c, "--mtp-margin F", "Verifier confidence margin for fast MTP acceptance. Default: 3");
-        }
         opt(fp, c, "--quality", "Prefer exact kernels where faster approximate paths exist.");
         opt(fp, c, "--warm-weights", "Touch mapped tensor pages at startup to reduce first-use stalls.");
         if (tool == Q36_HELP_Q36 || tool == Q36_HELP_BENCH) {

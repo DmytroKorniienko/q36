@@ -248,15 +248,20 @@ inputs; imatrix collection still uses the optional llama.cpp tooling.
 GGUF for Qwen 3.6 MoE. It can be used with the `q2-imatrix` and
 `q2-q4-imatrix` main models, but must be enabled explicitly with `--mtp`.
 Embedded heads are supported in 41-block MoE GGUFs and in the 65-block
-`Qwen3.8-27B-UD-IQ3_S.gguf`. Pass the same path to `-m` and `--mtp` to use
-one. The embedding and output weights remain shared. With `--mtp` omitted,
-the runtime excludes the extra block from the resident GPU weight cache.
+`Qwen3.8-27B-UD-IQ3_S.gguf`. Use `--mtp` without a filename to select the
+embedded head, or `--mtp FILE` for a separate support GGUF. In `q36`,
+`q36-server`, and `q36-agent`, this enables the tuned BC-250 configuration:
+up to eight tokens, adaptive draft confidence (`--mtp-margin 0`), and
+opportunistic sampling. Explicit depth, margin, and sampling options override
+these defaults regardless of argument order. The embedding and output weights
+remain shared. With `--mtp` omitted, the runtime excludes the extra block from
+the resident GPU weight cache.
 
 For greedy Vulkan generation with the dense embedded head:
 
 ```sh
 model=gguf/Qwen3.8-27B-UD-IQ3_S.gguf
-./q36 -m "$model" --mtp "$model" --mtp-draft 8 --mtp-margin 0 \
+./q36 -m "$model" --mtp \
   --temp 0 --nothink -p "Write a C function that reverses a linked list."
 ```
 
@@ -267,8 +272,8 @@ Verification shares quantized weights across rows and keeps token selection
 on the GPU. The draft output head uses a small mask of recent target
 alternatives; target verification always scores the full vocabulary.
 
-Dense Vulkan adapts recursive MTP between two and four rows using observed
-latency and acceptance. With `--mtp-draft 8`,
+Dense Vulkan chooses recursive MTP lengths between two and four rows from
+the current draft's confidence. With `--mtp-draft 8`,
 a matching 12–16-token suffix can supply a longer copied tail after MTP
 confirms its first proposal. Positive `--mtp-margin` values use MTP alone.
 The regression tests compare committed tokens and every target logit with
@@ -276,11 +281,10 @@ ordinary decode, including quantized KV, checkpoint restore and verifier
 widths up to eight. MTP also matches a separate ordinary engine with MTP disabled.
 Other recurrent paths use scalar verification to preserve ordinary decode.
 
-For opportunistic sampling, add `--mtp-opportunistic` at a positive temperature:
+Opportunistic sampling is the default with `--mtp` at a positive temperature:
 
 ```sh
-./q36 -m "$model" --mtp "$model" --mtp-draft 8 --mtp-margin 0 \
-  --mtp-opportunistic --temp 1 --seed 42 --nothink \
+./q36 -m "$model" --mtp --temp 1 --seed 42 --nothink \
   -p "Write a C function that reverses a linked list."
 ```
 
@@ -289,53 +293,62 @@ top-p and min-p, then accepts the draft tail while it matches the target's
 greedy continuation. This deliberately changes the sampling distribution.
 The next block samples again from the last committed target state. Target
 logits, KV updates and rejection rollback use the same verifier as greedy MTP.
-The flag also works in `q36-server` for non-batched text requests with zero
-presence/frequency penalties; other requests keep ordinary sampling.
-Positive-temperature generation samples every token when the flag is omitted.
+This also works in `q36-agent` and in `q36-server` for non-batched text
+requests with zero presence/frequency penalties; other server requests keep
+ordinary sampling. Use `--no-mtp-opportunistic` to sample every token at
+positive temperature while retaining exact greedy MTP at temperature zero.
+`--mtp-draft 1` disables speculative blocks.
 
-MTP remains experimental. On the BC-250, matched greedy runs with 128
-output tokens and Q8_0 K / Q4_0 V cache give these generation rates:
+With `--mtp-margin 0`, dense Vulkan drafting uses the MTP head's
+confidence to choose its length. It verifies at least one proposal and
+extends up to four rows while the top-two logit gap is at least 1.0.
+Confirmed history tails can still extend to eight. This avoids wider
+verification of weak prefixes and removes wall-clock timing from
+block-length decisions. Target acceptance still checks every proposed token.
 
-| Context | Story, plain → MTP t/s | Gain | C source, plain → MTP t/s | Gain |
-| ---: | ---: | ---: | ---: | ---: |
-| 128 | 22.06 → 30.15 | 1.37× | 22.09 → 27.46 | 1.24× |
-| 2048 | 21.62 → 32.26 | 1.49× | 21.68 → 28.97 | 1.34× |
-| 3968 | 21.26 → 26.64 | 1.25× | 21.43 → 30.72 | 1.43× |
-| 4096 | 21.23 → 31.87 | 1.50× | 21.29 → 30.57 | 1.44× |
+MTP remains experimental. These BC-250 comparisons use the pushed
+`e497fd7` build and the new implementation, 128 output tokens, and Q8_0 K /
+Q4_0 V cache. Each sweep starts at 128 and extends through 2K and 4K.
 
-Compared with `d608931`, greedy throughput improves by 4–10% across
-these cases, using the faster of two previous-build controls at each
-frontier. The verifier specializes exact block sizes and K-quant types,
-and reuses the Q8 activation sums. It adds no tensor or weight buffers.
-All 141 shared ordinary/prefill and scaled-IQ2 shaders remain byte-identical.
+Greedy generation:
 
-With opportunistic MTP at temperature 1, seeds 1 and 42 give these gains
-over ordinary sampling:
-
-| Context | Story gain, both seeds | C-source gain, both seeds |
+| Context | Story, pushed → new t/s | C source, pushed → new t/s |
 | ---: | ---: | ---: |
-| 128 | 1.24–1.36× | 1.17–1.37× |
-| 2048 | 1.42× | 1.38–1.51× |
-| 3968 | 1.22–1.27× | 1.25–1.37× |
-| 4096 | 1.35–1.60× | 1.37–1.50× |
+| 128 | 30.22 → 33.06 | 25.80 → 27.77 |
+| 2048 | 32.34 → 34.08 | 30.01 → 30.35 |
+| 3968 | 26.68 → 29.01 | 30.70 → 30.74 |
+| 4096 | 31.96 → 32.45 | 30.57 → 34.52 |
 
-Fresh 8K with seed 1 improves from 20.03 to 31.56 t/s (1.58×). Verified
-greedy tails account for 39%–72% of output tokens in these trials. The
-arms generate different sequences; adaptive timing can also change block
-boundaries and sampled continuations with the same seed. These two prompts
-do not demonstrate a general 1.5–2× gain or an attained hardware limit.
+Opportunistic generation at temperature 1, top-k 0, top-p 1 and min-p 0.05
+(all cells are pushed → new t/s):
 
-Peak extra Vulkan tensor allocation is 465 MiB at 4K and
-501 MiB at 8K. Recorded benchmark temperature peaks at 72°C.
-Greedy and sampled replay, quantized KV, checkpoint restore, scalar
-fallback, MoE regression, separate engines at 8K, and fresh 16-thread
-CPU/Vulkan parity through top-64 all pass. Every MTP replay has zero
-target-logit difference. Plain decoding remains the default. Commands,
-raw measurements and frozen sources are in
-[the local benchmark artifacts](tests/test-vectors/local/q38-mtp-20261020-v5/README.md).
+| Context | Story, seed 1 | Story, seed 42 | C source, seed 1 | C source, seed 42 |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 | 26.91 → 35.56 | 29.26 → 29.33 | 23.36 → 29.01 | 26.57 → 29.02 |
+| 2048 | 30.14 → 31.18 | 26.28 → 28.49 | 31.96 → 36.23 | 29.07 → 36.62 |
+| 3968 | 26.64 → 30.16 | 25.45 → 30.03 | 29.12 → 32.08 | 28.35 → 31.12 |
+| 4096 | 28.69 → 29.86 | 28.94 → 27.07 | 28.28 → 30.87 | 31.23 → 30.20 |
 
-The seed-42 2048-context code case was 6% slower than previous
-opportunistic MTP. Adaptive block choices and sampled continuations vary.
+The regressed 2K code/seed-42 case reaches 36.62 t/s,
+with 36.46 t/s in the final repeat. Additional pushed-build controls
+measured 28.97 and 28.72 t/s; the older pre-regression build measured
+30.94 and 31.03 t/s. Fresh 8K story/seed-1 generation changes from
+30.74 to 32.63 t/s.
+
+The largest sampled regression is 6.5% for story, seed 42, context 4096.
+Sampled arms can produce different continuations, so these end-to-end
+comparisons include continuation variation. A general 35 t/s rate or
+attained hardware limit is not established. The paired IQ4 lookup is
+independently 6–17% faster in warmed kernel measurements with identical
+scalar outputs. It adds no tensor or weight buffers.
+
+All greedy/sampled replay, quantized KV, checkpoint restore, scalar fallback,
+MoE regression, separate-engine 8K and fresh 16-thread CPU/Vulkan checks
+through top-64 pass. Every MTP replay has zero target-logit difference.
+Maximum recorded benchmark temperature is 73°C.
+Plain decoding remains the default. Commands, raw controls, rejected probes,
+frozen sources and complete results are in
+[the local benchmark artifacts](tests/test-vectors/local/q38-mtp-20261021-v6/README.md).
 
 ## Speed
 
@@ -497,8 +510,14 @@ Start the agent in the current directory, another project, or one-shot mode:
 ```sh
 ./q36-agent
 ./q36-agent --chdir /path/to/project
+./q36-agent -m gguf/Qwen3.8-27B-UD-IQ3_S.gguf --mtp --chdir /path/to/project
 ./q36-agent --non-interactive -p "Inspect the tests and fix the failure."
 ```
+
+`--mtp` uses the same Vulkan verifier as the CLI and server. The agent streams
+accepted tokens individually and decodes tags, thinking closure, and automatic
+edit-old shortening one token at a time. Tool calls therefore finish before
+the next assistant round, and the transcript stays aligned with the live KV.
 
 Adaptive thinking closure starts after 50000 thinking tokens by default. For
 budgets of at least 8000, its allowed `</think>` rank rises to the top 64 over
@@ -633,9 +652,10 @@ turn extends the previous conversation. Useful commands are `/help`, `/think`,
 the current generation and returns to `q36>`.
 
 Thinking mode is enabled by default. Use `/nothink` or `--nothink` for direct
-answers. `--mtp MTP.gguf --mtp-draft 2` enables the optional MTP speculative
-path for greedy decoding. It uses `--mtp-margin` as a confidence gate and is
-experimental; benchmark it on the intended workload before choosing it.
+answers. `--mtp` enables the embedded MTP head with the tuned defaults above;
+`--mtp MTP.gguf` selects a separate support model. Greedy decoding stays exact.
+At positive temperature, opportunistic MTP samples block starts and accepts
+greedy tails; `--no-mtp-opportunistic` restores sampling for every token.
 
 ## Server
 
