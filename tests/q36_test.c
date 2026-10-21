@@ -1897,6 +1897,86 @@ static void test_vulkan_rms_norm(void) {
 #endif
 }
 
+static void test_vulkan_split_norm(void) {
+#if !defined(Q36_NO_GPU) && !defined(Q36_METAL)
+    enum { max_n = 5157, max_rows = 9, guard = 64 };
+    size_t bytes = (size_t)max_n * max_rows * sizeof(float);
+    size_t weight_bytes = test_round_up_u64(max_n * sizeof(float), getpagesize());
+    float *weights = NULL, *input = malloc(bytes), *want = malloc(bytes), *got = malloc(bytes);
+    const char *saved = getenv("Q36_VK_SPLIT_NORM");
+    char *old_env = saved ? strdup(saved) : NULL;
+    uint8_t canary[guard], tail[guard];
+    memset(canary, 0xa5, guard);
+    q36_gpu_tensor *t[6] = {0};
+    TEST_ASSERT(posix_memalign((void **)&weights, getpagesize(), weight_bytes) == 0);
+    TEST_ASSERT(weights && input && want && got);
+    if (!weights || !input || !want || !got) goto done;
+    for (unsigned i = 0; i < max_n; i++) weights[i] = 0.75f + (i % 11u) * 0.03125f;
+    TEST_ASSERT(q36_gpu_init() != 0);
+    q36_gpu_set_quality(false);
+    q36_gpu_set_dense_model(true);
+    TEST_ASSERT(q36_gpu_set_model_map(weights, weight_bytes) != 0);
+    for (unsigned i = 0; i < 6; i++) {
+        t[i] = q36_gpu_tensor_alloc(bytes + guard);
+        TEST_ASSERT(t[i] != NULL);
+        if (!t[i]) goto done;
+    }
+    const unsigned widths[] = {4095, 4096, 5120, 5157};
+    for (unsigned wi = 0; wi < sizeof(widths) / sizeof(*widths); wi++) {
+        unsigned n = widths[wi];
+        for (unsigned rows = 1; rows <= max_rows; rows++) {
+            size_t nb = (size_t)n * rows * sizeof(float);
+            for (unsigned fixture = 0; fixture < 3; fixture++) {
+                for (size_t i = 0; i < nb / sizeof(float); i++)
+                    input[i] = fixture == 0 ? sinf(i * 0.031f) * (0.25f + (i % 11u)) :
+                               fixture == 1 ? (i % 7u ? 0.0001f : -1024.0f) : 0.0f;
+                for (unsigned kind = 0; kind < 3; kind++) {
+                    for (unsigned alias = 0; alias < 2; alias++) {
+                        q36_gpu_tensor *out = alias ? t[0] : t[2];
+                        q36_gpu_tensor *sum = alias ? t[1] : t[3];
+                        TEST_ASSERT(q36_gpu_tensor_write(t[0], 0, input, nb) != 0);
+                        TEST_ASSERT(q36_gpu_tensor_write(t[1], 0, input, nb) != 0);
+                        TEST_ASSERT(q36_gpu_tensor_write(out, nb, canary, guard) != 0);
+                        TEST_ASSERT(q36_gpu_tensor_write(sum, nb, canary, guard) != 0);
+                        for (unsigned arm = 0; arm < 2; arm++) {
+                            q36_gpu_tensor *dst = arm ? out : t[4];
+                            setenv("Q36_VK_SPLIT_NORM", arm ? "1" : "0", 1);
+                            if (kind == 0)
+                                TEST_ASSERT(q36_gpu_rms_norm_plain_rows_tensor(dst, t[0], n, rows, 1e-6f) != 0);
+                            else if (kind == 1)
+                                TEST_ASSERT(q36_gpu_rms_norm_weight_rows_tensor(dst, t[0], weights,
+                                    weight_bytes, 0, n, rows, 1e-6f) != 0);
+                            else
+                                TEST_ASSERT(q36_gpu_add_rms_norm_tensor(dst, arm ? sum : t[5], t[0], t[1],
+                                    weights, weight_bytes, 0, n, rows, 1e-6f) != 0);
+                            TEST_ASSERT(q36_gpu_tensor_read(dst, 0, arm ? got : want, nb) != 0);
+                        }
+                        TEST_ASSERT(memcmp(got, want, nb) == 0);
+                        TEST_ASSERT(q36_gpu_tensor_read(out, nb, tail, guard) != 0);
+                        TEST_ASSERT(memcmp(tail, canary, guard) == 0);
+                        if (kind == 2) {
+                            TEST_ASSERT(q36_gpu_tensor_read(sum, 0, got, nb) != 0);
+                            TEST_ASSERT(q36_gpu_tensor_read(t[5], 0, want, nb) != 0);
+                            TEST_ASSERT(memcmp(got, want, nb) == 0);
+                            TEST_ASSERT(q36_gpu_tensor_read(sum, nb, tail, guard) != 0);
+                            TEST_ASSERT(memcmp(tail, canary, guard) == 0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+done:
+    if (old_env) setenv("Q36_VK_SPLIT_NORM", old_env, 1);
+    else unsetenv("Q36_VK_SPLIT_NORM");
+    free(old_env);
+    for (unsigned i = 0; i < 6; i++) q36_gpu_tensor_free(t[i]);
+    q36_gpu_set_dense_model(false);
+    q36_gpu_cleanup();
+    free(weights); free(input); free(want); free(got);
+#endif
+}
+
 static void test_vulkan_add_rms_q8(void) {
 #if defined(Q36_NO_GPU) || defined(Q36_METAL)
     test_skip("vulkan-add-rms-q8", "Vulkan-only test");
@@ -4622,6 +4702,7 @@ static void test_vulkan_kernels(void) {
     test_metal_f16_matvec_fast_nr0_4();
     test_vulkan_f32_matvec();
     test_vulkan_rms_norm();
+    test_vulkan_split_norm();
     test_vulkan_add_rms_q8();
     test_vulkan_rms_norm_rope();
     test_vulkan_rms_norm_rope_kv();

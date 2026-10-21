@@ -1,0 +1,26 @@
+#version 460
+
+layout(local_size_x = 32) in;
+layout(binding = 0) readonly buffer A { float a[]; };
+layout(binding = 1) readonly buffer B { float b[]; };
+layout(binding = 2) writeonly buffer Sum { float s[]; };
+layout(binding = 3) writeonly buffer Partial { double partial[]; };
+layout(push_constant) uniform Push { uint n; uint has_weight; float eps; } pc;
+
+/* Eight groups share the original 256 strided sums. Each lane keeps its
+ * serial FP64 accumulation, while small decode batches occupy more CUs. */
+void main(void) {
+    uint lid = gl_WorkGroupID.x * 32u + gl_LocalInvocationID.x;
+    uint row = gl_WorkGroupID.y, base = row * pc.n;
+    double ss = 0.0;
+    for (uint i = lid; i < pc.n; i += 256u) {
+#ifdef Q36_ADD
+        float v = a[base + i] + b[base + i];
+        s[base + i] = v;
+#else
+        float v = a[base + i];
+#endif
+        ss += double(v) * double(v);
+    }
+    partial[row * 256u + lid] = ss;
+}

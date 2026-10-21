@@ -57,6 +57,9 @@ VULKAN_SHADERS := \
 	vulkan/add_rms_norm.spv \
 	vulkan/add_rms_norm_q8_k.spv \
 	vulkan/rms_norm.spv \
+	vulkan/rms_norm_partial.spv \
+	vulkan/add_rms_norm_partial.spv \
+	vulkan/rms_norm_finish.spv \
 	vulkan/swiglu.spv \
 	vulkan/swiglu_q8_k.spv \
 	vulkan/rope_qwen.spv \
@@ -610,6 +613,12 @@ vulkan/%.spv: vulkan/%.comp
 
 vulkan/add_rms_norm_q8_k.spv: vulkan/add_rms_norm.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_Q8=1 -o $@ $<
+
+vulkan/add_rms_norm_partial.spv: vulkan/rms_norm_partial.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_ADD=1 -o $@ $<
+
+vulkan/rms_norm_finish.spv: vulkan/rms_norm_finish.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
 vulkan/gdn_front.spv: vulkan/gdn_front.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<

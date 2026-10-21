@@ -164,6 +164,9 @@ typedef struct {
     q36_vk_kernel directional_steering;
     q36_vk_kernel rms_norm;
     q36_vk_kernel add_rms_norm;
+    q36_vk_kernel rms_norm_partial;
+    q36_vk_kernel add_rms_norm_partial;
+    q36_vk_kernel rms_norm_finish;
     q36_vk_kernel add_rms_norm_q8_k;
     q36_vk_kernel swiglu;
     q36_vk_kernel swiglu_q8_k;
@@ -300,6 +303,7 @@ typedef struct {
     uint32_t arena_plan_next;
     q36_gpu_tensor *iq_tables;
     q36_gpu_tensor *attn_part;
+    q36_gpu_tensor *norm_part;
     uint64_t attn_part_bytes;
     q36_gpu_tensor *top2_part;
     uint64_t top2_part_bytes;
@@ -2824,6 +2828,10 @@ int q36_gpu_init(void) {
     q36_vk.directional_steering = Q36_VK_KERNEL("vulkan/directional_steering.spv", 2, 16, 1u << 0);
     q36_vk.rms_norm = Q36_VK_KERNEL("vulkan/rms_norm.spv", 3, 12, 1u << 2);
     q36_vk.add_rms_norm = Q36_VK_KERNEL("vulkan/add_rms_norm.spv", 5, 8, (1u << 3) | (1u << 4));
+    q36_vk.rms_norm_partial = Q36_VK_KERNEL("vulkan/rms_norm_partial.spv", 4, 12, 1u << 3);
+    q36_vk.add_rms_norm_partial = Q36_VK_KERNEL("vulkan/add_rms_norm_partial.spv", 4, 12,
+                                               (1u << 2) | (1u << 3));
+    q36_vk.rms_norm_finish = Q36_VK_KERNEL("vulkan/rms_norm_finish.spv", 4, 12, 1u << 3);
     q36_vk.add_rms_norm_q8_k = Q36_VK_KERNEL("vulkan/add_rms_norm_q8_k.spv", 6, 8,
                                             (1u << 3) | (1u << 4) | (1u << 5));
     q36_vk.swiglu = Q36_VK_KERNEL("vulkan/swiglu.spv", 3, 12, 1u << 2);
@@ -3344,6 +3352,8 @@ void q36_gpu_cleanup(void) {
     q36_vk_tensor_free_unlocked(q36_vk.iq_tables);
     q36_vk.iq_tables = NULL;
     q36_vk_tensor_free_unlocked(q36_vk.attn_part);
+    q36_vk_tensor_free_unlocked(q36_vk.norm_part);
+    q36_vk.norm_part = NULL;
     q36_vk.attn_part = NULL;
     q36_vk.attn_part_bytes = 0;
     q36_vk_tensor_free_unlocked(q36_vk.top2_part);
@@ -3468,6 +3478,9 @@ void q36_gpu_cleanup(void) {
     q36_vk_kernel_destroy(&q36_vk.swiglu_q8_k);
     q36_vk_kernel_destroy(&q36_vk.rms_norm);
     q36_vk_kernel_destroy(&q36_vk.add_rms_norm);
+    q36_vk_kernel_destroy(&q36_vk.rms_norm_partial);
+    q36_vk_kernel_destroy(&q36_vk.add_rms_norm_partial);
+    q36_vk_kernel_destroy(&q36_vk.rms_norm_finish);
     q36_vk_kernel_destroy(&q36_vk.add_rms_norm_q8_k);
     q36_vk_kernel_destroy(&q36_vk.quantize_q8_0);
     q36_vk_kernel_destroy(&q36_vk.matmul_q6k_mmq_fast);
@@ -5382,6 +5395,30 @@ static void q36_vk_rms_norm_rows(void *opaque, uint64_t row0, uint64_t row1) {
     }
 }
 
+static bool q36_vk_use_split_norm_unlocked(uint32_t n, uint32_t rows) {
+    if (!q36_vk.bc250 || q36_vk.subgroup_size != 64u || !q36_gpu_dense_model ||
+        n < 4096u || rows > 8u || !q36_vk_env_default_on("Q36_VK_SPLIT_NORM")) return false;
+    if (!q36_vk.norm_part)
+        q36_vk.norm_part = q36_vk_tensor_alloc_scratch_unlocked(8u * 256u * sizeof(double));
+    return q36_vk.norm_part != NULL;
+}
+
+static int q36_vk_split_norm_unlocked(q36_gpu_tensor *out,
+                                       q36_gpu_tensor *sum,
+                                       const q36_gpu_tensor *a,
+                                       const q36_gpu_tensor *b,
+                                       const q36_gpu_tensor *weight,
+                                       uint32_t n, uint32_t rows,
+                                       bool has_weight, float eps) {
+    struct { uint32_t n, has_weight; float eps; } push = {n, has_weight, eps};
+    const q36_gpu_tensor *parts[] = {a, b ? b : a, sum ? sum : a, q36_vk.norm_part};
+    const q36_gpu_tensor *finish[] = {sum ? sum : a, weight, q36_vk.norm_part, out};
+    return q36_vk_run_unlocked("norm_partial", sum ? &q36_vk.add_rms_norm_partial :
+                               &q36_vk.rms_norm_partial, parts, &push, sizeof(push), 8, rows, 1) &&
+           q36_vk_run_unlocked("norm_finish", &q36_vk.rms_norm_finish,
+                               finish, &push, sizeof(push), (n - 1u) / 128u + 1u, rows, 1);
+}
+
 static int q36_vk_rms_norm_tensor(q36_gpu_tensor *out,
                                   const q36_gpu_tensor *x,
                                   const float *weight,
@@ -5408,7 +5445,9 @@ static int q36_vk_rms_norm_tensor(q36_gpu_tensor *out,
         int ok = wt != NULL;
         if (ok) {
             const q36_gpu_tensor *bindings[3] = { x, wt, out };
-            ok = q36_vk_run_unlocked("norm", &q36_vk.rms_norm, bindings, &push, sizeof(push), rows, 1, 1);
+            ok = q36_vk_use_split_norm_unlocked(n, rows) ?
+                q36_vk_split_norm_unlocked(out, NULL, x, NULL, wt, n, rows, weight != NULL, eps) :
+                q36_vk_run_unlocked("norm", &q36_vk.rms_norm, bindings, &push, sizeof(push), rows, 1, 1);
         }
         pthread_mutex_unlock(&q36_vk_mu);
         return ok;
@@ -5703,7 +5742,9 @@ static int q36_vk_add_rms_norm_tensor(q36_gpu_tensor *out_norm,
     if (ok) {
         const q36_gpu_tensor *bindings[6] = { a, b, wt, out_sum, out_norm, out_q8 };
         q36_vk_kernel *kernel = out_q8 ? &q36_vk.add_rms_norm_q8_k : &q36_vk.add_rms_norm;
-        ok = q36_vk_run_unlocked(out_q8 ? "add_rms_norm_q8_k" : "add_rms_norm",
+        ok = !out_q8 && q36_vk_use_split_norm_unlocked(n, rows) ?
+            q36_vk_split_norm_unlocked(out_norm, out_sum, a, b, wt, n, rows, true, eps) :
+            q36_vk_run_unlocked(out_q8 ? "add_rms_norm_q8_k" : "add_rms_norm",
                                  kernel, bindings, &push, sizeof(push), rows, 1, 1);
     }
     pthread_mutex_unlock(&q36_vk_mu);

@@ -1,0 +1,35 @@
+#version 460
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_shuffle_relative : require
+
+layout(local_size_x = 64) in;
+layout(binding = 0) readonly buffer X { float x[]; };
+layout(binding = 1) readonly buffer W { float w[]; };
+layout(binding = 2) readonly buffer Partial { double partial[]; };
+layout(binding = 3) writeonly buffer Y { float y[]; };
+layout(push_constant) uniform Push { uint n; uint has_weight; float eps; } pc;
+
+void main(void) {
+    uint lid = gl_LocalInvocationID.x, row = gl_WorkGroupID.y;
+    uint p = row * 256u + lid;
+    /* Preserve the 128,64,32,...,1 tree. Shuffle the double's two words so
+     * this needs no subgroup extended-types feature. Repeating the small
+     * reduction lets output tiles normalize in parallel without barriers. */
+    precise double ss = (partial[p] + partial[p + 128u]) +
+                        (partial[p + 64u] + partial[p + 192u]);
+    for (uint sh = 32u; sh > 0u; sh >>= 1u) {
+        uvec2 bits = unpackDouble2x32(ss);
+        double other = packDouble2x32(uvec2(subgroupShuffleDown(bits.x, sh),
+                                             subgroupShuffleDown(bits.y, sh)));
+        if (lid < sh) ss += other;
+    }
+    uvec2 bits = unpackDouble2x32(ss);
+    ss = packDouble2x32(uvec2(subgroupShuffle(bits.x, 0u), subgroupShuffle(bits.y, 0u)));
+    float scale = inversesqrt(float(ss / double(pc.n)) + pc.eps);
+    uint base = row * pc.n, first = gl_WorkGroupID.x * 128u;
+    for (uint i = first + lid; i < min(first + 128u, pc.n); i += 64u) {
+        float v = x[base + i] * scale;
+        y[base + i] = pc.has_weight != 0u ? v * w[i] : v;
+    }
+}
