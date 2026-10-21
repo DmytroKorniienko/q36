@@ -49,6 +49,7 @@ const uint TAB_IQ3S_GRID = 2592u;
 shared f16vec2 buf_a[BM * STRIDE];
 shared f16vec2 buf_b[BN * STRIDE];
 shared uint grid_lut[512];
+shared uint sign_lut[16];
 shared float weight_scale[BM];
 
 uint load_u8(uint off) {
@@ -74,7 +75,7 @@ vec4 unpack_i8(uint v) {
 }
 
 uint sign_mask(uint signs) {
-    return (((signs & 15u) * 0x00204081u) & 0x01010101u) * 255u;
+    return sign_lut[signs & 15u];
 }
 
 void main(void) {
@@ -99,6 +100,7 @@ void main(void) {
 #endif
     for (uint i = lid; i < 512u; i += 128u)
         grid_lut[i] = q36_iq3s_grid[i];
+    if (lid < 16u) sign_lut[lid] = (((lid * 0x00204081u) & 0x01010101u) * 254u);
     barrier();
 
     for (uint qb = 0u; qb < pc.blocks; qb++) {
@@ -138,8 +140,7 @@ void main(void) {
                                      ((qh << (8u - lane4)) & 256u);
                         uint mask = sign_mask((signs4 >> (8u * p + 4u * kw)) & 15u);
                         uint grid = grid_lut[entry];
-                        v[p] = d * unpack_i8((grid ^ mask) +
-                                             (mask & 0x01010101u));
+                        v[p] = d * unpack_i8(grid ^ mask);
                     }
                 }
                 [[unroll]] for (uint p = 0u; p < 4u; p++) {

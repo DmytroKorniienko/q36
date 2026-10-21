@@ -30,11 +30,7 @@ layout(constant_id = 0) const uint N_TOKENS = Q36_TOKENS;
 #define N_TOKENS 1
 #endif
 
-#if Q36_TOKENS > 1
 #define UNROLL [[unroll]]
-#else
-#define UNROLL
-#endif
 
 layout(push_constant) uniform Push {
     uint out_dim;
@@ -57,9 +53,7 @@ const uint Q8K_WORDS = 74u;
 const uint TAB_IQ3S_GRID = 2592u;
 
 shared uint grid_lut[512];
-#if Q36_TOKENS > 1
 shared uint sign_lut[16];
-#endif
 
 uint load_u8(uint off) {
     return uint(wb[off]);
@@ -76,19 +70,10 @@ uint load_u32(uint off) {
            (uint(wb[off + 2u]) << 16u) | (uint(wb[off + 3u]) << 24u);
 }
 
-vec4 unpack_i8(uint v) {
-    return vec4(float(bitfieldExtract(int(v), 0, 8)),
-                float(bitfieldExtract(int(v), 8, 8)),
-                float(bitfieldExtract(int(v), 16, 8)),
-                float(bitfieldExtract(int(v), 24, 8)));
-}
-
-#if Q36_TOKENS > 1
 int signed_bytes(uint grid, uint signs) {
     /* Odd magnitudes negate by toggling every bit except the low bit. */
     return int(grid ^ sign_lut[signs & 15u]);
 }
-#endif
 
 void main(void) {
     uint lid = gl_LocalInvocationID.x;
@@ -99,27 +84,17 @@ void main(void) {
         UNROLL for (uint r = 0u; r < ROWS; r++) acc[t][r] = 0.0;
     UNROLL for (uint i = lid; i < 512u; i += 64u)
         grid_lut[i] = q36_iq3s_grid[i];
-#if Q36_TOKENS > 1
     if (lid < 16u)
         sign_lut[lid] = (((lid * 0x00204081u) & 0x01010101u) * 254u);
-#endif
     barrier();
 
     for (uint b = lid >> 3u; b < pc.blocks; b += 8u) {
         uint qbase = b * Q8K_WORDS + 2u + 8u * itid;
-#if Q36_TOKENS > 1
         int qv[N_TOKENS][8];
-#else
-        vec4 qv[N_TOKENS][8];
-#endif
         float yd[N_TOKENS];
         UNROLL for (uint t = 0u; t < N_TOKENS; t++) {
             uint offset = t * pc.blocks * Q8K_WORDS;
-#if Q36_TOKENS > 1
             UNROLL for (uint l = 0u; l < 8u; l++) qv[t][l] = int(q8[offset + qbase + l]);
-#else
-            UNROLL for (uint l = 0u; l < 8u; l++) qv[t][l] = unpack_i8(q8[offset + qbase + l]);
-#endif
             yd[t] = uintBitsToFloat(q8[offset + b * Q8K_WORDS]);
         }
 
@@ -135,13 +110,8 @@ void main(void) {
             uint signs4 = load_u32(base + 74u + 4u * itid);
             /* These 32 byte products sum exactly in f32; packed integer dots
              * preserve the decode result before applying float scales. */
-#if Q36_TOKENS > 1
             int sum[N_TOKENS];
             UNROLL for (uint t = 0u; t < N_TOKENS; t++) sum[t] = 0;
-#else
-            float sum[N_TOKENS];
-            UNROLL for (uint t = 0u; t < N_TOKENS; t++) sum[t] = 0.0;
-#endif
             UNROLL for (uint l = 0u; l < 4u; l++) {
                 uint qs = l < 2u ? qs0 >> (16u * l) : qs1 >> (16u * (l - 2u));
                 uint signs = (signs4 >> (8u * l)) & 255u;
@@ -149,37 +119,11 @@ void main(void) {
                                       ((qh << (8u - 2u * l)) & 256u)];
                 uint grid1 = grid_lut[((qs >> 8u) & 255u) |
                                       ((qh << (7u - 2u * l)) & 256u)];
-#if Q36_TOKENS > 1
                 int weight0 = signed_bytes(grid0, signs);
                 int weight1 = signed_bytes(grid1, signs >> 4u);
-#else
-                vec4 weight0 = unpack_i8(grid0) * vec4(
-                    (signs & 1u) != 0u ? -1.0 : 1.0,
-                    (signs & 2u) != 0u ? -1.0 : 1.0,
-                    (signs & 4u) != 0u ? -1.0 : 1.0,
-                    (signs & 8u) != 0u ? -1.0 : 1.0);
-                vec4 weight1 = unpack_i8(grid1) * vec4(
-                    (signs & 16u) != 0u ? -1.0 : 1.0,
-                    (signs & 32u) != 0u ? -1.0 : 1.0,
-                    (signs & 64u) != 0u ? -1.0 : 1.0,
-                    (signs & 128u) != 0u ? -1.0 : 1.0);
-#endif
                 UNROLL for (uint t = 0u; t < N_TOKENS; t++) {
-#if Q36_TOKENS > 1
                     sum[t] += dotPacked4x8EXT(weight0, qv[t][2u * l]);
                     sum[t] += dotPacked4x8EXT(weight1, qv[t][2u * l + 1u]);
-#else
-                    vec4 q0 = qv[t][2u * l];
-                    vec4 q1 = qv[t][2u * l + 1u];
-                    sum[t] = fma(weight0.x, q0.x,
-                          fma(weight0.y, q0.y,
-                          fma(weight0.z, q0.z,
-                          fma(weight0.w, q0.w,
-                          fma(weight1.x, q1.x,
-                          fma(weight1.y, q1.y,
-                          fma(weight1.z, q1.z,
-                          fma(weight1.w, q1.w, sum[t]))))))));
-#endif
                 }
             }
             uint sc = load_u8(base + 106u + (itid >> 1u));

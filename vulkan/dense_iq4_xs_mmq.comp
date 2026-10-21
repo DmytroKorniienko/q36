@@ -39,7 +39,7 @@ const int values[16] = int[16](
 
 shared f16vec2 buf_a[BM * STRIDE];
 shared f16vec2 buf_b[BN * STRIDE];
-shared float weight_scale[BM];
+
 shared float input_scale[BN];
 shared float value_lut[16];
 
@@ -95,9 +95,11 @@ void main(void) {
     barrier();
 
     for (uint qb = 0u; qb < pc.blocks; qb++) {
-        if (lid < BM) {
-            uint row = row0 + lid;
-            weight_scale[lid] = row < pc.out_dim ?
+        /* Each loader keeps its scales across all eight slices. */
+        float weight_scale[(BM * 2u + 127u) / 128u];
+        for (uint i = lid; i < BM * 2u; i += 128u) {
+            uint row = row0 + i / 2u;
+            weight_scale[i / 128u] = row < pc.out_dim ?
                 unpackHalf2x16(load_u16(row * pc.row_bytes + 136u * qb)).x * pc.scale : 0.0;
         }
         if (lid < BN) {
@@ -123,7 +125,7 @@ void main(void) {
                     uint sh = load_u16(base + 2u);
                     int ls = int((sl >> (4u * (slice & 1u))) & 15u) |
                              int(((sh >> (2u * slice)) & 3u) << 4u);
-                    float d = weight_scale[lr] * float(ls - 32);
+                    float d = weight_scale[i / 128u] * float(ls - 32);
                     [[unroll]] for (uint p = 0u; p < 2u; p++) {
                         uint k = kw + 2u * p;
                         uint packed = load_u32(base + 8u + 16u * slice + 4u * k);

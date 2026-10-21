@@ -2003,7 +2003,7 @@ static void test_vulkan_add_rms_q8(void) {
     ref_q = q36_gpu_tensor_alloc(qbytes);
     TEST_ASSERT(a && b && sum && norm && q && ref_sum && ref_norm && ref_q);
     if (!a || !b || !sum || !norm || !q || !ref_sum || !ref_norm || !ref_q) goto cleanup;
-    const unsigned widths[] = {256, 768, 5120};
+    const unsigned widths[] = {256, 768, 3840, 4096, 5120};
     for (unsigned wi = 0; wi < sizeof(widths) / sizeof(widths[0]); wi++) {
         unsigned n = widths[wi], nb = n * 4, nq = n / 256 * 296;
         for (unsigned fixture = 0; fixture < 3; fixture++) {
@@ -2020,8 +2020,10 @@ static void test_vulkan_add_rms_q8(void) {
                 TEST_ASSERT(q36_gpu_add_rms_norm_tensor(ref_norm, ref_sum, a, b,
                     weights, bytes, 0, n, 1, 1e-6f) != 0);
                 TEST_ASSERT(q36_gpu_quantize_q8_k_tensor(ref_q, ref_norm, n, 1) != 0);
+                q36_gpu_set_dense_model(true);
                 TEST_ASSERT(q36_gpu_add_rms_norm_q8_k_tensor(norm, dst, a, b,
                     weights, bytes, 0, n, 1, 1e-6f, q) != 0);
+                q36_gpu_set_dense_model(false);
                 TEST_ASSERT(q36_gpu_tensor_read(dst, 0, got, nb) != 0);
                 TEST_ASSERT(q36_gpu_tensor_read(ref_sum, 0, want, nb) != 0);
                 TEST_ASSERT(memcmp(got, want, nb) == 0);
@@ -4724,9 +4726,13 @@ static void test_vulkan_kernels(void) {
         test_vulkan_wide_tiles(wide_types[i], wide_bytes[i], 131, wide_types[i] < 16 ? 4163 : 67);
     test_vulkan_wide_tiles(18, 98, 515, 8355);
     test_vulkan_wide_tiles(21, 110, 515, 8355);
+    test_vulkan_wide_tiles(16, 66, 515, 8355);
+    test_vulkan_wide_tiles(17, 74, 515, 8355);
+    test_vulkan_wide_tiles(22, 82, 515, 8355);
+    test_vulkan_wide_tiles(23, 136, 515, 8355);
 #if !defined(Q36_NO_GPU) && !defined(Q36_METAL)
-    const uint32_t decode_types[] = {11, 12, 13, 14, 20, 22},
-                   decode_bytes[] = {110, 144, 176, 210, 18, 82};
+    const uint32_t decode_types[] = {11, 12, 13, 14, 18, 20, 21, 22},
+                   decode_bytes[] = {110, 144, 176, 210, 98, 18, 110, 82};
     for (unsigned i = 0; i < sizeof(decode_types) / sizeof(decode_types[0]); i++) {
         test_vulkan_decode_one(decode_types[i], decode_bytes[i], 768);
         test_vulkan_decode_one(decode_types[i], decode_bytes[i], 5120);

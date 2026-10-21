@@ -24,11 +24,7 @@ layout(constant_id = 0) const uint N_TOKENS = Q36_TOKENS;
 #define N_TOKENS 1
 #endif
 
-#if Q36_TOKENS > 1
 #define UNROLL [[unroll]]
-#else
-#define UNROLL
-#endif
 
 layout(push_constant) uniform Push {
     uint out_dim;
@@ -51,9 +47,7 @@ const uint Q8K_WORDS = 74u;
 const uint TAB_IQ3XXS_GRID = 3104u;
 
 shared uint grid_lut[256];
-#if Q36_TOKENS > 1
 shared uvec2 sign_lut[16];
-#endif
 
 uint load_u8(uint off) {
     return (uint(wh[off >> 1u]) >> ((off & 1u) * 8u)) & 255u;
@@ -68,19 +62,10 @@ uint load_u32(uint off) {
     return uint(wh[i]) | (uint(wh[i + 1u]) << 16u);
 }
 
-vec4 unpack_i8(uint v) {
-    return vec4(float(bitfieldExtract(int(v), 0, 8)),
-                float(bitfieldExtract(int(v), 8, 8)),
-                float(bitfieldExtract(int(v), 16, 8)),
-                float(bitfieldExtract(int(v), 24, 8)));
-}
-
-#if Q36_TOKENS > 1
 int signed_bytes(uint grid, uint signs) {
     uvec2 mask = sign_lut[signs & 15u];
     return int((grid ^ mask.x) + mask.y);
 }
-#endif
 
 void main(void) {
     uint lid = gl_LocalInvocationID.x;
@@ -91,30 +76,20 @@ void main(void) {
         UNROLL for (uint r = 0u; r < ROWS; r++) acc[t][r] = 0.0;
     UNROLL for (uint i = lid; i < 256u; i += 64u)
         grid_lut[i] = tables[TAB_IQ3XXS_GRID + i];
-#if Q36_TOKENS > 1
     /* Build each byte mask once instead of spreading signs for every grid. */
     if (lid < 16u) {
         uint bits = (lid * 0x00204081u) & 0x01010101u;
         sign_lut[lid] = uvec2(bits * 255u, bits);
     }
-#endif
     barrier();
 
     for (uint b = lid >> 3u; b < pc.blocks; b += 8u) {
         uint qbase = b * Q8K_WORDS;
-#if Q36_TOKENS > 1
         int qv[N_TOKENS][8];
-#else
-        vec4 qv[N_TOKENS][8];
-#endif
         float yd[N_TOKENS];
         UNROLL for (uint t = 0u; t < N_TOKENS; t++) {
             uint offset = t * pc.blocks * Q8K_WORDS;
-#if Q36_TOKENS > 1
             UNROLL for (uint l = 0u; l < 8u; l++) qv[t][l] = int(q8[offset + qbase + 2u + 8u * itid + l]);
-#else
-            UNROLL for (uint l = 0u; l < 8u; l++) qv[t][l] = unpack_i8(q8[offset + qbase + 2u + 8u * itid + l]);
-#endif
             yd[t] = uintBitsToFloat(q8[offset + qbase]);
         }
         uint ib = itid;
@@ -128,13 +103,8 @@ void main(void) {
             uint aux = load_u32(base + 66u + 4u * ib);
             /* These 32 byte products sum exactly in f32; packed integer dots
              * preserve the decode result before applying float scales. */
-#if Q36_TOKENS > 1
             int sum[N_TOKENS];
             UNROLL for (uint t = 0u; t < N_TOKENS; t++) sum[t] = 0;
-#else
-            float sum[N_TOKENS];
-            UNROLL for (uint t = 0u; t < N_TOKENS; t++) sum[t] = 0.0;
-#endif
             UNROLL for (uint part = 0u; part < 2u; part++) {
                 uint qs = load_u32(base + 2u + 8u * ib + 4u * part);
                 UNROLL for (uint l = 0u; l < 2u; l++) {
@@ -143,39 +113,12 @@ void main(void) {
                     uint parity = bitCount(signs) & 1u;
                     uint grid0 = grid_lut[(qs >> (16u * l)) & 255u];
                     uint grid1 = grid_lut[(qs >> (16u * l + 8u)) & 255u];
-#if Q36_TOKENS > 1
                     int w0 = signed_bytes(grid0, signs);
                     int w1 = signed_bytes(grid1, (signs >> 4u) | (parity << 3u));
-#else
-                    vec4 w0 = unpack_i8(grid0) * vec4(
-                        (signs & 1u) != 0u ? -1.0 : 1.0,
-                        (signs & 2u) != 0u ? -1.0 : 1.0,
-                        (signs & 4u) != 0u ? -1.0 : 1.0,
-                        (signs & 8u) != 0u ? -1.0 : 1.0);
-                    signs >>= 4u;
-                    vec4 w1 = unpack_i8(grid1) * vec4(
-                        (signs & 1u) != 0u ? -1.0 : 1.0,
-                        (signs & 2u) != 0u ? -1.0 : 1.0,
-                        (signs & 4u) != 0u ? -1.0 : 1.0,
-                        parity != 0u ? -1.0 : 1.0);
-#endif
                     uint q = 4u * part + 2u * l;
                     UNROLL for (uint t = 0u; t < N_TOKENS; t++) {
-#if Q36_TOKENS > 1
                         sum[t] += dotPacked4x8EXT(w0, qv[t][q]);
                         sum[t] += dotPacked4x8EXT(w1, qv[t][q + 1u]);
-#else
-                        vec4 q0 = qv[t][q];
-                        vec4 q1 = qv[t][q + 1u];
-                        sum[t] = fma(w0.x, q0.x,
-                              fma(w0.y, q0.y,
-                              fma(w0.z, q0.z,
-                              fma(w0.w, q0.w,
-                              fma(w1.x, q1.x,
-                              fma(w1.y, q1.y,
-                              fma(w1.z, q1.z,
-                              fma(w1.w, q1.w, sum[t]))))))));
-#endif
                     }
                 }
             }

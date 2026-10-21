@@ -60,6 +60,7 @@ VULKAN_SHADERS := \
 	vulkan/rms_norm_partial.spv \
 	vulkan/add_rms_norm_partial.spv \
 	vulkan/rms_norm_finish.spv \
+	vulkan/rms_norm_finish_q8_k.spv \
 	vulkan/swiglu.spv \
 	vulkan/swiglu_q8_k.spv \
 	vulkan/rope_qwen.spv \
@@ -164,6 +165,7 @@ VULKAN_SHADERS := \
 	vulkan/dense_iq4_xs_decode_r2.spv \
 	vulkan/dense_iq4_xs_mmq.spv \
 	vulkan/dense_iq4_xs_bm64_mmq.spv \
+	vulkan/dense_iq4_xs_bm96_mmq.spv \
 	vulkan/dense_iq4_xs_mmq_n2.spv \
 	vulkan/dense_iq4_xs_mmq_n4.spv \
 	vulkan/dense_iq4_xs_mmq_n8.spv \
@@ -181,6 +183,7 @@ VULKAN_SHADERS := \
 	vulkan/dense_iq2_s_decode.spv \
 	vulkan/dense_extra_mmq.spv \
 	vulkan/dense_extra_bm64_mmq.spv \
+	vulkan/dense_extra_bm96_mmq.spv \
 	vulkan/dense_extra_mmq_n2.spv \
 	vulkan/dense_extra_mmq_n4.spv \
 	vulkan/dense_extra_mmq_n8.spv \
@@ -306,6 +309,9 @@ vulkan/dense_iq4_xs_decode.spv: vulkan/dense_iq4_xs_decode.comp
 vulkan/dense_iq4_xs_bm64_mmq.spv: vulkan/dense_iq4_xs_mmq.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_BM=64 -o $@ $<
 
+vulkan/dense_iq4_xs_bm96_mmq.spv: vulkan/dense_iq4_xs_mmq.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_BM=96 -o $@ $<
+
 vulkan/dense_iq4_xs_mmq.spv: vulkan/dense_iq4_xs_mmq.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
@@ -329,6 +335,9 @@ vulkan/dense_extra_mmq_n%.spv: vulkan/dense_extra_mmq.comp
 
 vulkan/dense_extra_bm64_mmq.spv: vulkan/dense_extra_mmq.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_BM=64 -o $@ $<
+
+vulkan/dense_extra_bm96_mmq.spv: vulkan/dense_extra_mmq.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_BM=96 -o $@ $<
 
 vulkan/dense_extra_mmq.spv: vulkan/dense_extra_mmq.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
@@ -618,6 +627,9 @@ vulkan/add_rms_norm_partial.spv: vulkan/rms_norm_partial.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_ADD=1 -o $@ $<
 
 vulkan/rms_norm_finish.spv: vulkan/rms_norm_finish.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
+
+vulkan/rms_norm_finish_q8_k.spv: vulkan/rms_norm_finish_q8_k.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
 vulkan/gdn_front.spv: vulkan/gdn_front.comp
