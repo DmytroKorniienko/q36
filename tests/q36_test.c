@@ -3548,6 +3548,7 @@ static void test_vulkan_small_tiles(void) {
         {6144, 5120}, {17408, 5120},
     };
     for (unsigned i = 0; i < sizeof(iq3_shapes) / sizeof(iq3_shapes[0]); i++) {
+        test_vulkan_small_dims(10, 84, iq3_shapes[i][1], iq3_shapes[i][0]);
         test_vulkan_small_dims(18, 98, iq3_shapes[i][1], iq3_shapes[i][0]);
         test_vulkan_small_dims(21, 110, iq3_shapes[i][1], iq3_shapes[i][0]);
         test_vulkan_small_dims(23, 136, iq3_shapes[i][1], iq3_shapes[i][0]);

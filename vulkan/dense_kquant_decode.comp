@@ -9,7 +9,7 @@
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
-#if defined(Q36_Q4K_ONLY) || defined(Q36_Q5K_ONLY)
+#if defined(Q36_Q2K_ONLY) || defined(Q36_Q4K_ONLY) || defined(Q36_Q5K_ONLY)
 layout(set = 0, binding = 0) readonly buffer Weights { uint ww[]; };
 #else
 layout(set = 0, binding = 0) readonly buffer Weights { uint16_t wh[]; };
@@ -67,7 +67,7 @@ const uint Q8K_WORDS = 74u;
 #endif
 
 uint load_u8(uint off) {
-#if defined(Q36_Q4K_ONLY) || defined(Q36_Q5K_ONLY)
+#if defined(Q36_Q2K_ONLY) || defined(Q36_Q4K_ONLY) || defined(Q36_Q5K_ONLY)
     return (ww[off >> 2u] >> ((off & 3u) * 8u)) & 255u;
 #else
     return (uint(wh[off >> 1u]) >> ((off & 1u) * 8u)) & 255u;
@@ -75,7 +75,7 @@ uint load_u8(uint off) {
 }
 
 uint load_u32(uint off) {
-#if defined(Q36_Q4K_ONLY) || defined(Q36_Q5K_ONLY)
+#if defined(Q36_Q2K_ONLY) || defined(Q36_Q4K_ONLY) || defined(Q36_Q5K_ONLY)
     return ww[off >> 2u];
 #else
     uint i = off >> 1u;
@@ -88,7 +88,7 @@ int load_i8(uint off) {
 }
 
 float load_f16(uint off) {
-#if defined(Q36_Q4K_ONLY) || defined(Q36_Q5K_ONLY)
+#if defined(Q36_Q2K_ONLY) || defined(Q36_Q4K_ONLY) || defined(Q36_Q5K_ONLY)
     return unpackHalf2x16(ww[off >> 2u] >> ((off & 2u) * 8u)).x;
 #else
     return unpackHalf2x16(uint(wh[off >> 1u])).x;
@@ -221,7 +221,7 @@ vec4 unpack_i8(uint v) {
 }
 
 #if Q36_TOKENS == 1
-#ifdef Q36_INT_DOT
+#if defined(Q36_INT_DOT) || defined(Q36_Q2K_ONLY)
 #define SCALAR_UNROLL [[unroll]]
 #else
 #define SCALAR_UNROLL
@@ -382,6 +382,28 @@ void main(void) {
                 acc[r] = fma(yd, part, acc[r]);
                 continue;
             }
+            if (QTYPE == Q2_K) {
+                /* Gather four coefficients per word and share the scales
+                 * across sixteen values, retaining the original float dot. */
+                uint base = row * pc.row_bytes + 84u * b;
+                uint scale = load_u8(base + itid);
+                float d = load_f16(base + 80u) * float(scale & 15u);
+                float m = load_f16(base + 82u) * float(scale >> 4u);
+                uint shift = 2u * ((itid & 7u) >> 1u);
+                float part = 0.0;
+                SCALAR_UNROLL for (uint i = 0u; i < 4u; i++) {
+                    uint off = base + 16u + (itid >> 3u) * 32u + (itid & 1u) * 16u + i * 4u;
+                    uint packed = (load_u32(off) >> shift) & 0x03030303u;
+                    vec4 wv = d * unpack_i8(packed) - m;
+#ifdef Q36_INT_DOT
+                    part += dot(wv, unpack_i8(uint(qvec[i])));
+#else
+                    part += dot(wv, qvec[i]);
+#endif
+                }
+                acc[r] = fma(yd, part, acc[r]);
+                continue;
+            }
             float part = 0.0;
             SCALAR_UNROLL for (uint i = 0u; i < 4u; i++)
                 part += dot(dequant_word(row, b, 4u * itid + i),
@@ -466,7 +488,16 @@ void main(void) {
                     packed_w[i] = int(packed);
                 }
             } else {
-                [[unroll]] for (uint i = 0u; i < 4u; i++) w[i] = dequant_word(row, b, 4u * part_id + i);
+                uint base = row * pc.row_bytes + 84u * b;
+                uint scale = load_u8(base + part_id);
+                float d = load_f16(base + 80u) * float(scale & 15u);
+                float m = load_f16(base + 82u) * float(scale >> 4u);
+                uint shift = 2u * ((part_id & 7u) >> 1u);
+                [[unroll]] for (uint i = 0u; i < 4u; i++) {
+                    uint off = base + 16u + (part_id >> 3u) * 32u + (part_id & 1u) * 16u + i * 4u;
+                    uint packed = (load_u32(off) >> shift) & 0x03030303u;
+                    w[i] = d * unpack_i8(packed) - m;
+                }
             }
             [[unroll]] for (uint t = 0u; t < N_TOKENS; t++) {
                 uint qbase = (t * pc.blocks + b) * Q8K_WORDS;
