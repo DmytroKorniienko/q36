@@ -268,6 +268,7 @@ typedef struct {
     q36_vk_kernel dense_iq4_xs;
     q36_vk_kernel dense_iq4_xs_decode;
     q36_vk_kernel dense_iq4_xs_decode_batch[7];
+    q36_vk_kernel dense_iq4_xs_verify_i16[4];
     q36_vk_kernel dense_iq4_xs_decode_r2;
     q36_vk_kernel dense_iq4_xs_mmq;
     q36_vk_kernel dense_iq4_xs_bm64_mmq;
@@ -3201,6 +3202,22 @@ int q36_gpu_init(void) {
             }
         }
     }
+    if (q36_vk.bc250) {
+        q36_vk.dense_iq3_s_mmq.path = "vulkan/dense_iq3_s_pair_mmq.spv";
+        q36_vk.dense_iq3_s_bm64_mmq.path = "vulkan/dense_iq3_s_bm64_pair_mmq.spv";
+        q36_vk.dense_iq3_s_bm96_mmq.path = "vulkan/dense_iq3_s_bm96_pair_mmq.spv";
+        q36_vk.dense_iq3_xxs_mmq.path = "vulkan/dense_iq3_xxs_pair_mmq.spv";
+        q36_vk.dense_iq3_xxs_bm64_mmq.path = "vulkan/dense_iq3_xxs_bm64_pair_mmq.spv";
+        q36_vk.dense_iq3_xxs_bm96_mmq.path = "vulkan/dense_iq3_xxs_bm96_pair_mmq.spv";
+        q36_vk.dense_iq4_xs_bm96_mmq.path = "vulkan/dense_iq4_xs_bm96_k2_mmq.spv";
+    }
+    if (q36_vk.bc250 && feat2.features.shaderInt16) {
+        for (unsigned i = 0; i < 4; i++) {
+            q36_vk.dense_iq4_xs_verify_i16[i] = q36_vk.dense_iq4_xs_decode_batch[i + 1];
+            q36_vk.dense_iq4_xs_verify_i16[i].path = "vulkan/dense_iq4_xs_verify_i16.spv";
+            q36_vk.dense_iq4_xs_verify_i16[i].bindings = 4;
+        }
+    }
     q36_vk.subgroup_size_control = subgroup_size_query.subgroupSizeControl &&
         subgroup_size_query.computeFullSubgroups &&
         subgroup_size_props.minSubgroupSize <= 32u &&
@@ -3431,6 +3448,8 @@ void q36_gpu_cleanup(void) {
     q36_vk_kernel_destroy(&q36_vk.dense_iq4_xs_decode);
     for (unsigned i = 0; i < 7; i++)
         q36_vk_kernel_destroy(&q36_vk.dense_iq4_xs_decode_batch[i]);
+    for (unsigned i = 0; i < 4; i++)
+        q36_vk_kernel_destroy(&q36_vk.dense_iq4_xs_verify_i16[i]);
     q36_vk_kernel_destroy(&q36_vk.dense_iq4_xs_decode_r2);
     q36_vk_kernel_destroy(&q36_vk.dense_iq4_xs);
     q36_vk_kernel_destroy(&q36_vk.dense_kquant_mmq);
@@ -4545,6 +4564,9 @@ void q36_gpu_set_micro_batch(bool enabled) {
             q36_vk_kernel_init(&q36_vk.dense_kquant_verify[i][j]);
     if (q36_vk.bc250 && q36_vk.dense_iq3_s_decode_batch[1].bindings == 5u)
         q36_vk_kernel_init(&q36_vk.preexpand_i16);
+    if (q36_vk.dense_iq4_xs_verify_i16[0].path)
+        for (unsigned i = 0; i < 4; i++)
+            q36_vk_kernel_init(&q36_vk.dense_iq4_xs_verify_i16[i]);
     q36_vk_kernel_init(&q36_vk.matmul_q8_0_f32b_nx);
     q36_vk_kernel_init(&q36_vk.mtp_head_mask);
     q36_vk_kernel_init(&q36_vk.mtp_head_q5k);
@@ -8168,12 +8190,20 @@ int q36_gpu_matmul_iq_quant_q8_scaled_tensor(q36_gpu_tensor *out,
         q36_gpu_tensor *weights = q36_vk_weight_get_unlocked(source, weight_bytes);
         ok = weights != NULL;
         if (ok) {
-            const q36_gpu_tensor *bindings[3] = { weights, q8, out };
+            const q36_gpu_tensor *bindings[4] = { weights, q8, out, NULL };
             if (q36_vk_micro_batch && n_tok > 1u && n_tok <= 8u) {
                 struct { uint32_t out_dim, blocks, row_bytes; float scale; uint32_t n_tok; }
                     push = { out_dim, blocks, row_bytes, scale, n_tok };
                 unsigned i = (unsigned)n_tok - 2u;
-                ok = q36_vk_run_unlocked("dense_iq4_verify", &q36_vk.dense_iq4_xs_decode_batch[i],
+                q36_vk_kernel *kernel = &q36_vk.dense_iq4_xs_decode_batch[i];
+                /* Native i16 wins at three through six tokens; reuse the IQ3 raw ring. */
+                if (n_tok >= 3u && n_tok <= 6u && in_dim >= 4096u && out_dim >= 1024u &&
+                    q36_vk.dense_iq4_xs_verify_i16[0].path) {
+                    kernel = &q36_vk.dense_iq4_xs_verify_i16[i - 1u];
+                    bindings[3] = q36_vk_predequant_b16_unlocked(q8, n_tok, blocks, true);
+                    if (!bindings[3]) { pthread_mutex_unlock(&q36_vk_mu); return 0; }
+                }
+                ok = q36_vk_run_unlocked("dense_iq4_verify", kernel,
                     bindings, &push, sizeof(push), ((uint32_t)out_dim + 3u) / 4u, 1, 1);
             } else if (n_tok == 1u) {
                 struct {

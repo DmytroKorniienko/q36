@@ -47,7 +47,11 @@ const uint Q8K_WORDS = 74u;
 const uint TAB_IQ3S_GRID = 2592u;
 
 shared f16vec2 buf_a[BM * STRIDE];
+#ifdef Q36_TOKEN_PAIRS
+#include "dense_token_pairs.glsl"
+#else
 shared f16vec2 buf_b[BN * STRIDE];
+#endif
 shared uint grid_lut[512];
 shared uint sign_lut[16];
 shared float weight_scale[BM];
@@ -151,6 +155,9 @@ void main(void) {
                 }
             }
 
+#ifdef Q36_TOKEN_PAIRS
+            stage_token_pairs(lid, tok0, qb, slice_tile);
+#else
             for (uint i = lid; i < BN * 2u * SLICES_PER_TILE; i += 128u) {
                 uint lt = i / (2u * SLICES_PER_TILE);
                 uint part = i % (2u * SLICES_PER_TILE);
@@ -169,6 +176,7 @@ void main(void) {
                         buf_b[dst + j] = f16vec2(0.0);
                 }
             }
+#endif
             barrier();
 
 #if Q36_BN <= 8
@@ -193,17 +201,33 @@ void main(void) {
                     av[r] = buf_a[(thread_row * ROWS_PER_LANE + r) *
                                       STRIDE + k];
 #endif
+#ifdef Q36_TOKEN_PAIRS
+                [[unroll]] for (uint tp = 0u; tp < 2u; tp++) {
+                    uint pair = warp_tok * 16u + tp * 8u + thread_tok;
+                    bv[2u * tp] = buf_b[2u * k * B_STRIDE + pair];
+                    bv[2u * tp + 1u] = buf_b[(2u * k + 1u) * B_STRIDE + pair];
+                }
+#else
                 [[unroll]] for (uint st = 0u; st < 2u; st++)
                     [[unroll]] for (uint t = 0u; t < 2u; t++)
                         bv[st * 2u + t] = buf_b[(warp_tok * 32u + st * 16u +
                             thread_tok * 2u + t) * STRIDE + k];
+#endif
                 [[unroll]] for (uint tp = 0u; tp < 2u; tp++)
                     [[unroll]] for (uint rr = 0u; rr < ROWS_PER_LANE; rr++)
+#ifdef Q36_TOKEN_PAIRS
+                        sum[tp * ROWS_PER_LANE + rr] = fma(f16vec2(av[rr].x),
+                            bv[2u * tp],
+                            fma(f16vec2(av[rr].y),
+                                bv[2u * tp + 1u],
+                                sum[tp * ROWS_PER_LANE + rr]));
+#else
                         sum[tp * ROWS_PER_LANE + rr] = fma(f16vec2(av[rr].x),
                             f16vec2(bv[2u * tp].x, bv[2u * tp + 1u].x),
                             fma(f16vec2(av[rr].y),
                                 f16vec2(bv[2u * tp].y, bv[2u * tp + 1u].y),
                                 sum[tp * ROWS_PER_LANE + rr]));
+#endif
             }
 #endif
             barrier();

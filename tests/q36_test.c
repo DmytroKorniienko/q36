@@ -3291,7 +3291,7 @@ static void test_vulkan_small_dims(uint32_t type, uint32_t block_bytes,
         for (uint32_t block = 0; block < blocks; block++) {
             uint8_t *p = weights + row * row_bytes + block * block_bytes;
             uint16_t d = test_float_to_f16(0.0001f * (float)(1 + row % 7 + block));
-            if (type == 21 && in_dim >= 5120u && ((row + block) & 1u)) d ^= 0x8000u;
+            if ((type == 18 || type == 21 || type == 23) && in_dim >= 5120u && ((row + block) & 1u)) d ^= 0x8000u;
             for (uint32_t i = 0; i < block_bytes; i++)
                 p[i] = (uint8_t)(row * 29u + block * 71u + i * 13u);
             uint32_t d_off = type == 10 ? 80 : type == 11 ? 108 : type == 14 ? 208 : 0;
@@ -3302,7 +3302,7 @@ static void test_vulkan_small_dims(uint32_t type, uint32_t block_bytes,
     }
     for (uint32_t i = 0; i < tokens * in_dim; i++) {
         input[i] = sinf((float)i * 0.031f) * (0.25f + (float)(i % 11) * 0.03125f);
-        if (type == 21 && in_dim >= 5120u && i / in_dim < 2u)
+        if ((type == 18 || type == 21 || type == 23) && in_dim >= 5120u && i / in_dim < 2u)
             input[i] = i / in_dim == 0u ? 1.0f : -1.0f;
     }
     TEST_ASSERT(q36_gpu_init() != 0);
@@ -3466,8 +3466,12 @@ static void test_vulkan_small_tiles(void) {
         {5120, 6144}, {5120, 10240}, {5120, 12288}, {5120, 17408},
         {6144, 5120}, {17408, 5120},
     };
-    for (unsigned i = 0; i < sizeof(iq3_shapes) / sizeof(iq3_shapes[0]); i++)
+    for (unsigned i = 0; i < sizeof(iq3_shapes) / sizeof(iq3_shapes[0]); i++) {
+        test_vulkan_small_dims(18, 98, iq3_shapes[i][1], iq3_shapes[i][0]);
         test_vulkan_small_dims(21, 110, iq3_shapes[i][1], iq3_shapes[i][0]);
+        test_vulkan_small_dims(23, 136, iq3_shapes[i][1], iq3_shapes[i][0]);
+    }
+    test_vulkan_small_dims(23, 136, 1024, 5120);
 #endif
 }
 

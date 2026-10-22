@@ -12,6 +12,9 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 layout(set = 0, binding = 0) readonly buffer Weights { uint ww[]; };
 layout(set = 0, binding = 1) readonly buffer Q8K { uint q8[]; };
 layout(set = 0, binding = 2) writeonly buffer Output { float y[]; };
+#ifdef Q36_I16
+layout(set = 0, binding = 3) readonly buffer Raw { uint raw_values[]; };
+#endif
 
 #ifndef Q36_TOKENS
 #define Q36_TOKENS 1
@@ -73,6 +76,13 @@ vec4 unpack_iq4(uint v, uint shift) {
 #endif
 
 #if Q36_TOKENS > 1
+#ifdef Q36_I16
+uvec2 packed_iq4(uint v, uint shift) {
+    uint pairs = (v >> shift) & 0x0f0f0f0fu;
+    pairs |= pairs >> 4u;
+    return uvec2(pair_lut[pairs & 255u], pair_lut[(pairs >> 16u) & 255u]);
+}
+#else
 int packed_iq4(uint v, uint shift) {
     uint pairs = (v >> shift) & 0x0f0f0f0fu;
     pairs |= pairs >> 4u;
@@ -80,6 +90,7 @@ int packed_iq4(uint v, uint shift) {
     uint b = (pairs >> 16u) & 255u;
     return int(pair_lut[a] | (pair_lut[b] << 16u));
 }
+#endif
 #endif
 
 void main(void) {
@@ -90,9 +101,15 @@ void main(void) {
     UNROLL for (uint t = 0u; t < N_TOKENS; t++)
         UNROLL for (uint r = 0u; r < ROWS; r++) acc[t][r] = 0.0;
 #if Q36_TOKENS > 1
+#ifdef Q36_I16
+    for (uint i = lid; i < 256u; i += 64u)
+        pair_lut[i] = uint(values[i & 15u] & 65535) |
+                      (uint(values[i >> 4u] & 65535) << 16u);
+#else
     /* A pair per lookup halves LDS reads while constructing the same bytes. */
     for (uint i = lid; i < 256u; i += 64u)
         pair_lut[i] = uint(values[i & 15u] & 255) | (uint(values[i >> 4u] & 255) << 8u);
+#endif
 #else
     if (lid < 16u) value_lut[lid] = float(values[lid]);
 #endif
@@ -100,18 +117,22 @@ void main(void) {
 
     for (uint b = lid >> 3u; b < pc.blocks; b += 8u) {
         uint qbase = b * Q8K_WORDS + 2u + 8u * itid;
+#ifndef Q36_I16
 #if Q36_TOKENS > 1
         int qv[N_TOKENS][8];
 #else
         vec4 qv[N_TOKENS][8];
 #endif
+#endif
         float yd[N_TOKENS];
         UNROLL for (uint t = 0u; t < N_TOKENS; t++) {
             uint offset = t * pc.blocks * Q8K_WORDS;
+#ifndef Q36_I16
 #if Q36_TOKENS > 1
             UNROLL for (uint l = 0u; l < 8u; l++) qv[t][l] = int(q8[offset + qbase + l]);
 #else
             UNROLL for (uint l = 0u; l < 8u; l++) qv[t][l] = unpack_i8(q8[offset + qbase + l]);
+#endif
 #endif
             yd[t] = uintBitsToFloat(q8[offset + b * Q8K_WORDS]);
         }
@@ -136,7 +157,10 @@ void main(void) {
 #endif
             UNROLL for (uint l = 0u; l < 4u; l++) {
                 uint packed = ww[base + 2u + 4u * ib + l];
-#if Q36_TOKENS > 1
+#ifdef Q36_I16
+                uvec2 w0 = packed_iq4(packed, 0u);
+                uvec2 w1 = packed_iq4(packed, 4u);
+#elif Q36_TOKENS > 1
                 int w0 = packed_iq4(packed, 0u);
                 int w1 = packed_iq4(packed, 4u);
 #else
@@ -144,7 +168,16 @@ void main(void) {
                 vec4 w1 = unpack_iq4(packed, 4u);
 #endif
                 UNROLL for (uint t = 0u; t < N_TOKENS; t++) {
-#if Q36_TOKENS > 1
+#ifdef Q36_I16
+                    /* Two products per i16 lane fit even at 2 * 127 * 128.
+                     * Widen each partial before adding low and high halves. */
+                    uint raw = (t * pc.blocks + b) * 128u + 16u * itid + 2u * l;
+                    i16vec2 a = unpackInt2x16(int(w0.x)) * unpackInt2x16(int(raw_values[raw]));
+                    a += unpackInt2x16(int(w0.y)) * unpackInt2x16(int(raw_values[raw + 1u]));
+                    i16vec2 c = unpackInt2x16(int(w1.x)) * unpackInt2x16(int(raw_values[raw + 8u]));
+                    c += unpackInt2x16(int(w1.y)) * unpackInt2x16(int(raw_values[raw + 9u]));
+                    sum[t] += int(a.x) + int(a.y) + int(c.x) + int(c.y);
+#elif Q36_TOKENS > 1
                     sum[t] += dotPacked4x8EXT(w0, qv[t][l]);
                     sum[t] += dotPacked4x8EXT(w1, qv[t][l + 4u]);
 #else
