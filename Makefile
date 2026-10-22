@@ -118,6 +118,8 @@ VULKAN_SHADERS := \
 	vulkan/attn_reduce.spv \
 	vulkan/attn_decode_fused.spv \
 	vulkan/attn_decode_split.spv \
+	vulkan/attn_decode_gqa6.spv \
+	vulkan/attn_decode_gqa6_q4.spv \
 	vulkan/attn_prefill_qtile.spv \
 	vulkan/attn_prefill_qtile2.spv \
 	vulkan/attn_prefill_qtile1_gqa6.spv \
@@ -128,6 +130,7 @@ VULKAN_SHADERS := \
 	vulkan/moe_tiles.spv \
 	vulkan/kv_store.spv \
 	vulkan/kv_store_quant.spv \
+	vulkan/kv_store_q4_key.spv \
 	vulkan/rms_norm_rope_kv_qwen_quant.spv \
 	vulkan/top2.spv \
 	vulkan/mtp_head_mask.spv \
@@ -190,12 +193,8 @@ VULKAN_SHADERS := \
 	vulkan/dense_extra_decode.spv \
 	vulkan/dense_extra_decode_float.spv \
 	vulkan/dense_iq2_xxs_verify.spv \
-	vulkan/dense_iq2_xs_verify_n2.spv \
-	vulkan/dense_iq2_xs_verify_n4.spv \
-	vulkan/dense_iq2_xs_verify_n8.spv \
-	vulkan/dense_iq2_s_verify_n2.spv \
-	vulkan/dense_iq2_s_verify_n4.spv \
-	vulkan/dense_iq2_s_verify_n8.spv \
+	vulkan/dense_iq2_xs_verify.spv \
+	vulkan/dense_iq2_s_verify.spv \
 	vulkan/dense_extra_verify.spv \
 	vulkan/dense_iq4_nl_decode.spv \
 	vulkan/dense_iq2_s_decode.spv \
@@ -281,8 +280,8 @@ vulkan/dense_iq3_s_decode.spv: vulkan/dense_iq3_s_decode.comp q36_iq3s_grid_valu
 vulkan/dense_iq3_s_decode_full.spv: vulkan/dense_iq3_s_decode.comp q36_iq3s_grid_values.inc
 	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_BOUNDS=0 -o $@ $<
 
-vulkan/dense_iq3_xxs_verify.spv: vulkan/dense_iq3_xxs_decode.comp
-	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_ROWS=4 -DQ36_TOKENS=8 $< -o $@
+vulkan/dense_iq3_xxs_verify.spv: vulkan/dense_iq3_xxs_decode.comp Makefile
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_ROWS=4 -DQ36_TOKENS=8 -DQ36_BOUNDS=0 $< -o $@
 
 vulkan/dense_iq4_xs_verify_i16.spv: vulkan/dense_iq4_xs_decode.comp Makefile
 	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_ROWS=4 -DQ36_TOKENS=8 -DQ36_I16=1 -DQ36_BOUNDS=0 -o $@ $<
@@ -293,8 +292,8 @@ vulkan/dense_iq4_xs_verify.spv: vulkan/dense_iq4_xs_decode.comp
 vulkan/dense_extra_verify.spv: vulkan/dense_extra_decode.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_ROWS=4 -DQ36_TOKENS=8 $< -o $@
 
-vulkan/dense_q%k_verify.spv: vulkan/dense_kquant_decode.comp
-	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_ROWS=4 -DQ36_TOKENS=8 -DQ36_Q$*K_ONLY=1 $< -o $@
+vulkan/dense_q%k_verify.spv: vulkan/dense_kquant_decode.comp Makefile
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_ROWS=4 -DQ36_TOKENS=8 -DQ36_BOUNDS=0 -DQ36_Q$*K_ONLY=1 $< -o $@
 
 vulkan/mtp_head_q5k.spv: vulkan/dense_kquant_decode.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_Q5K_ONLY=1 -DQ36_HEAD_MASK=1 $< -o $@
@@ -302,11 +301,11 @@ vulkan/mtp_head_q5k.spv: vulkan/dense_kquant_decode.comp
 vulkan/mtp_head_mask.spv: vulkan/mtp_head_mask.comp
 	$(GLSLC) -O --target-env=vulkan1.1 $< -o $@
 
-vulkan/dense_iq2_s_verify_n%.spv: vulkan/dense_extra_decode.comp
-	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_ROWS=4 -DQ36_TOKENS=$* -DQ36_TYPE=22 $< -o $@
+vulkan/dense_iq2_s_verify.spv: vulkan/dense_extra_decode.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_ROWS=4 -DQ36_TOKENS=8 -DQ36_TYPE=22 $< -o $@
 
-vulkan/dense_iq2_xs_verify_n%.spv: vulkan/dense_extra_decode.comp
-	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_ROWS=4 -DQ36_TOKENS=$* -DQ36_TYPE=17 $< -o $@
+vulkan/dense_iq2_xs_verify.spv: vulkan/dense_extra_decode.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_ROWS=4 -DQ36_TOKENS=8 -DQ36_TYPE=17 $< -o $@
 
 vulkan/dense_iq2_xxs_verify.spv: vulkan/dense_extra_decode.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_ROWS=4 -DQ36_TOKENS=8 -DQ36_TYPE=16 $< -o $@
@@ -547,6 +546,15 @@ vulkan/attn_decode_fused.spv: vulkan/attn_decode_fused.comp
 
 vulkan/attn_decode_split.spv: vulkan/attn_decode_split.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
+
+vulkan/attn_decode_gqa6.spv: vulkan/attn_decode_gqa6.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
+
+vulkan/attn_decode_gqa6_q4.spv: vulkan/attn_decode_gqa6.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_K_Q4=1 -o $@ $<
+
+vulkan/kv_store_q4_key.spv: vulkan/kv_store_quant.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_KEYS=1 -o $@ $<
 
 vulkan/attn_prefill_qtile.spv: vulkan/attn_prefill_qtile.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<

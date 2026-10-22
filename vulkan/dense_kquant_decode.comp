@@ -439,7 +439,9 @@ void main(void) {
     for (uint b = lid >> 4u; b < pc.blocks; b += 4u) {
         [[unroll]] for (uint r = 0u; r < ROWS; r++) {
             uint row = first_row + r;
+#if Q36_BOUNDS
             if (row >= pc.out_dim) continue;
+#endif
             vec4 w[4];
             int packed_w[4];
             float wd = 0.0, wm = 0.0, sc = 0.0, mn = 0.0;
@@ -531,7 +533,11 @@ void main(void) {
         [[unroll]] for (uint r = 0u; r < ROWS; r++) {
             float total = subgroupAdd(acc[t][r]);
             uint row = first_row + r;
-            if (lid == 0u && row < pc.out_dim) y[t * pc.out_dim + row] = total * pc.scale;
+            if (lid == 0u
+#if Q36_BOUNDS
+                && row < pc.out_dim
+#endif
+            ) y[t * pc.out_dim + row] = total * pc.scale;
         }
     }
 }

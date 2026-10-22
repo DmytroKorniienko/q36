@@ -19,7 +19,7 @@ layout(set = 0, binding = 3) readonly buffer Tables { uint tables[]; };
 #define Q36_TOKENS 1
 #endif
 
-#if Q36_TOKENS > 1 && (!defined(Q36_TYPE) || (Q36_TYPE != 17 && Q36_TYPE != 22))
+#if Q36_TOKENS > 1
 layout(constant_id = 0) const uint N_TOKENS = Q36_TOKENS;
 #else
 #define N_TOKENS Q36_TOKENS
@@ -287,13 +287,12 @@ void main(void) {
     init_signs();
     uint lid=gl_LocalInvocationID.x,group=lid&7u;
     uint first=gl_WorkGroupID.x*ROWS;
-    float acc[Q36_TOKENS][ROWS];
-    UNROLL for(uint t=0u;t<Q36_TOKENS;t++)
+    float acc[N_TOKENS][ROWS];
+    UNROLL for(uint t=0u;t<N_TOKENS;t++)
         UNROLL for(uint r=0u;r<ROWS;r++)acc[t][r]=0.0;
     for(uint b=lid>>3u;b<pc.blocks;b+=8u) {
         UNROLL for(uint r=0u;r<ROWS;r++) {
             uint row=first+r;
-            if(row>=pc.out_dim)continue;
             uint base=row*pc.row_bytes+b*(QTYPE==IQ2_S?82u:74u);
             float wd=unpackHalf2x16(load_u16(base)).x*0.25;
             uint scales=load_u8(base+(QTYPE==IQ2_S?74u:66u)+group);
@@ -306,14 +305,15 @@ void main(void) {
                     signs=load_u8(base+34u+4u*group+l);
                 } else {
                     uint qs=load_u16(base+2u+8u*group+2u*l);
-                    entry=qs&511u;signs=table_u8(TAB_KSIGNS_BYTES+(qs>>9u));
+                    entry=qs&511u;
+                    uint bits=qs>>9u;
+                    signs=bits|((bitCount(bits)&1u)<<7u);
                 }
                 uint tab=(QTYPE==IQ2_S?TAB_IQ2S:TAB_IQ2XS)+2u*entry;
                 weights[l]=ivec2(signed_bytes(tables[tab],signs),signed_bytes(tables[tab+1u],signs>>4u));
                 d[l]=wd*(0.5+float(l<2u?scales&15u:scales>>4u));
             }
-            UNROLL for(uint t=0u;t<Q36_TOKENS;t++) {
-                if(t>=pc.n_tok)continue;
+            UNROLL for(uint t=0u;t<N_TOKENS;t++) {
                 uint qbase=(t*pc.blocks+b)*Q8K_WORDS+2u+8u*group;
                 float sum=0.0;
                 UNROLL for(uint l=0u;l<4u;l++) {
@@ -325,11 +325,10 @@ void main(void) {
             }
         }
     }
-    UNROLL for(uint t=0u;t<Q36_TOKENS;t++) {
-        if(t>=pc.n_tok)continue;
+    UNROLL for(uint t=0u;t<N_TOKENS;t++) {
         UNROLL for(uint r=0u;r<ROWS;r++) {
             float value=subgroupAdd(acc[t][r]);
-            if(lid==0u&&first+r<pc.out_dim)y[t*pc.out_dim+first+r]=value*pc.scale;
+            if(lid==0u)y[t*pc.out_dim+first+r]=value*pc.scale;
         }
     }
 }

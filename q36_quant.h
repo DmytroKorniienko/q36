@@ -13,6 +13,7 @@ Q36_QUANT_LINKAGE uint16_t q36_quant_f32_to_f16(float f);
 Q36_QUANT_LINKAGE void q36_quant_q8_0(const float *x, void *out, int64_t n);
 Q36_QUANT_LINKAGE void q36_quant_q4_0(const float *x, void *out, int64_t n);
 Q36_QUANT_LINKAGE void q36_quant_q4_0_kv(const float *x, void *out, int64_t n);
+Q36_QUANT_LINKAGE void q36_quant_q4_0_key(const float *x, void *out, int64_t n);
 Q36_QUANT_LINKAGE void q36_quant_q8_k(const float *x, void *out, int64_t n);
 Q36_QUANT_LINKAGE bool q36_quant_dot_q8_k(
         uint32_t type, const void *weights, const void *activation, uint32_t n, float *out);

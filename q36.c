@@ -1743,6 +1743,73 @@ void q36_quant_q4_0(const float *x, void *out, int64_t n) {
 void q36_quant_q4_0_kv(const float *x, void *out, int64_t n) {
     q36_quant_q4_0_impl(x, out, n, true);
 }
+
+static float q36_q4_key_error(const float *x, float d) {
+    float dh = q36_quant_f16_to_f32(q36_quant_f32_to_f16(d));
+    float inv = d ? (float)(1.0 / (double)d) : 0.0f;
+    double err = 0.0;
+    for (int i = 0; i < 32; i++) {
+        int q = (int)(x[i] * inv + 8.5f);
+        if (q < 0) q = 0;
+        if (q > 15) q = 15;
+        double e = (double)x[i] - (double)dh * (q - 8);
+        err += e * e;
+    }
+    return (float)err;
+}
+
+static float q36_q4_key_fit(const float *x, float d) {
+    float inv = d ? (float)(1.0 / (double)d) : 0.0f;
+    double num = 0.0;
+    int den = 0;
+    for (int i = 0; i < 32; i++) {
+        int q = (int)(x[i] * inv + 8.5f);
+        if (q < 0) q = 0;
+        if (q > 15) q = 15;
+        q -= 8;
+        num += (double)x[i] * q;
+        den += q * q;
+    }
+    return den ? (float)(num / den) : d;
+}
+
+void q36_quant_q4_0_key(const float *x, void *out, int64_t n) {
+    if (!x || !out || n < 0 || n % 32) return;
+    q36_block_q4_0 *y = out;
+    for (int64_t b = 0; b < n / 32; b++) {
+        const float *row = x + b * 32;
+        float extreme = 0.0f;
+        for (int i = 0; i < 32; i++)
+            if (fabsf(row[i]) > fabsf(extreme)) extreme = row[i];
+        float initial = extreme / -8.0f;
+        float best = initial + (q36_q4_key_fit(row, initial) - initial) * 0.25f;
+        float error = q36_q4_key_error(row, best);
+        /* Keep the existing encoding unless a rounded scale improves it.
+         * Both signs matter: Q4_0 has eight negative levels and seven positive. */
+        for (int sign = 0; sign < 2; sign++) {
+            float d = sign ? (float)(-(double)initial * 8.0 / 7.0) : initial;
+            for (int pass = 0; pass < 2; pass++) {
+                d = q36_quant_f16_to_f32(q36_quant_f32_to_f16(d));
+                d = q36_q4_key_fit(row, d);
+                d = q36_quant_f16_to_f32(q36_quant_f32_to_f16(d));
+                float e = q36_q4_key_error(row, d);
+                if (e < error) { error = e; best = d; }
+            }
+        }
+        if (extreme == 0.0f) best = -0.0f;
+        float inv = best ? (float)(1.0 / (double)best) : 0.0f;
+        y[b].d = q36_quant_f32_to_f16(best);
+        for (int i = 0; i < 16; i++) {
+            int q0 = (int)(row[i] * inv + 8.5f);
+            int q1 = (int)(row[i + 16] * inv + 8.5f);
+            if (q0 < 0) q0 = 0;
+            if (q1 < 0) q1 = 0;
+            if (q0 > 15) q0 = 15;
+            if (q1 > 15) q1 = 15;
+            y[b].qs[i] = (uint8_t)(q0 | (q1 << 4));
+        }
+    }
+}
 #if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC pop_options
 #endif
@@ -6538,7 +6605,10 @@ static void q36_full_attn_cache_store(q36_full_attn_cache *cache, uint32_t pos, 
     if (!cache || pos >= cache->cap) return;
     dstk = cache->k + (uint64_t)pos * cache->k_row_bytes;
     dstv = cache->v + (uint64_t)pos * cache->v_row_bytes;
-    q36_kv_cache_store_row(dstk, cache->type_k, k, Q36_N_HEAD_KV * Q36_N_HEAD_DIM);
+    if (cache->type_k == Q36_KV_CACHE_Q4_0)
+        q36_quant_q4_0_key(k, dstk, Q36_N_HEAD_KV * Q36_N_HEAD_DIM);
+    else
+        q36_kv_cache_store_row(dstk, cache->type_k, k, Q36_N_HEAD_KV * Q36_N_HEAD_DIM);
     q36_kv_cache_store_row(dstv, cache->type_v, v, Q36_N_HEAD_KV * Q36_N_VALUE_DIM);
     if (cache->len <= pos) cache->len = pos + 1u;
 }
@@ -9181,10 +9251,12 @@ static bool q36_mtp_catchup(q36_session *s, const int *tokens,
     q36_vulkan_runtime *rt = s->runtime;
     uint64_t row = (uint64_t)Q36_N_EMBD * sizeof(float);
     if (!q36_gpu_tensor_copy(rt->mtp_target_h, 0, rt->last_h, 0, row) ||
-        (!target_saved && !q36_gpu_tensor_copy(rt->mtp_target_h, row, rt->norm, 0, n_tok * row)) ||
-        !q36_mtp_forward(s, tokens, n_tok, pos, rt->mtp_target_h, false) ||
-        !q36_gpu_tensor_copy(rt->last_h, 0, rt->mtp_target_h, n_tok * row, row)) return false;
-    return true;
+        (!target_saved && !q36_gpu_tensor_copy(rt->mtp_target_h, row, rt->norm, 0, n_tok * row))) return false;
+    /* Accepted blocks use the draft's decode arithmetic, including Q6_K. */
+    q36_gpu_set_micro_batch(n_tok <= Q36_MTP_VERIFY_MAX);
+    bool ok = q36_mtp_forward(s, tokens, n_tok, pos, rt->mtp_target_h, false);
+    q36_gpu_set_micro_batch(false);
+    return ok && q36_gpu_tensor_copy(rt->last_h, 0, rt->mtp_target_h, n_tok * row, row);
 }
 
 static bool q36_mtp_eval_vulkan(q36_session *s, int token, uint32_t pos,

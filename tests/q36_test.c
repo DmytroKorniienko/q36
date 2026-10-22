@@ -305,6 +305,28 @@ static void test_quant_primitives(void) {
 
     TEST_ASSERT(q36_parse_kv_cache_type("q4_0", &(q36_kv_cache_type){0}));
     TEST_ASSERT(!strcmp(q36_kv_cache_type_name(Q36_KV_CACHE_Q4_0), "q4_0"));
+    for (int block = 0; block < 128; block++) {
+        q4_0_block old, key;
+        for (int i = 0; i < 32; i++) {
+            float x = sinf((float)(block * 37 + i * 13)) * (0.2f + (float)(i % 7));
+            if (block % 4 == 0) x += 2.0f;
+            if (block % 4 == 1 && i == 0) x *= 20.0f;
+            x0[i] = block == 0 ? 0.0f : x;
+        }
+        q36_quant_q4_0_kv(x0, &old, 32);
+        q36_quant_q4_0_key(x0, &key, 32);
+        double old_error = 0.0, key_error = 0.0;
+        for (int i = 0; i < 32; i++) {
+            int shift = i < 16 ? 0 : 4;
+            int a_q = ((old.qs[i & 15] >> shift) & 15) - 8;
+            int b_q = ((key.qs[i & 15] >> shift) & 15) - 8;
+            double a = (double)x0[i] - (double)q36_quant_f16_to_f32(old.d) * a_q;
+            double b = (double)x0[i] - (double)q36_quant_f16_to_f32(key.d) * b_q;
+            old_error += a * a;
+            key_error += b * b;
+        }
+        TEST_ASSERT(key_error <= old_error * 1.000001 + 1.0e-12);
+    }
     TEST_ASSERT(q36_default_kv_cache_type_k(Q36_BACKEND_VULKAN, false) == Q36_KV_CACHE_Q8_0);
     TEST_ASSERT(q36_default_kv_cache_type_v(Q36_BACKEND_VULKAN, false) == Q36_KV_CACHE_Q4_0);
     TEST_ASSERT(q36_default_kv_cache_type_k(Q36_BACKEND_VULKAN, true) == Q36_KV_CACHE_F16);
@@ -2339,7 +2361,7 @@ static void test_vulkan_kv_store_quant_case(uint32_t type_k, uint32_t type_v) {
         if (type_k == Q36_KV_CACHE_Q8_0)
             q36_quant_q8_0(k_host + (size_t)t * row, k_exp + (size_t)t * k_row_bytes, row);
         else
-            q36_quant_q4_0_kv(k_host + (size_t)t * row, k_exp + (size_t)t * k_row_bytes, row);
+            q36_quant_q4_0_key(k_host + (size_t)t * row, k_exp + (size_t)t * k_row_bytes, row);
         if (type_v == Q36_KV_CACHE_Q8_0)
             q36_quant_q8_0(v_host + (size_t)t * row, v_exp + (size_t)t * v_row_bytes, row);
         else
@@ -3549,6 +3571,10 @@ static void test_vulkan_small_tiles(void) {
     };
     for (unsigned i = 0; i < sizeof(iq3_shapes) / sizeof(iq3_shapes[0]); i++) {
         test_vulkan_small_dims(10, 84, iq3_shapes[i][1], iq3_shapes[i][0]);
+        test_vulkan_small_dims(12, 144, iq3_shapes[i][1], iq3_shapes[i][0]);
+        test_vulkan_small_dims(14, 210, iq3_shapes[i][1], iq3_shapes[i][0]);
+        test_vulkan_small_dims(17, 74, iq3_shapes[i][1], iq3_shapes[i][0]);
+        test_vulkan_small_dims(22, 82, iq3_shapes[i][1], iq3_shapes[i][0]);
         test_vulkan_small_dims(18, 98, iq3_shapes[i][1], iq3_shapes[i][0]);
         test_vulkan_small_dims(21, 110, iq3_shapes[i][1], iq3_shapes[i][0]);
         test_vulkan_small_dims(23, 136, iq3_shapes[i][1], iq3_shapes[i][0]);
@@ -4719,6 +4745,8 @@ static void test_vulkan_attn_decode_fused(void) {
     /* Six-head GQA, partial tiles crossing span and span-group boundaries. */
     test_vulkan_attn_case(12, 510, 3, Q36_KV_CACHE_Q8_0, Q36_KV_CACHE_Q4_0, 256);
     test_vulkan_attn_case(12, 4094, 5, Q36_KV_CACHE_Q8_0, Q36_KV_CACHE_Q4_0, 256);
+    test_vulkan_attn_case(12, 1534, 5, Q36_KV_CACHE_Q8_0, Q36_KV_CACHE_Q4_0, 256);
+    test_vulkan_attn_case(12, 4094, 5, Q36_KV_CACHE_Q4_0, Q36_KV_CACHE_Q4_0, 256);
 #endif
 }
 

@@ -4,7 +4,11 @@
  * Blocks processed sequentially. Staging buffer with atomicOr writes,
  * then copy to cache as aligned uints. */
 
+#ifdef Q36_KEYS
+layout(local_size_x = 64) in;
+#else
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+#endif
 
 layout(set = 0, binding = 0) buffer Cache {
     uint cache[];
@@ -25,9 +29,16 @@ layout(push_constant) uniform Push {
 const uint QK = 32u;
 
 /* All shared vars at global scope */
+#ifdef Q36_KEYS
+shared float sh_blk[64];
+shared float sh_d[2];
+shared uint sh_scale[2];
+shared int sh_q[64];
+#else
 shared float sh_blk[32];   /* one block of source values */
 shared float sh_extreme;   /* reduction result for current block */
 shared uint  sh_row[272];  /* staging: up to 1088 bytes */
+#endif
 
 int nearest_int(float f) {
     precise float g = f + 12582912.0;  /* keep the fma contractor away */
@@ -50,6 +61,89 @@ uint f16_rte(float f) {
     return (sign >> 16) | (shl1 > 0xff000000u ? 0x7e00u : nonsign);
 }
 
+#ifdef Q36_KEYS
+float key_error(float d, uint base) {
+    float dh = unpackHalf2x16(f16_rte(d)).x;
+    float inv = d != 0.0 ? float(1.0 / double(d)) : 0.0;
+    double err = 0.0;
+    for (uint i = 0u; i < QK; i++) {
+        precise float p = sh_blk[base + i] * inv + 8.5;
+        int q = clamp(int(p), 0, 15) - 8;
+        double e = double(sh_blk[base + i]) - double(dh) * double(q);
+        err += e * e;
+    }
+    return float(err);
+}
+float key_fit(float d, uint base) {
+    float inv = d != 0.0 ? float(1.0 / double(d)) : 0.0;
+    double num = 0.0;
+    int den = 0;
+    for (uint i = 0u; i < QK; i++) {
+        precise float p = sh_blk[base + i] * inv + 8.5;
+        int q = clamp(int(p), 0, 15) - 8;
+        num += double(sh_blk[base + i]) * double(q);
+        den += q * q;
+    }
+    return den != 0 ? float(num / double(den)) : d;
+}
+float key_scale(float initial, uint base) {
+    precise float original = initial + (key_fit(initial, base) - initial) * 0.25;
+    float best = original;
+    float error = key_error(best, base);
+    for (uint sign = 0u; sign < 2u; sign++) {
+        float d = sign == 0u ? initial : float(-double(initial) * 8.0 / 7.0);
+        for (uint pass = 0u; pass < 2u; pass++) {
+            d = unpackHalf2x16(f16_rte(d)).x;
+            d = key_fit(d, base);
+            d = unpackHalf2x16(f16_rte(d)).x;
+            float e = key_error(d, base);
+            if (e < error) { error = e; best = d; }
+        }
+    }
+    return best;
+}
+
+/* Each workgroup owns two Q4 blocks: their 36 bytes are word aligned.
+ * Blocks fit their scales independently, then store the stripe directly. */
+void main(void) {
+    uint lid = gl_LocalInvocationID.x;
+    uint stripe = gl_WorkGroupID.x;
+    uint tok = gl_WorkGroupID.y;
+    uint blk = lid >> 5u;
+    uint base = blk * 32u;
+    sh_blk[lid] = src[tok * pc.row_elems + stripe * 64u + lid];
+    barrier();
+    if ((lid & 31u) == 0u) {
+        float extreme = 0.0;
+        for (uint i = 0u; i < 32u; i++)
+            if (abs(sh_blk[base + i]) > abs(extreme)) extreme = sh_blk[base + i];
+        float d = key_scale(extreme / -8.0, base);
+        if (extreme == 0.0) d = uintBitsToFloat(0x80000000u);
+        sh_d[blk] = d;
+        sh_scale[blk] = f16_rte(d);
+    }
+    barrier();
+    float d = sh_d[blk];
+    float inv = d != 0.0 ? float(1.0 / double(d)) : 0.0;
+    precise float q = sh_blk[lid] * inv + 8.5;
+    sh_q[lid] = clamp(int(q), 0, 15);
+    barrier();
+    if (lid < 9u) {
+        uint word = 0u;
+        for (uint j = 0u; j < 4u; j++) {
+            uint off = lid * 4u + j;
+            uint b = off / 18u;
+            off %= 18u;
+            uint byte;
+            if (off < 2u) byte = (sh_scale[b] >> (off * 8u)) & 255u;
+            else byte = uint(sh_q[b * 32u + off - 2u]) |
+                        (uint(sh_q[b * 32u + off + 14u]) << 4u);
+            word |= byte << (j * 8u);
+        }
+        cache[((pc.pos0 + tok) * pc.cache_row_bytes + stripe * 36u) / 4u + lid] = word;
+    }
+}
+#else
 void main(void) {
     uint lid  = gl_LocalInvocationID.x;
     uint tok  = gl_WorkGroupID.y;
@@ -163,3 +257,5 @@ void main(void) {
     for (uint i = lid; i < n_stage; i += 256u)
         cache[cache_base + i] = sh_row[i];
 }
+
+#endif
