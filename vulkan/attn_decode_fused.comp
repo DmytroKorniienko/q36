@@ -6,7 +6,7 @@
 
 /* Fused full-attention pass: scores, online softmax with optional sinks,
  * weighted V sum, and sigmoid output gating in one dispatch, replacing the
- * attn_scores/attn_post/attn_reduce chain in fast mode.  One workgroup per
+ * attn_scores/attn_post/attn_reduce chain. One workgroup per
  * (head, token); thread j owns output dim j and streams the causal
  * n_kv = pos0 + tok + 1 keys in 64-key tiles, rescaling the accumulator
  * when the running max moves (flash-attention style).  The V accumulation
@@ -23,7 +23,7 @@
  * arrives in a prefill chunk, a chunk tail, or a decode step (the
  * warm==cold session-sync invariant).  Scores use f32 subgroup-clustered
  * dots; parity with the CPU engine is the fast-path gate (same_top1), the
- * bit-exact fp64 chain remains available under --quality. */
+ * fp64 reference is used when the device cannot run this kernel. */
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 

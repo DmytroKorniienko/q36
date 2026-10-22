@@ -12,6 +12,9 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 layout(set = 0, binding = 0) readonly buffer Weights { uint ww[]; };
 layout(set = 0, binding = 1) readonly buffer Q8K { uint q8[]; };
 layout(set = 0, binding = 2) writeonly buffer Output { float y[]; };
+#ifdef Q36_HEAD_MASK
+layout(set = 0, binding = 3) readonly buffer Mask { uint ages[]; };
+#endif
 #ifdef Q36_I16
 layout(set = 0, binding = 3) readonly buffer Raw { uint raw_values[]; };
 #endif
@@ -97,6 +100,13 @@ void main(void) {
     uint lid = gl_LocalInvocationID.x;
     uint itid = lid & 7u;
     uint first_row = gl_WorkGroupID.x * ROWS;
+#ifdef Q36_HEAD_MASK
+    if (ages[first_row / 64u] == 0u) {
+        if (lid < ROWS && first_row + lid < pc.out_dim)
+            y[first_row + lid] = uintBitsToFloat(0xff800000u);
+        return;
+    }
+#endif
     float acc[N_TOKENS][ROWS];
     UNROLL for (uint t = 0u; t < N_TOKENS; t++)
         UNROLL for (uint r = 0u; r < ROWS; r++) acc[t][r] = 0.0;

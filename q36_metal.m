@@ -48,7 +48,6 @@ static uint64_t q36_peak_bytes;
 static const void *q36_model_map;
 static uint64_t q36_model_size;
 static int q36_model_fd = -1;
-static bool q36_quality;
 static bool q36_micro_batch;
 static bool q36_ssd_streaming;
 static bool q36_dense_model;
@@ -136,7 +135,7 @@ static bool q36_metal_detect_mpp(void) {
 }
 
 static int q36_metal_moe_mpp_mask(void) {
-    if (!q36_metal_mpp_enabled || q36_quality) return 0;
+    if (!q36_metal_mpp_enabled) return 0;
     const char *value = getenv("Q36_METAL_MOE_MPP_MASK");
     return value ? atoi(value) & 7 : 7;
 }
@@ -1010,8 +1009,13 @@ static int q36_dense(NSString *kernel, q36_gpu_tensor *out,
     [enc setBuffer:weights offset:(NSUInteger)inner atIndex:1];
     [enc setBuffer:x->buffer offset:x->offset atIndex:2];
     [enc setBytes:&args length:sizeof(args) atIndex:3];
-    [enc dispatchThreads:MTLSizeMake((NSUInteger)out_dim, (NSUInteger)tokens, 1)
-   threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    if ([kernel isEqualToString:@"q36_matmul_bf16"]) {
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)out_dim, (NSUInteger)tokens, 1)
+            threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    } else {
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)out_dim, (NSUInteger)tokens, 1)
+            threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    }
     [enc endEncoding];
     return 1;
 }
@@ -1381,7 +1385,6 @@ int q36_gpu_prepare_q5_k_output_cache(
     return 1;
 }
 
-void q36_gpu_set_quality(bool enabled) { q36_quality = enabled; }
 void q36_gpu_set_dense_model(bool dense) { q36_dense_model = dense; }
 void q36_gpu_set_micro_batch(bool enabled) { q36_micro_batch = enabled; }
 bool q36_gpu_attn_fused_enabled(void) { return false; }
@@ -2159,6 +2162,18 @@ int q36_gpu_matmul_f16_tensor(q36_gpu_tensor *out, const void *map,
                      in_dim, out_dim, x, tokens, 1.0f);
 }
 
+int q36_gpu_matmul_bf16_scaled_tensor(q36_gpu_tensor *out, const void *map,
+                                      uint64_t size, uint64_t offset,
+                                      uint64_t in_dim, uint64_t out_dim,
+                                      const q36_gpu_tensor *x, uint64_t tokens,
+                                      float scale) {
+    if (!in_dim || !out_dim ||
+        in_dim > UINT64_MAX / out_dim / sizeof(uint16_t)) return 0;
+    return q36_dense(@"q36_matmul_bf16", out, map, size, offset,
+                     in_dim * out_dim * sizeof(uint16_t),
+                     in_dim, out_dim, x, tokens, scale);
+}
+
 int q36_gpu_matmul_f32_scaled_tensor(q36_gpu_tensor *out, const void *map,
                                      uint64_t size, uint64_t offset,
                                      uint64_t in_dim, uint64_t out_dim,
@@ -2248,9 +2263,10 @@ int q36_gpu_extract_recurrent_v_tensor(q36_gpu_tensor *dst,
 int q36_gpu_recurrent_conv_step_tensor(q36_gpu_tensor *cache,
                                         const q36_gpu_tensor *cur,
                                         q36_gpu_tensor *window,
+                                        uint32_t conv_dim,
                                         uint32_t tokens) {
-    const uint32_t conv_dim = 8192u, hist = 3u;
-    if (!cache || !cur || !window || !tokens ||
+    const uint32_t hist = 3u;
+    if (!cache || !cur || !window || !conv_dim || !tokens ||
         cache->bytes < (uint64_t)hist * conv_dim * 4u ||
         cur->bytes < (uint64_t)tokens * conv_dim * 4u ||
         window->bytes < (uint64_t)tokens * (hist + 1u) * conv_dim * 4u)

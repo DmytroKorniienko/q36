@@ -55,7 +55,7 @@ What they cover:
 - `--long-context`: runs the long-context security continuation regression from
   `tests/long_context_security_prompt.txt` unless `Q36_TEST_LONG_PROMPT` is set.
 - `--tool-call-quality`: exercises actual model behavior for tool-call emission
-  in both fast and exact paths.
+  through the production inference path.
 - `--qwen-tool-call-quality`: exercises native Qwen tool-call emission through
   the OpenAI-compatible request path.
 - `--vulkan-kernels`: isolated Vulkan kernel numeric checks.

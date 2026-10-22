@@ -531,7 +531,6 @@ static void usage(const char *argv0) {
             "  --ssd-streaming\n"
             "  --ssd-streaming-cache-experts N|NGB\n"
             "  --ssd-streaming-cold\n"
-            "  --quality\n"
             "  --rendered-prompt\n"
             "  --dump-first-logits PATH\n"
             "  --max-cases N\n",
@@ -582,8 +581,6 @@ int main(int argc, char **argv) {
             long n = strtol(argv[argi++], &end, 10);
             if (*end || n <= 0 || n > INT_MAX) die("invalid --max-cases value");
             max_cases = (int)n;
-        } else if (!strcmp(a, "--quality")) {
-            opt.quality = true;
         } else if (!strcmp(a, "--ssd-streaming")) {
             opt.ssd_streaming = true;
         } else if (!strcmp(a, "--ssd-streaming-cold")) {

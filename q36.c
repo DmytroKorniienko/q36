@@ -275,6 +275,7 @@ static const gguf_type_info gguf_types[] = {
     [23] = {"iq4_xs", 256, 136},
     [26] = {"i32", 1, 4},
     [29] = {"iq1_m", 256, 56},
+    [30] = {"bf16", 1, 2},
 };
 
 enum {
@@ -296,6 +297,7 @@ enum {
     Q36_TENSOR_IQ4_XS = 23,
     Q36_TENSOR_I32 = 26,
     Q36_TENSOR_IQ1_M = 29,
+    Q36_TENSOR_BF16 = 30,
 };
 
 typedef struct {
@@ -603,7 +605,6 @@ struct q36_engine {
     int activation_dump_pos; /* -1: last prompt token; -2: every committed token. */
     int activation_dump_slot[Q36_DUMP_COUNT];
     uint32_t activation_dump_slots;
-    bool quality;
     int routed_quant_bits;
     float expert_weights_scale;
     uint32_t ssd_streaming_cache_experts;
@@ -617,6 +618,7 @@ struct q36_engine {
     bool mtp_ready;
     bool vision_ready;
     bool kat_coder;
+    bool gsq_rco;
     q36_variant variant;
 };
 
@@ -1936,6 +1938,25 @@ static const uint8_t *q36_iq3xxs_grid_at(uint32_t idx) {
     return (const uint8_t *)&q36_iq3xxs_grid[idx];
 }
 
+static float q36_bf16_to_f32(uint16_t value) {
+    uint32_t bits = (uint32_t)value << 16;
+    float out;
+    memcpy(&out, &bits, sizeof(out));
+    return out;
+}
+
+/* BF16 GEMM rounds the activations as well as the weights. */
+static float q36_round_bf16(float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    if ((bits & 0x7fffffffu) > 0x7f800000u)
+        bits = (bits & 0xffff0000u) | 0x00400000u;
+    else
+        bits = (bits + 0x7fffu + ((bits >> 16) & 1u)) & 0xffff0000u;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
 static bool q36_dequantize_row_from_ptr(uint32_t type, const uint8_t *src, float *dst, uint32_t n) {
     switch (type) {
     case Q36_TENSOR_F32:
@@ -1944,6 +1965,11 @@ static bool q36_dequantize_row_from_ptr(uint32_t type, const uint8_t *src, float
     case Q36_TENSOR_F16: {
         const uint16_t *h = (const uint16_t *)src;
         for (uint32_t i = 0; i < n; i++) dst[i] = q36_f16_to_f32(h[i]);
+        return true;
+    }
+    case Q36_TENSOR_BF16: {
+        const uint16_t *h = (const uint16_t *)src;
+        for (uint32_t i = 0; i < n; i++) dst[i] = q36_bf16_to_f32(h[i]);
         return true;
     }
     case Q36_TENSOR_Q8_0:
@@ -2463,9 +2489,9 @@ static float q36_tensor_index_or(const q36_model *m, const q36_tensor *t, uint32
         const float *src = (const float *)(m->map + t->abs_offset);
         return src[idx];
     }
-    if (t->type == Q36_TENSOR_F16) {
+    if (t->type == Q36_TENSOR_F16 || t->type == Q36_TENSOR_BF16) {
         const uint16_t *src = (const uint16_t *)(m->map + t->abs_offset);
-        return q36_f16_to_f32(src[idx]);
+        return t->type == Q36_TENSOR_BF16 ? q36_bf16_to_f32(src[idx]) : q36_f16_to_f32(src[idx]);
     }
     return fallback;
 }
@@ -2516,22 +2542,94 @@ static bool q36_tensor_pair_can_fuse(const q36_tensor *t0,
     return q36_tensor_type_supports_prequant_dot(t0->type);
 }
 
-static bool q36_tensor_row_dot_q8k(uint32_t type, const uint8_t *row, const uint8_t *xq, uint32_t n, float *out) {
-    const q36_block_q8_k *q = (const q36_block_q8_k *)xq;
+bool q36_quant_dot_q8_k(uint32_t type, const void *packed, const void *activation,
+                         uint32_t n, float *out) {
+    const uint8_t *row = packed;
+    const q36_block_q8_k *q = activation;
     float weights[Q36_QK_K];
-    double acc = 0.0;
+    float acc = 0.0f;
     uint32_t block_bytes;
-    if (!row || !xq || !out || (n % Q36_QK_K) != 0) return false;
+    if (!row || !q || !out || (n % Q36_QK_K) != 0 || !q36_tensor_type_supports_q8k_dot(type)) return false;
     if (type >= sizeof(gguf_types) / sizeof(gguf_types[0]) || !gguf_types[type].block_bytes) return false;
-    block_bytes = gguf_types[type].block_bytes *
-                  (Q36_QK_K / gguf_types[type].block_elems);
+    block_bytes = gguf_types[type].block_bytes * (Q36_QK_K / gguf_types[type].block_elems);
     for (uint32_t block = 0; block < n / Q36_QK_K; block++) {
-        if (!q36_dequantize_row_from_ptr(type, row + (uint64_t)block * block_bytes,
-                                         weights, Q36_QK_K)) return false;
-        for (uint32_t i = 0; i < Q36_QK_K; i++)
-            acc += (double)weights[i] * (double)(q[block].d * (float)q[block].qs[i]);
+        const uint8_t *src = row + (uint64_t)block * block_bytes;
+        float d = 0.0f, dmin = 0.0f;
+        int min_dot = 0;
+        union { q36_block_q2_k q2; q36_block_q4_k q4; q36_block_q5_k q5; } copy;
+        if (type == Q36_TENSOR_Q2_K) {
+            memcpy(&copy.q2, src, sizeof(copy.q2));
+            d = q36_f16_to_f32(copy.q2.d);
+            dmin = q36_f16_to_f32(copy.q2.dmin);
+            copy.q2.dmin = 0;
+            for (uint32_t i = 0; i < 16; i++)
+                min_dot += (copy.q2.scales[i] >> 4) * q[block].bsums[i];
+            src = (const uint8_t *)&copy.q2;
+        } else if (type == Q36_TENSOR_Q4_K || type == Q36_TENSOR_Q5_K) {
+            const uint8_t *scales;
+            if (type == Q36_TENSOR_Q4_K) {
+                memcpy(&copy.q4, src, sizeof(copy.q4));
+                d = q36_f16_to_f32(copy.q4.d);
+                dmin = q36_f16_to_f32(copy.q4.dmin);
+                copy.q4.dmin = 0;
+                scales = copy.q4.scales;
+                src = (const uint8_t *)&copy.q4;
+            } else {
+                memcpy(&copy.q5, src, sizeof(copy.q5));
+                d = q36_f16_to_f32(copy.q5.d);
+                dmin = q36_f16_to_f32(copy.q5.dmin);
+                copy.q5.dmin = 0;
+                scales = copy.q5.scales;
+                src = (const uint8_t *)&copy.q5;
+            }
+            for (uint32_t i = 0; i < 8; i++) {
+                uint8_t scale, min;
+                q36_get_scale_min_k4(i, scales, &scale, &min);
+                min_dot += min * (q[block].bsums[i * 2] + q[block].bsums[i * 2 + 1]);
+            }
+        } else if (type == Q36_TENSOR_Q3_K) {
+            d = q36_f16_to_f32(((const q36_block_q3_k *)src)->d);
+        } else if (type == Q36_TENSOR_Q6_K) {
+            d = q36_f16_to_f32(((const q36_block_q6_k *)src)->d);
+        } else if (type == Q36_TENSOR_IQ1_M) {
+            const uint16_t *sc = (const uint16_t *)((const q36_block_iq1_m *)src)->scales;
+            uint16_t h = (sc[0] >> 12) | ((sc[1] >> 8) & 0xf0) |
+                         ((sc[2] >> 4) & 0xf00) | (sc[3] & 0xf000);
+            d = q36_f16_to_f32(h) * 0.125f;
+        } else if (type != Q36_TENSOR_IQ4_NL) {
+            uint16_t h;
+            memcpy(&h, src, sizeof(h));
+            d = q36_f16_to_f32(h);
+            if (type == Q36_TENSOR_IQ2_XXS || type == Q36_TENSOR_IQ2_XS ||
+                type == Q36_TENSOR_IQ2_S || type == Q36_TENSOR_IQ1_S) d *= 0.125f;
+            else if (type == Q36_TENSOR_IQ3_XXS) d *= 0.25f;
+        }
+        if (!q36_dequantize_row_from_ptr(type, src, weights, Q36_QK_K)) return false;
+        if (type == Q36_TENSOR_IQ4_NL) {
+            const q36_block_iq4_nl *w = (const q36_block_iq4_nl *)src;
+            for (uint32_t group = 0; group < 8; group++) {
+                d = q36_f16_to_f32(w[group].d);
+                float inverse = d ? (float)(1.0 / (double)d) : 0.0f;
+                int dot = 0;
+                for (uint32_t i = group * 32; i < (group + 1) * 32; i++) {
+                    float coefficient = weights[i] * inverse;
+                    dot += (int)(coefficient + copysignf(0.5f, coefficient)) * q[block].qs[i];
+                }
+                acc += (d * q[block].d) * (float)dot;
+            }
+        } else {
+            /* Fold the block scales after the integer dot, like the GGUF
+             * reference kernels. Per-value float dequantization rounds twice. */
+            float inverse = d ? (float)(1.0 / (double)d) : 0.0f;
+            int dot = 0;
+            for (uint32_t i = 0; i < Q36_QK_K; i++) {
+                float coefficient = weights[i] * inverse;
+                dot += (int)(coefficient + copysignf(0.5f, coefficient)) * q[block].qs[i];
+            }
+            acc += (d * q[block].d) * (float)dot - (dmin * q[block].d) * (float)min_dot;
+        }
     }
-    *out = (float)acc;
+    *out = acc;
     return true;
 }
 
@@ -2543,8 +2641,8 @@ static bool q36_tensor_row_dot_q8k_pair(uint32_t type,
                                         float *out0,
                                         float *out1) {
     if (!row0 || !row1 || !xq || !out0 || !out1 || (n % Q36_QK_K) != 0) return false;
-    return q36_tensor_row_dot_q8k(type, row0, xq, n, out0) &&
-           q36_tensor_row_dot_q8k(type, row1, xq, n, out1);
+    return q36_quant_dot_q8_k(type, row0, xq, n, out0) &&
+           q36_quant_dot_q8_k(type, row1, xq, n, out1);
 }
 
 static bool q36_tensor_row_dot_prequant(uint32_t type, const uint8_t *row, const uint8_t *xq, uint32_t n, float *out) {
@@ -2555,7 +2653,7 @@ static bool q36_tensor_row_dot_prequant(uint32_t type, const uint8_t *row, const
         *out = acc;
         return true;
     }
-    return q36_tensor_row_dot_q8k(type, row, xq, n, out);
+    return q36_quant_dot_q8_k(type, row, xq, n, out);
 }
 
 static bool q36_tensor_row_dot_prequant_pair(uint32_t type,
@@ -2782,12 +2880,18 @@ static void q36_matmul_batch_worker(void *opaque, uint64_t row0, uint64_t row1) 
             }
             break;
         }
-        case Q36_TENSOR_F16: {
+        case Q36_TENSOR_F16:
+        case Q36_TENSOR_BF16: {
             const uint16_t *wr = (const uint16_t *)(m->map + ctx->t->abs_offset) + row * ctx->in_dim;
             for (uint32_t t = 0; t < ctx->n_tok; t++) {
                 const float *xr = ctx->x + (uint64_t)t * ctx->in_dim;
                 double acc = 0.0;
-                for (uint32_t i = 0; i < ctx->in_dim; i++) acc += (double)q36_f16_to_f32(wr[i]) * (double)xr[i];
+                for (uint32_t i = 0; i < ctx->in_dim; i++) {
+                    float w = ctx->t->type == Q36_TENSOR_BF16 ?
+                        q36_bf16_to_f32(wr[i]) : q36_f16_to_f32(wr[i]);
+                    float x = ctx->t->type == Q36_TENSOR_BF16 ? q36_round_bf16(xr[i]) : xr[i];
+                    acc += (double)w * (double)x;
+                }
                 ctx->out[(uint64_t)t * ctx->out_dim + row] = (float)acc * ctx->scale;
             }
             break;
@@ -4243,6 +4347,7 @@ static bool tensor_type_is_cpu_matrix(uint32_t type) {
     switch (type) {
     case Q36_TENSOR_F32:
     case Q36_TENSOR_F16:
+    case Q36_TENSOR_BF16:
     case Q36_TENSOR_Q8_0:
     case Q36_TENSOR_Q2_K:
     case Q36_TENSOR_Q3_K:
@@ -5698,11 +5803,6 @@ static bool q36_gpu_tensor_zero(q36_gpu_tensor *tensor) {
     return true;
 }
 
-static bool q36_gpu_tensor_all_finite(const q36_gpu_tensor *tensor, uint32_t n) {
-    float *p = q36_gpu_tensor_contents_named((q36_gpu_tensor *)tensor, "submit_wait_all_finite");
-    return p && q36_all_finite(p, n);
-}
-
 static bool q36_gpu_tensor_scale_host(q36_gpu_tensor *tensor, uint32_t n, float scale) {
     float *p = q36_gpu_tensor_contents_named(tensor, "submit_wait_scale_host");
     if (!p) return false;
@@ -5808,6 +5908,10 @@ static bool q36_gpu_tensor_matmul_scaled(const q36_model *m,
                                        in_dim, out_dim, x, n_tok) != 0;
         if (ok && scale != 1.0f) ok = q36_gpu_tensor_scale_host(out, n_tok * out_dim, scale);
         break;
+    case Q36_TENSOR_BF16:
+        ok = q36_gpu_matmul_bf16_scaled_tensor(out, m->map, m->size, t->abs_offset,
+                                               in_dim, out_dim, x, n_tok, scale) != 0;
+        break;
     case Q36_TENSOR_Q8_0:
         ok = q36_gpu_matmul_q8_0_scaled_tensor(out, m->map, m->size, t->abs_offset,
                                                in_dim, out_dim, x, n_tok, scale) != 0;
@@ -5897,7 +6001,7 @@ static bool q36_gpu_tensor_matmul_q8_or_float_scaled(const q36_model *m,
                                              in_dim, out_dim, n_tok, scale);
     }
 #endif
-    if (t->type == Q36_TENSOR_F32 || t->type == Q36_TENSOR_F16 ||
+    if (t->type == Q36_TENSOR_F32 || t->type == Q36_TENSOR_F16 || t->type == Q36_TENSOR_BF16 ||
         t->type == Q36_TENSOR_Q8_0) {
         return q36_gpu_tensor_matmul_scaled(m, t, x, out, in_dim, out_dim, n_tok, scale);
     }
@@ -5995,7 +6099,6 @@ static void q36_vulkan_runtime_free(q36_vulkan_runtime *rt) {
 static q36_vulkan_runtime *q36_vulkan_runtime_create(int ctx_size,
                                                      uint32_t prefill_cap,
                                                      bool enable_mtp,
-                                                     bool quality,
                                                      bool ssd_streaming,
                                                      q36_kv_cache_type cache_type_k,
                                                      q36_kv_cache_type cache_type_v) {
@@ -6014,13 +6117,13 @@ static q36_vulkan_runtime *q36_vulkan_runtime_create(int ctx_size,
     rt->mtp_enabled = enable_mtp;
     {
         const char *env = getenv("Q36_VK_RECURRENT_CONV_DECODE");
-        rt->recur_conv_fused = !quality && !ssd_streaming &&
+        rt->recur_conv_fused = !ssd_streaming &&
                                (!env || !env[0] || env[0] != '0');
     }
 #ifndef Q36_METAL
     {
         const char *env = getenv("Q36_VK_RECURRENT_STATE_F16");
-        rt->recur_state_f16 = !quality && !ssd_streaming &&
+        rt->recur_state_f16 = !ssd_streaming &&
                               (!env || !env[0] || env[0] != '0');
     }
 #endif
@@ -6033,9 +6136,7 @@ static q36_vulkan_runtime *q36_vulkan_runtime_create(int ctx_size,
         if (!rt->field) goto fail; \
     } while (0)
 #define Q36_GPU_ALLOC_SCRATCH_F32(field, n) do { \
-        rt->field = quality ? \
-            q36_gpu_tensor_alloc((uint64_t)(n) * prefill_cap * sizeof(float)) : \
-            q36_gpu_tensor_alloc_scratch((uint64_t)(n) * prefill_cap * sizeof(float)); \
+        rt->field = q36_gpu_tensor_alloc_scratch((uint64_t)(n) * prefill_cap * sizeof(float)); \
         if (!rt->field) goto fail; \
     } while (0)
 #define Q36_GPU_ALLOC_U32(field, n) do { \
@@ -6090,9 +6191,7 @@ static q36_vulkan_runtime *q36_vulkan_runtime_create(int ctx_size,
 #else
     uint32_t q8_width = Q36_MODEL_DENSE && Q36_N_FF_SHARED > Q36_N_EMBD ?
         Q36_N_FF_SHARED : Q36_N_EMBD;
-    rt->inp_q8 = quality ?
-        q36_gpu_tensor_alloc((uint64_t)((q8_width + Q36_QK_K - 1u) / Q36_QK_K) * Q36_VK_Q8_K_BYTES * prefill_cap) :
-        q36_gpu_tensor_alloc_scratch((uint64_t)((q8_width + Q36_QK_K - 1u) / Q36_QK_K) * Q36_VK_Q8_K_BYTES * prefill_cap);
+    rt->inp_q8 = q36_gpu_tensor_alloc_scratch((uint64_t)((q8_width + Q36_QK_K - 1u) / Q36_QK_K) * Q36_VK_Q8_K_BYTES * prefill_cap);
     if (!rt->inp_q8) goto fail;
     Q36_GPU_ALLOC_SCRATCH_F32(attn_qg, Q36_N_HEAD * Q36_N_HEAD_DIM * 2u);
     Q36_GPU_ALLOC_SCRATCH_F32(attn_q, Q36_N_HEAD * Q36_N_HEAD_DIM);
@@ -7696,19 +7795,17 @@ static bool q36_forward_ffn_vulkan(q36_session *s,
                                         false, inp_q8_ready);
 }
 
-/* RoPE stays on the host even on the Vulkan path: the rotated values feed KV
- * storage, so they must match the CPU reference bit for bit, and only the
- * q36_apply_rope_one() body compiled in this unit guarantees that.
- * Token row t rotates at absolute position pos0 + t. */
+/* Token row t rotates at absolute position pos0 + t. Explicit positions
+ * carry the vision layout; the host implementation remains a diagnostic. */
 static bool q36_vulkan_rope_heads(q36_gpu_tensor *x, uint32_t n_head,
                                   uint32_t pos0, uint32_t n_tok,
-                                  const uint32_t *positions, bool quality) {
+                                  const uint32_t *positions) {
     const char *env = getenv("Q36_VK_GPU_ROPE");
     bool use_gpu = !env || !env[0] || env[0] != '0';
     if (positions)
         return q36_gpu_rope_qwen_mrope_rows_tensor(x, n_head,
                                                     positions, n_tok) != 0;
-    if (!positions && !quality && use_gpu)
+    if (!positions && use_gpu)
         return q36_gpu_rope_qwen_rows_tensor(x, n_head, pos0, n_tok) != 0;
     q36_vulkan_rope_ctx ctx;
     float *xp;
@@ -7733,11 +7830,10 @@ static bool q36_vulkan_prepare_attn_heads(q36_gpu_tensor *dst,
                                           uint32_t n_head,
                                           uint32_t pos0,
                                           uint32_t n_tok,
-                                          const uint32_t *positions,
-                                          bool quality) {
+                                          const uint32_t *positions) {
     const char *env = getenv("Q36_VK_NORM_ROPE");
     bool fused = !env || !env[0] || env[0] != '0';
-    if (!positions && !quality && fused) {
+    if (!positions && fused) {
         return q36_gpu_rms_norm_rope_qwen_rows_tensor(dst, src,
                                                        m->map, m->size,
                                                        norm->abs_offset,
@@ -7752,14 +7848,13 @@ static bool q36_vulkan_prepare_attn_heads(q36_gpu_tensor *dst,
                                              Q36_RMS_EPS)) {
         return false;
     }
-    return q36_vulkan_rope_heads(dst, n_head, pos0, n_tok, positions, quality);
+    return q36_vulkan_rope_heads(dst, n_head, pos0, n_tok, positions);
 }
 
 static bool q36_forward_full_attn_vulkan_model(q36_vulkan_runtime *rt,
                                                const q36_model *m,
                                                const q36_layer_weights *l,
                                                q36_vulkan_full_attn_cache *cache,
-                                               bool quality,
                                                uint32_t il,
                                                uint32_t pos0,
                                                uint32_t rope_pos0,
@@ -7794,10 +7889,10 @@ static bool q36_forward_full_attn_vulkan_model(q36_vulkan_runtime *rt,
     }
     if (!cache_only && !q36_vulkan_prepare_attn_heads(rt->attn_q, rt->attn_qg, m, l->attn_q_norm,
                                        Q36_N_HEAD_DIM * 2u, Q36_N_HEAD,
-                                       rope_pos0, n_tok, positions, quality)) return false;
+                                       rope_pos0, n_tok, positions)) return false;
     {
         const char *env = getenv("Q36_VK_NORM_ROPE_KV");
-        bool fused_kv = !positions && rope_pos0 == pos0 && !quality &&
+        bool fused_kv = !positions && rope_pos0 == pos0 &&
                         (!env || !env[0] || env[0] != '0') &&
                         cache->type_k == 0u && cache->type_v == 0u &&
                         cache->k_row_bytes == Q36_N_HEAD_KV * Q36_N_HEAD_DIM * sizeof(uint16_t) &&
@@ -7810,7 +7905,7 @@ static bool q36_forward_full_attn_vulkan_model(q36_vulkan_runtime *rt,
                     pos0, n_tok, cache->cap, Q36_RMS_EPS)) {
                 return false;
             }
-        } else if (!positions && rope_pos0 == pos0 && !quality &&
+        } else if (!positions && rope_pos0 == pos0 &&
                    (!env || !env[0] || env[0] != '0') &&
                    cache->type_k == Q36_KV_CACHE_Q8_0 &&
                    cache->type_v == Q36_KV_CACHE_Q4_0 &&
@@ -7826,8 +7921,7 @@ static bool q36_forward_full_attn_vulkan_model(q36_vulkan_runtime *rt,
         } else {
             if (!q36_vulkan_prepare_attn_heads(rt->attn_k, rt->attn_k, m, l->attn_k_norm,
                                                Q36_N_HEAD_DIM, Q36_N_HEAD_KV,
-                                               rope_pos0, n_tok, positions,
-                                               quality)) return false;
+                                               rope_pos0, n_tok, positions)) return false;
             if (!q36_gpu_attn_kv_store_tensor(cache->k, cache->v,
                                               rt->attn_k, rt->attn_v,
                                               pos0, n_tok, cache->cap,
@@ -7889,7 +7983,6 @@ static bool q36_forward_full_attn_vulkan(q36_session *s,
                                               &e->model,
                                               l,
                                               &rt->full[il],
-                                              e->quality,
                                               il,
                                               pos0,
                                               (uint32_t)((int32_t)pos0 + s->rope_delta),
@@ -7953,22 +8046,24 @@ static bool q36_forward_recurrent_vulkan_into(q36_session *s,
             (uint64_t)n_tok * Q36_N_SSM_CONV_DIM * sizeof(float))) return false;
     bool front=false;
 #ifndef Q36_METAL
-    if (!e->quality && !e->ssd_streaming && n_tok==1u && rt->recur_conv_fused &&
+    if (!e->ssd_streaming && n_tok==1u && rt->recur_conv_fused &&
         Q36_N_SSM_STATE==128u && Q36_N_SSM_CONV==4u &&
-        l->ssm_alpha->type==Q36_TENSOR_Q8_0 && l->ssm_beta->type==Q36_TENSOR_Q8_0) {
+        l->ssm_alpha->type == l->ssm_beta->type &&
+        (l->ssm_alpha->type == Q36_TENSOR_Q8_0 || l->ssm_alpha->type == Q36_TENSOR_BF16)) {
         const uint64_t offsets[5]={l->ssm_conv1d->abs_offset,l->ssm_alpha->abs_offset,
             l->ssm_beta->abs_offset,l->ssm_dt->abs_offset,l->ssm_a->abs_offset};
         front=q36_gpu_gdn_front_tensor(cache->conv,rt->recur_qkv,inp,
             rt->recur_q,rt->recur_k,rt->recur_v,rt->recur_gb,
-            e->model.map,e->model.size,offsets,Q36_N_EMBD,Q36_N_SSM_GROUP,Q36_N_SSM_DT_RANK,
+            e->model.map,e->model.size,offsets,Q36_N_EMBD,Q36_N_SSM_GROUP,Q36_N_SSM_DT_RANK,l->ssm_alpha->type,
             q36_tensor_scalar_or(&e->model,l->ssm_alpha_scale,1.0f),
             q36_tensor_scalar_or(&e->model,l->ssm_beta_scale,1.0f),Q36_RMS_EPS)!=0;
     }
 #endif
 #ifndef Q36_METAL
-    if (!e->quality && !e->ssd_streaming && rt->spec_verifying && n_tok > 1u &&
+    if (!e->ssd_streaming && rt->spec_verifying && n_tok > 1u &&
         rt->recur_conv_fused && Q36_N_SSM_STATE == 128u && Q36_N_SSM_CONV == 4u &&
-        l->ssm_alpha->type == Q36_TENSOR_Q8_0 && l->ssm_beta->type == Q36_TENSOR_Q8_0 &&
+        l->ssm_alpha->type == l->ssm_beta->type &&
+        (l->ssm_alpha->type == Q36_TENSOR_Q8_0 || l->ssm_alpha->type == Q36_TENSOR_BF16) &&
         q36_gpu_gdn_front_supported(Q36_N_EMBD, Q36_N_SSM_GROUP, Q36_N_SSM_DT_RANK)) {
         const uint64_t offsets[5] = {l->ssm_conv1d->abs_offset, l->ssm_alpha->abs_offset,
             l->ssm_beta->abs_offset, l->ssm_dt->abs_offset, l->ssm_a->abs_offset};
@@ -7986,7 +8081,7 @@ static bool q36_forward_recurrent_vulkan_into(q36_session *s,
             }
             if (ok) ok = q36_gpu_gdn_front_tensor(cache->conv, rows[0], rows[1],
                 rows[2], rows[3], rows[4], rows[5], e->model.map, e->model.size, offsets,
-                Q36_N_EMBD, Q36_N_SSM_GROUP, Q36_N_SSM_DT_RANK,
+                Q36_N_EMBD, Q36_N_SSM_GROUP, Q36_N_SSM_DT_RANK, l->ssm_alpha->type,
                 q36_tensor_scalar_or(&e->model, l->ssm_alpha_scale, 1.0f),
                 q36_tensor_scalar_or(&e->model, l->ssm_beta_scale, 1.0f), Q36_RMS_EPS) != 0;
             for (unsigned i = 0; i < 6; i++) q36_gpu_tensor_free(rows[i]);
@@ -7998,7 +8093,7 @@ static bool q36_forward_recurrent_vulkan_into(q36_session *s,
     {
         if (!rt->recur_conv_fused) {
             if (!q36_gpu_recurrent_conv_step_tensor(cache->conv, rt->recur_qkv,
-                                                    rt->recur_window, n_tok)) return false;
+                                                    rt->recur_window, Q36_N_SSM_CONV_DIM, n_tok)) return false;
             if (!q36_gpu_ssm_conv_silu_tensor(rt->recur_conv,
                                               rt->recur_window,
                                               e->model.map,
@@ -8013,10 +8108,6 @@ static bool q36_forward_recurrent_vulkan_into(q36_session *s,
                        Q36_N_SSM_CONV_DIM, Q36_N_SSM_CONV, n_tok)) {
             return false;
         }
-    }
-    if (e->quality && !q36_gpu_tensor_all_finite(rt->recur_conv, n_tok * Q36_N_SSM_CONV_DIM)) {
-        fprintf(stderr, "q36: recurrent conv non-finite at layer=%u\n", il);
-        return false;
     }
     pair_projected = n_tok == 1u &&
                      l->ssm_beta->type == Q36_TENSOR_Q8_0 &&
@@ -8046,7 +8137,7 @@ static bool q36_forward_recurrent_vulkan_into(q36_session *s,
     }
     {
         const char *env = getenv("Q36_VK_DELTA_QKV");
-        bool fused = !e->quality && !e->ssd_streaming &&
+        bool fused = !e->ssd_streaming &&
                      (!env || !env[0] || env[0] != '0') &&
                      q36_gpu_delta_qkv_l2_norm_tensor(
                          rt->recur_q, rt->recur_k, rt->recur_v,
@@ -8086,10 +8177,6 @@ recurrent_update:
             offset += (uint64_t)Q36_MTP_VERIFY_MAX * widths[i] * sizeof(float);
         }
     }
-    if (e->quality && !q36_gpu_tensor_all_finite(rt->recur_gb, n_tok * Q36_N_SSM_DT_RANK * 2u)) {
-        fprintf(stderr, "q36: recurrent gate non-finite at layer=%u\n", il);
-        return false;
-    }
     bool updated;
 #ifndef Q36_METAL
     if (rt->spec_verifying && rt->spec_row == 0)
@@ -8111,23 +8198,17 @@ recurrent_update:
     if (!updated) {
         return false;
     }
-    if (e->quality && !q36_gpu_tensor_all_finite(rt->recur_proj, n_tok * Q36_N_SSM_INNER)) {
-        fprintf(stderr, "q36: recurrent delta decode non-finite at layer=%u\n", il);
-        return false;
-    }
     bool norm_gate_q8 = false;
 #ifndef Q36_METAL
-    norm_gate_q8 = !e->quality &&
-        q36_gpu_recurrent_norm_gate_q8_k_tensor(
+    norm_gate_q8 = q36_gpu_recurrent_norm_gate_q8_k_tensor(
             rt->recur_proj, rt->inp_q8, rt->recur_z,
             e->model.map, e->model.size, l->ssm_norm->abs_offset,
             n_tok * Q36_N_SSM_DT_RANK, Q36_RMS_EPS);
 #endif
-    bool norm_gate_fused = norm_gate_q8 || (!e->quality &&
-        q36_gpu_recurrent_norm_gate_tensor(
+    bool norm_gate_fused = norm_gate_q8 || q36_gpu_recurrent_norm_gate_tensor(
             rt->recur_proj, rt->recur_z, e->model.map, e->model.size,
             l->ssm_norm->abs_offset, Q36_N_SSM_STATE,
-            n_tok * Q36_N_SSM_DT_RANK, Q36_RMS_EPS));
+            n_tok * Q36_N_SSM_DT_RANK, Q36_RMS_EPS);
     if (!norm_gate_fused &&
         (!q36_gpu_rms_norm_weight_rows_tensor(
              rt->recur_proj, rt->recur_proj,
@@ -8136,10 +8217,6 @@ recurrent_update:
          !q36_gpu_swiglu_tensor(
              rt->recur_proj, rt->recur_z, rt->recur_proj,
              n_tok * Q36_N_SSM_INNER, 0.0f, 1.0f))) {
-        return false;
-    }
-    if (e->quality && !q36_gpu_tensor_all_finite(rt->recur_proj, n_tok * Q36_N_SSM_INNER)) {
-        fprintf(stderr, "q36: recurrent gated proj non-finite at layer=%u\n", il);
         return false;
     }
     float out_scale = q36_tensor_scalar_or(&e->model, l->ssm_out_scale, 1.0f);
@@ -8267,15 +8344,10 @@ static bool q36_forward_tokens_vulkan_into(q36_session *s,
                 s->directional_steering_attn_scale)) {
             return false;
         }
-        if (e->quality && !q36_gpu_tensor_all_finite(rt->next_hidden, n_tok * Q36_N_EMBD)) {
-            fprintf(stderr, "q36: non-finite attn output at pos=%u layer=%u kind=%s\n",
-                    pos0, il, l->kind == Q36_LAYER_FULL_ATTN ? "full" : "recurrent");
-            return false;
-        }
         if (!q36_dump_activation_gpu(s, Q36_DUMP_ATTN_OUT, il, rt->next_hidden)) return false;
         bool norm_q8 = false;
 #ifndef Q36_METAL
-        if (Q36_MODEL_DENSE && n_tok == 1u && !e->quality) {
+        if (Q36_MODEL_DENSE && n_tok == 1u) {
             norm_q8 = q36_gpu_add_rms_norm_q8_k_tensor(
                 rt->norm, rt->next_hidden, rt->next_hidden, rt->hidden,
                 e->model.map, e->model.size, l->post_attention_norm->abs_offset,
@@ -8303,17 +8375,13 @@ static bool q36_forward_tokens_vulkan_into(q36_session *s,
                 s->directional_steering_ffn_scale)) {
             return false;
         }
-        if (e->quality && !q36_gpu_tensor_all_finite(rt->hidden, n_tok * Q36_N_EMBD)) {
-            fprintf(stderr, "q36: non-finite ffn output at pos=%u layer=%u\n", pos0, il);
-            return false;
-        }
         if (!q36_dump_activation_gpu(s, Q36_DUMP_FFN_OUT, il, rt->hidden)) return false;
         {
             const q36_tensor *next_norm = il + 1u < Q36_N_LAYER ?
                 e->weights.layer[il + 1u].attn_norm : e->weights.output_norm;
             attn_q8 = false;
 #ifndef Q36_METAL
-            if (Q36_MODEL_DENSE && n_tok == 1u && !e->quality && il + 1u < Q36_N_LAYER) {
+            if (Q36_MODEL_DENSE && n_tok == 1u && il + 1u < Q36_N_LAYER) {
                 const q36_layer_weights *next = &e->weights.layer[il + 1u];
                 bool needs_q8 = next->kind == Q36_LAYER_FULL_ATTN ?
                     (next->attn_q->type != Q36_TENSOR_Q8_0 ||
@@ -8338,14 +8406,6 @@ static bool q36_forward_tokens_vulkan_into(q36_session *s,
         if (!q36_dump_activation_gpu(s, Q36_DUMP_RESIDUAL_POST, il, rt->hidden)) return false;
         if (il + 1u == Q36_N_LAYER &&
             !q36_dump_activation_gpu(s, Q36_DUMP_OUTPUT_NORM, il, rt->norm)) return false;
-        if (e->quality && !q36_gpu_tensor_all_finite(rt->hidden, n_tok * Q36_N_EMBD)) {
-            fprintf(stderr, "q36: non-finite hidden state at pos=%u layer=%u\n", pos0, il);
-            return false;
-        }
-    }
-    if (e->quality && !q36_gpu_tensor_all_finite(rt->norm, n_tok * Q36_N_EMBD)) {
-        fprintf(stderr, "q36: non-finite output norm at pos=%u\n", pos0);
-        return false;
     }
     if (logits_out) {
         bool ok;
@@ -8370,10 +8430,6 @@ static bool q36_forward_tokens_vulkan_into(q36_session *s,
         }
         if (!ok) {
             fprintf(stderr, "q36: output projection failed at pos=%u\n", pos0);
-            return false;
-        }
-        if (e->quality && !q36_gpu_tensor_all_finite(logits_out, Q36_N_VOCAB * (logits_all_rows ? n_tok : 1u))) {
-            fprintf(stderr, "q36: non-finite logits at pos=%u\n", pos0);
             return false;
         }
     }
@@ -8443,8 +8499,8 @@ static bool q36_sessions_full_attn_vulkan(q36_decode_item *items, int count,
                 Q36_N_SSM_INNER);
         bool ok = qg && q && k && v && attn &&
             q36_vulkan_prepare_attn_heads(q, qg, &e->model, l->attn_q_norm,
-                    Q36_N_HEAD_DIM * 2u, Q36_N_HEAD, pos, 1, NULL, e->quality);
-        bool fused_kv = !e->quality && cache->type_k == Q36_KV_CACHE_F16 &&
+                    Q36_N_HEAD_DIM * 2u, Q36_N_HEAD, pos, 1, NULL);
+        bool fused_kv = cache->type_k == Q36_KV_CACHE_F16 &&
                         cache->type_v == Q36_KV_CACHE_F16 &&
                         cache->k_row_bytes == Q36_N_HEAD_KV * Q36_N_HEAD_DIM * sizeof(uint16_t) &&
                         cache->v_row_bytes == Q36_N_HEAD_KV * Q36_N_VALUE_DIM * sizeof(uint16_t);
@@ -8458,7 +8514,7 @@ static bool q36_sessions_full_attn_vulkan(q36_decode_item *items, int count,
         } else if (ok) {
             ok = q36_vulkan_prepare_attn_heads(k, k, &e->model,
                     l->attn_k_norm, Q36_N_HEAD_DIM, Q36_N_HEAD_KV,
-                    pos, 1, NULL, e->quality) &&
+                    pos, 1, NULL) &&
                  q36_gpu_attn_kv_store_tensor(
                     cache->k, cache->v, k, v, pos, 1, cache->cap,
                     Q36_N_HEAD_KV * Q36_N_HEAD_DIM,
@@ -8512,22 +8568,38 @@ static bool q36_sessions_recurrent_vulkan(q36_decode_item *items, int count,
         !q36_gpu_tensor_matmul_q8_or_float_scaled(
             &e->model, l->attn_gate, inp, batch->inp_q8, batch->recur_z,
             Q36_N_EMBD, Q36_N_SSM_INNER, rows,
-            q36_tensor_scalar_or(&e->model, l->attn_gate_scale, 1.0f)) ||
-        !q36_gpu_tensor_matmul_dense_q8_scaled(
+            q36_tensor_scalar_or(&e->model, l->attn_gate_scale, 1.0f))) {
+        return false;
+    }
+    bool front = false;
+#ifndef Q36_METAL
+    front = !e->ssd_streaming && batch->recur_conv_fused &&
+        Q36_N_SSM_STATE == 128u && Q36_N_SSM_CONV == 4u &&
+        l->ssm_alpha->type == l->ssm_beta->type &&
+        (l->ssm_alpha->type == Q36_TENSOR_Q8_0 || l->ssm_alpha->type == Q36_TENSOR_BF16) &&
+        q36_gpu_gdn_front_supported(Q36_N_EMBD, Q36_N_SSM_GROUP, Q36_N_SSM_DT_RANK);
+#endif
+    if (!front && (!q36_gpu_tensor_matmul_dense_q8_scaled(
             &e->model, l->ssm_beta, inp, batch->inp_q8, batch->recur_beta,
             Q36_N_EMBD, Q36_N_SSM_DT_RANK, rows,
             q36_tensor_scalar_or(&e->model, l->ssm_beta_scale, 1.0f)) ||
         !q36_gpu_tensor_matmul_dense_q8_scaled(
             &e->model, l->ssm_alpha, inp, batch->inp_q8, batch->recur_alpha,
             Q36_N_EMBD, Q36_N_SSM_DT_RANK, rows,
-            q36_tensor_scalar_or(&e->model, l->ssm_alpha_scale, 1.0f))) {
+            q36_tensor_scalar_or(&e->model, l->ssm_alpha_scale, 1.0f)))) {
         return false;
     }
 
+    /* Expanded Q/K share the raw QKV owner. Preserve later input rows before
+     * an earlier row writes its expanded heads; reuse dead convolution scratch. */
+    if (Q36_MODEL_DENSE && !q36_gpu_tensor_copy(batch->recur_conv, 0,
+            batch->recur_qkv, 0, (uint64_t)rows * Q36_N_SSM_CONV_DIM * sizeof(float)))
+        return false;
     for (int i = 0; i < count; i++) {
         q36_vulkan_runtime *rt = items[i].session->runtime;
         q36_vulkan_recurrent_cache *cache = &rt->recurrent[il];
-        q36_gpu_tensor *qkv = q36_vulkan_row(batch->recur_qkv, (uint32_t)i,
+        q36_gpu_tensor *x = q36_vulkan_row(inp, (uint32_t)i, Q36_N_EMBD);
+        q36_gpu_tensor *qkv = q36_vulkan_row(Q36_MODEL_DENSE ? batch->recur_conv : batch->recur_qkv, (uint32_t)i,
                 Q36_N_SSM_CONV_DIM);
         q36_gpu_tensor *conv = q36_vulkan_row(batch->recur_conv, (uint32_t)i,
                 Q36_N_SSM_CONV_DIM);
@@ -8545,8 +8617,19 @@ static bool q36_sessions_recurrent_vulkan(q36_decode_item *items, int count,
                 Q36_N_SSM_DT_RANK);
         q36_gpu_tensor *proj = q36_vulkan_row(batch->recur_proj, (uint32_t)i,
                 Q36_N_SSM_INNER);
-        bool ok = qkv && conv && q && k && v && gb && alpha && beta && proj;
-        if (ok) {
+        bool ok = x && qkv && conv && q && k && v && gb && alpha && beta && proj;
+#ifndef Q36_METAL
+        if (ok && front) {
+            const uint64_t offsets[5] = {l->ssm_conv1d->abs_offset, l->ssm_alpha->abs_offset,
+                l->ssm_beta->abs_offset, l->ssm_dt->abs_offset, l->ssm_a->abs_offset};
+            ok = q36_gpu_gdn_front_tensor(cache->conv, qkv, x, q, k, v, gb,
+                e->model.map, e->model.size, offsets, Q36_N_EMBD, Q36_N_SSM_GROUP,
+                Q36_N_SSM_DT_RANK, l->ssm_alpha->type,
+                q36_tensor_scalar_or(&e->model, l->ssm_alpha_scale, 1.0f),
+                q36_tensor_scalar_or(&e->model, l->ssm_beta_scale, 1.0f), Q36_RMS_EPS) != 0;
+        }
+#endif
+        if (ok && !front) {
             if (rt->recur_conv_fused) {
                 ok = q36_gpu_recurrent_conv_silu_tensor(
                         cache->conv, qkv, conv, e->model.map, e->model.size,
@@ -8554,14 +8637,14 @@ static bool q36_sessions_recurrent_vulkan(q36_decode_item *items, int count,
                         Q36_N_SSM_CONV, 1) != 0;
             } else {
                 ok = q36_gpu_recurrent_conv_step_tensor(
-                        cache->conv, qkv, rt->recur_window, 1) != 0 &&
+                        cache->conv, qkv, rt->recur_window, Q36_N_SSM_CONV_DIM, 1) != 0 &&
                      q36_gpu_ssm_conv_silu_tensor(
                         conv, rt->recur_window, e->model.map, e->model.size,
                         l->ssm_conv1d->abs_offset, Q36_N_SSM_CONV_DIM,
                         Q36_N_SSM_CONV, 1) != 0;
             }
         }
-        if (ok && !q36_gpu_delta_qkv_l2_norm_tensor(
+        if (ok && !front && !q36_gpu_delta_qkv_l2_norm_tensor(
                     q, k, v, conv, Q36_N_SSM_DT_RANK, Q36_N_SSM_GROUP,
                     Q36_N_SSM_STATE, Q36_N_SSM_CONV_DIM, 1, Q36_RMS_EPS)) {
             ok = q36_gpu_delta_qk_l2_norm_tensor(
@@ -8570,12 +8653,14 @@ static bool q36_sessions_recurrent_vulkan(q36_decode_item *items, int count,
                     Q36_RMS_EPS) != 0 &&
                  q36_gpu_extract_recurrent_v_tensor(v, conv, 1) != 0;
         }
-        if (ok) {
+        if (ok && !front) {
             ok = q36_gpu_delta_net_gates_tensor(
                     gb, alpha, beta, e->model.map, e->model.size,
                     l->ssm_dt->abs_offset, l->ssm_a->abs_offset,
-                    Q36_N_SSM_DT_RANK, 1) != 0 &&
-                 q36_gpu_delta_net_decode_tensor(
+                    Q36_N_SSM_DT_RANK, 1) != 0;
+        }
+        if (ok) {
+            ok = q36_gpu_delta_net_decode_tensor(
                     cache->state, q, k, v, gb, proj,
                     Q36_N_SSM_DT_RANK, Q36_N_SSM_STATE, 1) != 0;
         }
@@ -8588,18 +8673,36 @@ static bool q36_sessions_recurrent_vulkan(q36_decode_item *items, int count,
         q36_gpu_tensor_free(q);
         q36_gpu_tensor_free(conv);
         q36_gpu_tensor_free(qkv);
+        q36_gpu_tensor_free(x);
         if (!ok) return false;
     }
 
-    if (!q36_gpu_rms_norm_weight_rows_tensor(
+    /* Match ordinary decode's fused normalization and Q8_K rounding. */
+    bool norm_q8 = false;
+#ifndef Q36_METAL
+    norm_q8 = q36_gpu_recurrent_norm_gate_q8_k_tensor(
+        batch->recur_proj, batch->inp_q8, batch->recur_z,
+        e->model.map, e->model.size, l->ssm_norm->abs_offset,
+        rows * Q36_N_SSM_DT_RANK, Q36_RMS_EPS);
+#endif
+    bool norm_gate = norm_q8 || q36_gpu_recurrent_norm_gate_tensor(
+        batch->recur_proj, batch->recur_z, e->model.map, e->model.size,
+        l->ssm_norm->abs_offset, Q36_N_SSM_STATE,
+        rows * Q36_N_SSM_DT_RANK, Q36_RMS_EPS);
+    if (!norm_gate && (!q36_gpu_rms_norm_weight_rows_tensor(
             batch->recur_proj, batch->recur_proj,
             e->model.map, e->model.size, l->ssm_norm->abs_offset,
             Q36_N_SSM_STATE, rows * Q36_N_SSM_DT_RANK, Q36_RMS_EPS) ||
         !q36_gpu_swiglu_tensor(batch->recur_proj, batch->recur_z,
                                batch->recur_proj,
-                               rows * Q36_N_SSM_INNER, 0.0f, 1.0f)) {
+                               rows * Q36_N_SSM_INNER, 0.0f, 1.0f))) {
         return false;
     }
+    if (norm_q8)
+        return q36_gpu_tensor_matmul_q8_or_float_scaled(
+            &e->model, l->ssm_out, batch->recur_proj, batch->inp_q8, out,
+            Q36_N_SSM_INNER, Q36_N_EMBD, rows,
+            q36_tensor_scalar_or(&e->model, l->ssm_out_scale, 1.0f));
     return q36_gpu_tensor_matmul_scaled(
             &e->model, l->ssm_out, batch->recur_proj, out,
             Q36_N_SSM_INNER, Q36_N_EMBD, rows,
@@ -8703,12 +8806,14 @@ static bool q36_sessions_eval_batch_vulkan(q36_decode_item *items, int count) {
         e->session_batch_logits = logits;
         e->session_batch_logits_cap = rows;
     }
-    if (!q36_gpu_tensor_matmul_scaled(
+    /* The output head is decode too; prefill kernels accumulate differently. */
+    q36_gpu_set_micro_batch(true);
+    bool head_ok = q36_gpu_tensor_matmul_scaled(
             &e->model, e->weights.output, rt->norm,
             e->session_batch_logits, Q36_N_EMBD, Q36_N_VOCAB, rows,
-            q36_tensor_scalar_or(&e->model, e->weights.output_scale, 1.0f))) {
-        return false;
-    }
+            q36_tensor_scalar_or(&e->model, e->weights.output_scale, 1.0f));
+    q36_gpu_set_micro_batch(false);
+    if (!head_ok) return false;
     for (int i = 0; i < count; i++) {
         q36_vulkan_runtime *dst = items[i].session->runtime;
         if (!q36_gpu_tensor_copy(
@@ -9017,7 +9122,6 @@ static bool q36_mtp_forward(q36_session *s, const int *tokens,
                                             &e->mtp_model,
                                             l,
                                             &rt->mtp_full,
-                                            e->quality,
                                             Q36_N_LAYER,
                                             pos,
                                             (uint32_t)((int32_t)pos + s->rope_delta),
@@ -9067,7 +9171,6 @@ static bool q36_mtp_forward(q36_session *s, const int *tokens,
                                       Q36_N_VOCAB,
                                       1,
                                       q36_tensor_scalar_or(&e->model, e->weights.output_scale, 1.0f))) return false;
-    if (e->quality && !q36_gpu_tensor_all_finite(rt->mtp_logits, Q36_N_VOCAB)) return false;
     return true;
 }
 
@@ -10397,7 +10500,6 @@ int q36_engine_open(q36_engine **out, const q36_engine_options *opt) {
     e->cache_type_k = opt->cache_type_k;
     e->cache_type_v = opt->cache_type_v;
     e->power_percent = opt->power_percent > 0 ? opt->power_percent : 100;
-    e->quality = opt->quality;
     e->ssd_streaming = opt->ssd_streaming;
     e->ssd_streaming_cold = opt->ssd_streaming_cold;
     e->ssd_streaming_full_layers_set = opt->ssd_streaming_full_layers_set;
@@ -10425,6 +10527,7 @@ int q36_engine_open(q36_engine **out, const q36_engine_options *opt) {
         if (model_get_string(&e->model, "general.name", &name)) {
             e->kat_coder = q36_str_contains(name, "KAT Coder") ||
                            q36_str_contains(name, "KAT-Coder");
+            e->gsq_rco = q36_str_contains(name, "GSQ-RCO");
         }
     }
     config_validate_model(&e->model);
@@ -10571,7 +10674,6 @@ int q36_engine_open(q36_engine **out, const q36_engine_options *opt) {
     }
 #ifndef Q36_NO_GPU
     if (q36_backend_uses_graph(opt->backend)) {
-        q36_gpu_set_quality(opt->quality);
         q36_gpu_set_dense_model(Q36_MODEL_DENSE);
         if (e->mtp_ready) {
             q36_gpu_set_micro_batch(true);
@@ -10803,6 +10905,8 @@ const char *q36_engine_model_name(q36_engine *e) {
 
 int q36_engine_model_id(q36_engine *e) {
     if (e && e->kat_coder) return 2;
+    /* Different dense weights must never restore each other's KV state. */
+    if (e && e->variant == Q36_VARIANT_27B && e->gsq_rco) return 4;
     return e && e->variant == Q36_VARIANT_27B ? 3 : 1;
 }
 
@@ -11018,7 +11122,6 @@ int q36_session_create(q36_session **out, q36_engine *e, int ctx_size) {
         s->runtime = q36_vulkan_runtime_create(ctx_size,
                                                q36_engine_gpu_prefill_cap(e),
                                                e->mtp_ready,
-                                               e->quality,
                                                e->ssd_streaming,
                                                e->cache_type_k,
                                                e->cache_type_v);

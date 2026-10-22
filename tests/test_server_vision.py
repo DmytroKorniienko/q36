@@ -47,10 +47,13 @@ def main():
     parser.add_argument('--slots', type=int, default=1)
     parser.add_argument('--ctx', type=int, default=16384)
     parser.add_argument('--resident', action='store_true')
+    parser.add_argument('--mtp', action='store_true', help='Use the embedded MTP head')
     parser.add_argument('--pi', type=Path)
     parser.add_argument('--pi-api', action='append', choices=[
         'openai-completions', 'openai-responses', 'anthropic-messages'])
     args = parser.parse_args()
+    if args.slots < 1 or (args.mtp and args.slots != 1):
+        parser.error('--slots must be positive; --mtp requires one slot')
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=True)
     with socket.socket() as sock:
@@ -59,10 +62,14 @@ def main():
     base = f'http://127.0.0.1:{port}'
     cmd = [str(args.binary.resolve()), '--vulkan', '-m', str(Path(args.model).resolve()),
            '--vision', str(Path(args.vision).resolve()), '--ctx', str(args.ctx),
-           '--host', '127.0.0.1', '--port', str(port), '--batched-session', str(args.slots),
+           '--host', '127.0.0.1', '--port', str(port),
            '--trace', str(out / 'trace.txt')]
+    if not args.mtp:
+        cmd += ['--batched-session', str(args.slots)]
     if not args.resident:
         cmd.append('--ssd-streaming')
+    if args.mtp:
+        cmd.append('--mtp')
     (out / 'command.json').write_text(json.dumps(cmd))
     sequence = 0
 

@@ -301,6 +301,31 @@ kernel void q36_matmul_f16(device float *out [[buffer(0)]],
     out[(ulong)gid.y * args.out_dim + gid.x] = sum * args.scale;
 }
 
+static float q36_round_bf16(float value) {
+    uint bits = as_type<uint>(value);
+    if ((bits & 0x7fffffffu) > 0x7f800000u)
+        bits = (bits & 0xffff0000u) | 0x00400000u;
+    else
+        bits = (bits + 0x7fffu + ((bits >> 16u) & 1u)) & 0xffff0000u;
+    return as_type<float>(bits);
+}
+
+kernel void q36_matmul_bf16(device float *out [[buffer(0)]],
+                             device const ushort *weights [[buffer(1)]],
+                             device const float *x [[buffer(2)]],
+                             constant q36_dense_args &args [[buffer(3)]],
+                             uint2 gid [[threadgroup_position_in_grid]],
+                             uint lane [[thread_index_in_simdgroup]]) {
+    if (gid.x >= args.out_dim || gid.y >= args.tokens) return;
+    device const ushort *w = weights + (ulong)gid.x * args.in_dim;
+    device const float *v = x + (ulong)gid.y * args.in_dim;
+    float sum = 0.0f;
+    for (uint i = lane; i < args.in_dim; i += 32u)
+        sum = fma(as_type<float>(uint(w[i]) << 16), q36_round_bf16(v[i]), sum);
+    sum = simd_sum(sum);
+    if (lane == 0u) out[(ulong)gid.y * args.out_dim + gid.x] = sum * args.scale;
+}
+
 struct q36_block_q8_0 {
     half d;
     char qs[32];

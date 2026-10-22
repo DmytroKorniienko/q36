@@ -13,7 +13,7 @@ import struct
 import sys
 
 
-FIELDS = {'source', 'model', 'backend', 'quality', 'quant_bits', 'prompt_tokens',
+FIELDS = {'source', 'model', 'backend', 'quant_bits', 'prompt_tokens',
           'frontier_tokens', 'prefill_tokens', 'ctx', 'vocab', 'argmax_id',
           'argmax_logit', 'logits'}
 INT_MAX = 2**31 - 1
@@ -69,7 +69,7 @@ def binary32(value, name):
     return raw, rounded
 
 
-def validate_expectations(frontiers, ctx, model, backend, quality, quant_bits, vocab):
+def validate_expectations(frontiers, ctx, model, backend, quant_bits, vocab):
     if (not frontiers or any(type(n) is not int or not 0 < n <= INT_MAX for n in frontiers)
             or frontiers != sorted(set(frontiers))):
         raise InvalidDump('expected frontiers must be unique, positive, strictly increasing integers')
@@ -79,12 +79,12 @@ def validate_expectations(frontiers, ctx, model, backend, quality, quant_bits, v
         raise InvalidDump('expected model must be a nonempty path string without NUL')
     if backend not in ('vulkan', 'metal', 'cpu') or type(backend) is not str:
         raise InvalidDump('unsupported expected backend')
-    if type(quality) is not bool or type(quant_bits) is not int or quant_bits not in (0, 2, 4):
-        raise InvalidDump('expected quality must be boolean and quant_bits must be 0, 2, or 4')
+    if type(quant_bits) is not int or quant_bits not in (0, 2, 4):
+        raise InvalidDump('expected quant_bits must be 0, 2, or 4')
     if type(vocab) is not int or not 0 < vocab <= INT_MAX:
         raise InvalidDump('expected vocab must be a positive signed C int')
     return {'source': 'q36-bench', 'model': model, 'backend': backend,
-            'quality': quality, 'quant_bits': quant_bits, 'ctx': ctx, 'vocab': vocab}
+            'quant_bits': quant_bits, 'ctx': ctx, 'vocab': vocab}
 
 
 def validate_dump(path, expected, frontier, previous):
@@ -104,9 +104,7 @@ def validate_dump(path, expected, frontier, previous):
     for key in ('source', 'model', 'backend'):
         if type(document[key]) is not str or document[key] != expected[key]:
             raise InvalidDump(f'{key}: does not match explicit expected metadata')
-    if type(document['quality']) is not bool or document['quality'] != expected['quality']:
-        raise InvalidDump('quality: does not match explicit expected boolean')
-    metadata = {key: document[key] for key in ('source', 'model', 'backend', 'quality')}
+    metadata = {key: document[key] for key in ('source', 'model', 'backend')}
     counts = {key: integer(document[key], key) for key in
               ('quant_bits', 'prompt_tokens', 'frontier_tokens', 'prefill_tokens', 'ctx', 'vocab', 'argmax_id')}
     required_counts = {key: expected[key] for key in ('quant_bits', 'ctx', 'vocab')}
@@ -141,7 +139,7 @@ def validate_dump(path, expected, frontier, previous):
 def compare_directories(baseline, candidate, frontiers, expected):
     try:
         validated = validate_expectations(frontiers, expected['ctx'], expected['model'],
-                                           expected['backend'], expected['quality'],
+                                           expected['backend'],
                                            expected['quant_bits'], expected['vocab'])
     except (KeyError, TypeError) as exc:
         raise InvalidDump(f'incomplete expected metadata: {exc}') from exc
@@ -206,14 +204,13 @@ def main(argv=None):
     parser.add_argument('--ctx', type=int, required=True)
     parser.add_argument('--model', required=True)
     parser.add_argument('--backend', choices=('vulkan', 'metal', 'cpu'), required=True)
-    parser.add_argument('--quality', choices=('true', 'false'), required=True)
     parser.add_argument('--quant-bits', type=int, choices=(0, 2, 4), required=True)
     parser.add_argument('--vocab', type=int, required=True)
     parser.add_argument('--output', type=Path, required=True, help='exclusively create a new JSON report')
     args = parser.parse_args(argv)
     try:
         expected = validate_expectations(args.frontiers, args.ctx, args.model, args.backend,
-                                         args.quality == 'true', args.quant_bits, args.vocab)
+                                         args.quant_bits, args.vocab)
         report = compare_directories(args.baseline, args.candidate, args.frontiers, expected)
         with args.output.open('x', encoding='utf-8') as output:
             output.write(json.dumps(report, indent=2, allow_nan=False) + '\n')

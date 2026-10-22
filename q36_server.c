@@ -10526,8 +10526,6 @@ static void usage(FILE *fp) {
         "      CPU helper threads for lightweight host-side work.\n"
         "  --prefill-chunk N\n"
         "      GPU graph prefill chunk size. Default: auto; resident GPU resolves to 1024.\n"
-        "  --quality\n"
-        "      Prefer exact kernels where faster approximate paths exist; MTP uses strict verification.\n"
         "  --dir-steering-file FILE\n"
         "      Load one hidden-width f32 direction per model layer.\n"
         "  --dir-steering-ffn F\n"
@@ -10733,8 +10731,6 @@ static server_config parse_options(int argc, char **argv) {
             c.disable_exact_tool_replay = true;
         } else if (!strcmp(arg, "--tool-memory-max-ids")) {
             c.tool_memory_max_ids = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
-        } else if (!strcmp(arg, "--quality")) {
-            c.engine.quality = true;
         } else if (!strcmp(arg, "--ssd-streaming")) {
             c.engine.ssd_streaming = true;
         } else if (!strcmp(arg, "--ssd-streaming-cold")) {
@@ -10901,9 +10897,13 @@ int main(int argc, char **argv) {
         char name[40];
         uint64_t key = q36_session_directional_steering_key(s.session);
         snprintf(name, sizeof(name), "steering-%016llx", (unsigned long long)key);
-        char *dir = key ? path_join(cfg.kv_disk_dir, name) : xstrdup(cfg.kv_disk_dir);
+        /* The legacy server KV header cannot identify different model weights. */
+        char *base = q36_engine_model_id(engine) == 4 ?
+            path_join(cfg.kv_disk_dir, "qwen38-gsq-rco") : xstrdup(cfg.kv_disk_dir);
+        char *dir = key ? path_join(base, name) : xstrdup(base);
         kv_cache_open(&s.kv, dir, cfg.kv_disk_space_mb,
                       cfg.kv_cache_reject_different_quant, cfg.kv_cache);
+        free(base);
         free(dir);
     }
     if (s.batched_mode) {

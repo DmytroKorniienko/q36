@@ -17,7 +17,7 @@
  * (d * 128) folded in, so f16 add chains are 8 terms long and cannot
  * overflow. Per-output k order is fixed regardless of n_tok, keeping
  * the batch-size invariance rule (warm == cold). Results differ from
- * the f32 kernel by ~1e-3 relative; --quality never routes here. */
+ * the f32 kernel by ~1e-3 relative. */
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 

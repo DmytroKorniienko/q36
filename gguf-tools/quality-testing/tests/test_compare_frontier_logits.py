@@ -21,7 +21,7 @@ def fixture(frontier=2048, previous=0, values=None, **changes):
     values = [f32(value) for value in values]
     best = max(range(len(values)), key=values.__getitem__)
     document = {'source': 'q36-bench', 'model': '/models/qwen', 'backend': 'vulkan',
-                'quality': False, 'quant_bits': 2, 'prompt_tokens': frontier,
+                'quant_bits': 2, 'prompt_tokens': frontier,
                 'frontier_tokens': frontier, 'prefill_tokens': frontier - previous,
                 'ctx': 8192, 'vocab': len(values), 'argmax_id': best,
                 'argmax_logit': '__ARGMAX__', 'logits': '__LOGITS__'}
@@ -38,7 +38,7 @@ class FrontierTests(unittest.TestCase):
         self.old, self.new = self.root / 'old', self.root / 'new'
         self.old.mkdir()
         self.new.mkdir()
-        self.expected = gate.validate_expectations([2048, 4096], 8192, '/models/qwen', 'vulkan', False, 2, 4)
+        self.expected = gate.validate_expectations([2048, 4096], 8192, '/models/qwen', 'vulkan', 2, 4)
         for directory in (self.old, self.new):
             (directory / 'frontier_002048.logits.json').write_bytes(fixture())
             (directory / 'frontier_004096.logits.json').write_bytes(fixture(4096, 2048))
@@ -111,8 +111,6 @@ class FrontierTests(unittest.TestCase):
         for changes in ({'quant_bits': 4}, {'prompt_tokens': 2047}, {'frontier_tokens': 4096},
                         {'prefill_tokens': 0}, {'ctx': 4096}, {'vocab': 3}, {'argmax_id': 4}):
             self.assert_bad(fixture(**changes))
-        for value in (None, 0, 1, 'false', True):
-            self.assert_bad(fixture(quality=value))
 
     def test_source_model_backend_metadata_must_match_explicit_expectations(self):
         for key in ('source', 'model', 'backend'):
@@ -168,17 +166,17 @@ class FrontierTests(unittest.TestCase):
     def test_expected_frontiers_and_context_require_explicit_sane_contract(self):
         for frontiers in ([], [0], [-1], [True], [4096, 2048], [2048, 2048]):
             with self.assertRaises(gate.InvalidDump):
-                gate.validate_expectations(frontiers, 8192, '/models/qwen', 'vulkan', False, 2, 4)
+                gate.validate_expectations(frontiers, 8192, '/models/qwen', 'vulkan', 2, 4)
             with self.assertRaises(gate.InvalidDump):
                 gate.compare_directories(self.old, self.new, frontiers, self.expected)
         for ctx in (4095, 4096, True, 2**31):
             with self.assertRaises(gate.InvalidDump):
-                gate.validate_expectations([2048, 4096], ctx, '/models/qwen', 'vulkan', False, 2, 4)
+                gate.validate_expectations([2048, 4096], ctx, '/models/qwen', 'vulkan', 2, 4)
 
     def test_cli_exit_status_and_exclusive_output_for_identity_drift_invalid(self):
         command = [sys.executable, str(Path(gate.__file__)), str(self.old), str(self.new),
                    '--frontiers', '2048', '4096', '--ctx', '8192', '--model', '/models/qwen',
-                   '--backend', 'vulkan', '--quality', 'false', '--quant-bits', '2', '--vocab', '4']
+                   '--backend', 'vulkan', '--quant-bits', '2', '--vocab', '4']
         output = self.root / 'identity.json'
         process = subprocess.run(command + ['--output', str(output)], capture_output=True, text=True)
         self.assertEqual(process.returncode, 0, process.stderr)

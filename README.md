@@ -148,7 +148,28 @@ the tensor layout, quantization mix, metadata, or optional MTP state expected by
 the engine. The 2 bit quantizations provided here are verified to be actually
 high quality: they behave well, work under coding agents, call tools in a reliable way.
 
-Start dense Qwen3.8-27B explicitly:
+Dense Qwen3.8-27B has two supported options, both with an embedded MTP head:
+
+| Download target | GGUF | File size | Use |
+|---|---|---:|---|
+| `27b` | `Qwen3.8-27B-UD-IQ3_S.gguf` | 11.21 GiB | Higher quality weights |
+| `27b-iq3-xxs` | `Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf` | 9.73 GiB | More memory for context |
+
+The GSQ-RCO file replaces the earlier unofficial UD-IQ3_XXS option. Its
+mixed tensor formats, including BF16 recurrent projections, run natively on
+the GPU. Both models use the same CLI, server, agent, evaluator, session
+cache, and Qwen3.8 vision projector.
+GSQ-RCO uses a separate disk cache namespace and agent checkpoint identity
+so switching models cannot restore KV state produced by the other weights.
+
+Download and start the smaller dense model explicitly:
+
+```sh
+./download_model.sh 27b-iq3-xxs
+./q36-server -m gguf/Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf --mtp --vulkan
+```
+
+Select IQ3_S for higher quality weights:
 
 ```sh
 ./q36-server \
@@ -247,8 +268,8 @@ inputs; imatrix collection still uses the optional llama.cpp tooling.
 `./download_model.sh mtp` fetches the optional speculative decoding support
 GGUF for Qwen 3.6 MoE. It can be used with the `q2-imatrix` and
 `q2-q4-imatrix` main models, but must be enabled explicitly with `--mtp`.
-Embedded heads are supported in 41-block MoE GGUFs and in the 65-block
-`Qwen3.8-27B-UD-IQ3_S.gguf`. Use `--mtp` without a filename to select the
+Embedded heads are supported in 41-block MoE GGUFs and in both supported
+65-block Qwen3.8-27B GGUFs. Use `--mtp` without a filename to select the
 embedded head, or `--mtp FILE` for a separate support GGUF. In `q36`,
 `q36-server`, and `q36-agent`, this enables the tuned BC-250 configuration:
 up to eight tokens, adaptive draft confidence (`--mtp-margin 0`), and

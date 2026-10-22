@@ -55,7 +55,6 @@ typedef struct {
     bool ssd_streaming_cold;
     bool ssd_streaming_full_layers_set;
     bool warm_weights;
-    bool quality;
     const char *dump_frontier_logits_dir;
 } bench_config;
 
@@ -88,7 +87,6 @@ static void usage(FILE *fp) {
         "      Select Metal on Apple Silicon, Vulkan on Linux, or CPU.\n"
         "  -t, --threads N        CPU helper threads.\n"
         "  --prefill-chunk N      Override GPU graph prefill width. Default: auto; resident GPU resolves to 1024.\n"
-        "  --quality              Prefer exact kernels where applicable.\n"
         "  -ctk, --cache-type-k TYPE\n"
         "                         KV cache K type: f16, q8_0, or q4_0.\n"
         "                         Default: Vulkan/Metal resident q8_0, otherwise f16\n"
@@ -288,8 +286,6 @@ static bench_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--cuda")) {
             fprintf(stderr, "q36-bench: %s is not supported; use --metal, --vulkan, or --cpu\n", arg);
             exit(2);
-        } else if (!strcmp(arg, "--quality")) {
-            c.quality = true;
         } else if (!strcmp(arg, "-ctk") || !strcmp(arg, "--cache-type-k")) {
             if (!q36_parse_kv_cache_type(need_arg(&i, argc, argv, arg), &c.cache_type_k)) {
                 fprintf(stderr, "q36-bench: invalid cache type for %s\n", arg);
@@ -476,13 +472,12 @@ static int write_frontier_logits_json(
     fprintf(fp, "{\n  \"source\":\"q36-bench\",\n  \"model\":");
     json_write_string(fp, cfg->model_path);
     fprintf(fp,
-            ",\n  \"backend\":\"%s\",\n  \"quality\":%s,\n"
+            ",\n  \"backend\":\"%s\",\n"
             "  \"quant_bits\":%d,\n  \"prompt_tokens\":%d,\n"
             "  \"frontier_tokens\":%d,\n  \"prefill_tokens\":%d,\n"
             "  \"ctx\":%d,\n  \"vocab\":%d,\n"
             "  \"argmax_id\":%d,\n  \"argmax_logit\":%.9g,\n  \"logits\":[",
             q36_backend_name(cfg->backend),
-            cfg->quality ? "true" : "false",
             q36_engine_routed_quant_bits(engine),
             frontier,
             frontier,
@@ -561,7 +556,6 @@ int main(int argc, char **argv) {
         .cache_type_k = cfg.cache_type_k,
         .cache_type_v = cfg.cache_type_v,
         .warm_weights = cfg.warm_weights,
-        .quality = cfg.quality,
     };
     q36_engine *engine = NULL;
     if (q36_engine_open(&engine, &opt) != 0) return 1;

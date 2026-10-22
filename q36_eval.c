@@ -1206,7 +1206,6 @@ typedef struct {
     q36_think_mode think_mode;
     bool plain;
     bool warm_weights;
-    bool quality;
     bool ssd_streaming;
     bool ssd_streaming_cold;
     bool ssd_streaming_full_layers_set;
@@ -1694,8 +1693,6 @@ static eval_config parse_options(int argc, char **argv) {
                    !strcmp(arg, "--coordinator")) {
             fprintf(stderr, "q36-eval: %s is not supported in this q36 port\n", arg);
             exit(2);
-        } else if (!strcmp(arg, "--quality")) {
-            c.quality = true;
         } else if (!strcmp(arg, "--ssd-streaming")) {
             c.ssd_streaming = true;
         } else if (!strcmp(arg, "--ssd-streaming-cold")) {
@@ -4725,7 +4722,6 @@ int main(int argc, char **argv) {
         .cache_type_k = cfg.cache_type_k,
         .cache_type_v = cfg.cache_type_v,
         .warm_weights = cfg.warm_weights,
-        .quality = cfg.quality,
         .ssd_streaming = cfg.ssd_streaming,
         .ssd_streaming_cold = cfg.ssd_streaming_cold,
     };

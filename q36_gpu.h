@@ -73,7 +73,6 @@ int q36_gpu_prepare_q5_k_output_cache(const void *model_map,
                                       uint64_t in_dim,
                                       uint64_t out_dim);
 #endif
-void q36_gpu_set_quality(bool quality);
 void q36_gpu_set_dense_model(bool dense);
 void q36_gpu_set_micro_batch(bool enabled);
 /* True when the fused attention path will serve q36_gpu_attn_decode_tensor;
@@ -164,6 +163,17 @@ int q36_gpu_matmul_f16_tensor(
         uint64_t                out_dim,
         const q36_gpu_tensor *x,
         uint64_t                n_tok);
+
+int q36_gpu_matmul_bf16_scaled_tensor(
+        q36_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const q36_gpu_tensor *x,
+        uint64_t                n_tok,
+        float                   scale);
 
 int q36_gpu_matmul_f32_tensor(
         q36_gpu_tensor       *out,
@@ -405,6 +415,7 @@ int q36_gpu_recurrent_conv_step_tensor(
         q36_gpu_tensor       *cache_conv,
         const q36_gpu_tensor *cur,
         q36_gpu_tensor       *window,
+        uint32_t                conv_dim,
         uint32_t                n_tok);
 
 int q36_gpu_gdn_front_supported(uint32_t width, uint32_t groups, uint32_t heads);
@@ -412,7 +423,7 @@ int q36_gpu_gdn_front_tensor(q36_gpu_tensor *history,
     const q36_gpu_tensor *cur, const q36_gpu_tensor *x,
     q36_gpu_tensor *q, q36_gpu_tensor *k, q36_gpu_tensor *v, q36_gpu_tensor *gb,
     const void *map, uint64_t size, const uint64_t offsets[5],
-    uint32_t width, uint32_t groups, uint32_t heads,
+    uint32_t width, uint32_t groups, uint32_t heads, uint32_t weight_type,
     float alpha_scale, float beta_scale, float eps);
 
 int q36_gpu_recurrent_conv_silu_tensor(

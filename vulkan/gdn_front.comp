@@ -36,8 +36,19 @@ float sigmoid_stable(float x) {
 }
 
 /* Each key-head group owns its convolution history and all associated
- * value heads. Keep the existing convolution, Q8 dot and norm trees.
+ * value heads. Keep the existing convolution and norm trees.
  * Read all owned channels before writing Q/K, which may alias raw QKV. */
+#ifdef Q36_BF16
+vec4 round_bf16(vec4 value) {
+    uvec4 bits = floatBitsToUint(value);
+    bvec4 nan = greaterThan(bits & 0x7fffffffu, uvec4(0x7f800000u));
+    uvec4 quiet = (bits & 0xffff0000u) | 0x00400000u;
+    bits = (bits + 0x7fffu + ((bits >> 16u) & 1u)) & 0xffff0000u;
+    return uintBitsToFloat(mix(bits, quiet, nan));
+}
+
+#endif
+
 void main() {
     uint tid=gl_LocalInvocationID.x, h=gl_WorkGroupID.x;
     uint per=pc.heads/pc.groups, channels=(2u*pc.groups+pc.heads)*128u;
@@ -73,6 +84,17 @@ void main() {
         qout[row*128u+lane]=qv[lane]*qs;
         kout[row*128u+lane]=kv[lane]*ks;
         float aa=0.0, ab=0.0;
+#ifdef Q36_BF16
+        uint n4 = pc.blocks * 8u;
+        for (uint i = lane; i < n4; i += 128u) {
+            uint base = row * n4 * 4u + i * 4u;
+            vec4 a = uintBitsToFloat(uvec4(wa[base], wa[base+1u], wa[base+2u], wa[base+3u]) << 16u);
+            vec4 b = uintBitsToFloat(uvec4(wb[base], wb[base+1u], wb[base+2u], wb[base+3u]) << 16u);
+            vec4 input_value = round_bf16(xv[i]);
+            aa += dot(a, input_value);
+            ab += dot(b, input_value);
+        }
+#else
         uint eoff=(lane&3u)*8u;
         for (uint b=lane>>2u; b<pc.blocks; b+=32u) {
             uint base=(row*pc.blocks+b)*17u, q=base+1u+(eoff>>1u);
@@ -85,6 +107,7 @@ void main() {
             aa+=unpackHalf2x16(uint(wa[base])).x*(dot(vec4(unpack8(int(a0))),x0)+dot(vec4(unpack8(int(a1))),x1));
             ab+=unpackHalf2x16(uint(wb[base])).x*(dot(vec4(unpack8(int(b0))),x0)+dot(vec4(unpack8(int(b1))),x1));
         }
+#endif
         aa=subgroupAdd(aa); ab=subgroupAdd(ab);
         if (subgroupElect()) { sa[gl_SubgroupID]=aa; sb[gl_SubgroupID]=ab; }
         barrier();

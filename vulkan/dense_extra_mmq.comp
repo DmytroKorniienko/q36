@@ -25,6 +25,7 @@ const uint IQ2_XS = 17u;
 const uint IQ1_S = 19u;
 const uint IQ4_NL = 20u;
 const uint IQ2_S = 22u;
+const uint IQ1_M = 29u;
 #ifndef Q36_BN
 #define Q36_BN 128
 #endif
@@ -46,6 +47,13 @@ const uint TAB_IQ2S = 544u;
 const uint TAB_IQ1S = 3360u;
 const uint TAB_IQ2XS = 7456u;
 
+/* IQ1_M's coarse levels benefit from FP32 accumulation. Other formats
+ * retain packed half accumulation and their existing tile throughput. */
+#ifdef Q36_F32_ACCUM
+#define Q36_ACCUM2 vec2
+#else
+#define Q36_ACCUM2 f16vec2
+#endif
 shared f16vec2 buf_a[BM * STRIDE];
 shared f16vec2 buf_b[BN * STRIDE];
 shared float weight_scale[BM];
@@ -164,14 +172,14 @@ void main(void) {
     /* Each lane owns one row and two tokens; the dot keeps the large tile's K order. */
     uint lr_out = lid % BM;
     uint tok_pair = 2u * (lid / BM);
-    f16vec2 sum = f16vec2(0.0);
+    Q36_ACCUM2 sum = Q36_ACCUM2(0.0);
 #else
     uint wave = gl_SubgroupID;
     uint lane = gl_SubgroupInvocationID;
     uint lane_row = lane & 3u;
     uint lane_tok = lane >> 2u;
-    f16vec2 sum[2u * ROWS_PER_LANE];
-    [[unroll]] for (uint i = 0u; i < 2u * ROWS_PER_LANE; i++) sum[i] = f16vec2(0.0);
+    Q36_ACCUM2 sum[2u * ROWS_PER_LANE];
+    [[unroll]] for (uint i = 0u; i < 2u * ROWS_PER_LANE; i++) sum[i] = Q36_ACCUM2(0.0);
 
 #endif
 
@@ -181,7 +189,7 @@ void main(void) {
             uint block_bytes = pc.type == IQ2_XXS ? 66u :
                                pc.type == IQ2_XS ? 74u :
                                pc.type == IQ2_S ? 82u : 50u;
-            weight_scale[lid] = row < pc.out_dim && pc.type != IQ4_NL ?
+            weight_scale[lid] = row < pc.out_dim && pc.type != IQ4_NL && pc.type != IQ1_M ?
                 unpackHalf2x16(load_u16(row * pc.row_bytes + qb * block_bytes)).x *
                     pc.scale : 0.0;
         }
@@ -251,6 +259,23 @@ void main(void) {
                             v[p] = d * (unpack_i8(
                                 tables[TAB_IQ1S + entry * 2u + kw]) + delta);
                         }
+                    } else if (pc.type == IQ1_M) {
+                        base += qb * 56u;
+                        uint sc0 = load_u16(base + 48u), sc1 = load_u16(base + 50u);
+                        uint sc2 = load_u16(base + 52u), sc3 = load_u16(base + 54u);
+                        uint dh = (sc0 >> 12u) | ((sc1 >> 8u) & 0xf0u) |
+                                  ((sc2 >> 4u) & 0xf00u) | (sc3 & 0xf000u);
+                        uint sc = load_u16(base + 48u + 2u * (slice / 2u));
+                        float d = unpackHalf2x16(dh).x * pc.scale;
+                        [[unroll]] for (uint p = 0u; p < 4u; p++) {
+                            uint qh = load_u8(base + 32u + slice * 2u + p / 2u);
+                            uint hi = (p & 1u) != 0u ? qh << 4u : qh << 8u;
+                            uint entry = load_u8(base + slice * 4u + p) | (hi & 0x700u);
+                            uint shift = 6u * (slice & 1u) + 3u * (p >> 1u);
+                            float delta = (qh & ((p & 1u) != 0u ? 0x80u : 0x08u)) != 0u ? -0.125 : 0.125;
+                            v[p] = d * float(2u * ((sc >> shift) & 7u) + 1u) *
+                                (unpack_i8(tables[TAB_IQ1S + entry * 2u + kw]) + delta);
+                        }
                     } else {
                         base += (qb * 8u + slice) * 18u;
                         float d = unpackHalf2x16(load_u16(base)).x * pc.scale;
@@ -297,8 +322,8 @@ void main(void) {
                 f16vec2 av = buf_a[lr_out * STRIDE + k];
                 f16vec2 b0 = buf_b[tok_pair * STRIDE + k];
                 f16vec2 b1 = buf_b[(tok_pair + 1u) * STRIDE + k];
-                sum = fma(f16vec2(av.x), f16vec2(b0.x, b1.x),
-                          fma(f16vec2(av.y), f16vec2(b0.y, b1.y), sum));
+                sum = fma(Q36_ACCUM2(av.x), Q36_ACCUM2(b0.x, b1.x),
+                          fma(Q36_ACCUM2(av.y), Q36_ACCUM2(b0.y, b1.y), sum));
             }
 #else
             [[unroll]] for (uint k = 0u; k < BK / 2u; k++) {
@@ -319,10 +344,10 @@ void main(void) {
                             lane_tok * 2u + t) * STRIDE + k];
                 [[unroll]] for (uint tp = 0u; tp < 2u; tp++)
                     [[unroll]] for (uint r = 0u; r < ROWS_PER_LANE; r++)
-                        sum[tp * ROWS_PER_LANE + r] = fma(f16vec2(av[r].x),
-                            f16vec2(bv[2u * tp].x, bv[2u * tp + 1u].x),
-                            fma(f16vec2(av[r].y),
-                                f16vec2(bv[2u * tp].y, bv[2u * tp + 1u].y),
+                        sum[tp * ROWS_PER_LANE + r] = fma(Q36_ACCUM2(av[r].x),
+                            Q36_ACCUM2(bv[2u * tp].x, bv[2u * tp + 1u].x),
+                            fma(Q36_ACCUM2(av[r].y),
+                                Q36_ACCUM2(bv[2u * tp].y, bv[2u * tp + 1u].y),
                                 sum[tp * ROWS_PER_LANE + r]));
             }
 #endif

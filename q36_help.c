@@ -186,7 +186,6 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     if (full) {
         if (tool == Q36_HELP_EVAL)
             opt(fp, c, "--mtp FILE", "Optional MTP support GGUF used for draft-token probes.");
-        opt(fp, c, "--quality", "Prefer exact kernels where faster approximate paths exist.");
         opt(fp, c, "--warm-weights", "Touch mapped tensor pages at startup to reduce first-use stalls.");
         if (tool == Q36_HELP_Q36 || tool == Q36_HELP_BENCH) {
             opt(fp, c, "--expert-profile FILE", "Write routed expert locality/cache simulation JSON.");

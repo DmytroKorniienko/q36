@@ -3,8 +3,7 @@
 /* q8_K activation quantization on GPU.  One workgroup handles one 256-wide
  * block from one token row: 64 threads x 4 floats each.  The block layout
  * matches q36_vk_block_q8_K exactly: d, dmin=0, 64 packed q bytes, 8 packed
- * bsum word pairs.  This is the fast path; quality mode keeps the old host
- * quantizer. */
+ * bsum word pairs. The host quantizer is the reference for numeric tests. */
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 

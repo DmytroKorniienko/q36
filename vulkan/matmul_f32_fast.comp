@@ -9,13 +9,18 @@
  * scalar strided version was latency-bound, not bandwidth-bound.  The
  * arithmetic per (row, token) is fixed, so results are n_tok-invariant.
  * A near-tie could still flip an expert pick vs the CPU engine, so the
- * fp64 kernel remains the --quality and Q36_VK_F32_FAST=0 path; the
- * dispatcher also routes in_dim % 4 != 0 there. */
+ * fp64 kernel remains the Q36_VK_F32_FAST=0 diagnostic path; the
+ * dispatcher also routes in_dim % 4 != 0 there. The BF16 variant expands
+ * four weights in registers, retaining the compact model and reduction. */
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) readonly buffer Weights {
+#ifdef Q36_BF16
+    uvec2 w[];
+#else
     vec4 w[];
+#endif
 };
 
 layout(set = 0, binding = 1) readonly buffer Input {
@@ -35,6 +40,17 @@ layout(push_constant) uniform Push {
 
 shared float sh_sum[2];
 
+#ifdef Q36_BF16
+vec4 round_bf16(vec4 value) {
+    uvec4 bits = floatBitsToUint(value);
+    bvec4 nan = greaterThan(bits & 0x7fffffffu, uvec4(0x7f800000u));
+    uvec4 quiet = (bits & 0xffff0000u) | 0x00400000u;
+    bits = (bits + 0x7fffu + ((bits >> 16u) & 1u)) & 0xffff0000u;
+    return uintBitsToFloat(mix(bits, quiet, nan));
+}
+
+#endif
+
 void main(void) {
     uint out_row = gl_WorkGroupID.x;
     uint tok = gl_WorkGroupID.y;
@@ -46,7 +62,14 @@ void main(void) {
     uint xbase = tok * n4;
     float acc = 0.0;
     for (uint i = lid; i < n4; i += 64u) {
+#ifdef Q36_BF16
+        uvec2 bits = w[wbase + i];
+        vec4 weight = uintBitsToFloat(uvec4(bits.x << 16u, bits.x & 0xffff0000u,
+                                           bits.y << 16u, bits.y & 0xffff0000u));
+        acc += dot(weight, round_bf16(x[xbase + i]));
+#else
         acc += dot(w[wbase + i], x[xbase + i]);
+#endif
     }
     acc = subgroupAdd(acc);
     if (gl_NumSubgroups > 1u) {

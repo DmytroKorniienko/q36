@@ -106,7 +106,6 @@ typedef struct {
     q36_kv_cache_type cache_type_k;
     q36_kv_cache_type cache_type_v;
     bool warm_weights;
-    bool quality;
     bool ssd_streaming;
     bool ssd_streaming_cold;
     bool ssd_streaming_full_layers_set;

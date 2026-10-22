@@ -47,7 +47,10 @@ METAL_LDFLAGS := $(LDFLAGS) $(DARWIN_MIN_FLAG)
 METAL_SRCS := $(wildcard metal/*.metal)
 VULKAN_SHADERS := \
 	vulkan/gdn_front.spv \
+	vulkan/gdn_front_bf16.spv \
 	vulkan/matmul_f16.spv \
+	vulkan/matmul_bf16.spv \
+	vulkan/matmul_bf16_fast.spv \
 	vulkan/vision_matmul_f16.spv \
 	vulkan/vision_attention.spv \
 	vulkan/matmul_f32.spv \
@@ -129,6 +132,7 @@ VULKAN_SHADERS := \
 	vulkan/top2.spv \
 	vulkan/mtp_head_mask.spv \
 	vulkan/mtp_head_q5k.spv \
+	vulkan/mtp_head_iq4_xs.spv \
 	vulkan/mtp_head_q5k_dot.spv \
 	vulkan/moe_gate_up_f32b.spv \
 	vulkan/moe_gate_up_decode.spv \
@@ -197,6 +201,8 @@ VULKAN_SHADERS := \
 	vulkan/dense_iq2_s_decode.spv \
 	vulkan/dense_iq2_s_decode_float.spv \
 	vulkan/dense_extra_mmq.spv \
+	vulkan/dense_iq1_m_mmq.spv \
+	vulkan/dense_iq1_m_bm64_mmq.spv \
 	vulkan/dense_extra_bm64_mmq.spv \
 	vulkan/dense_extra_bm96_mmq.spv \
 	vulkan/dense_extra_mmq_n2.spv \
@@ -208,6 +214,7 @@ VULKAN_SHADERS := \
 	vulkan/dense_kquant_mmq_n4.spv \
 	vulkan/dense_kquant_mmq_n8.spv \
 	vulkan/dense_kquant_decode.spv \
+	vulkan/dense_q2k_decode.spv \
 	vulkan/dense_q2k_verify.spv \
 	vulkan/dense_q3k_verify.spv \
 	vulkan/dense_q4k_verify.spv \
@@ -400,6 +407,12 @@ vulkan/dense_extra_bm96_mmq.spv: vulkan/dense_extra_mmq.comp
 vulkan/dense_extra_mmq.spv: vulkan/dense_extra_mmq.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
+vulkan/dense_iq1_m_mmq.spv: vulkan/dense_extra_mmq.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_F32_ACCUM=1 -o $@ $<
+
+vulkan/dense_iq1_m_bm64_mmq.spv: vulkan/dense_extra_mmq.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_F32_ACCUM=1 -DQ36_BM=64 -o $@ $<
+
 vulkan/preexpand_i16.spv: vulkan/preexpand_i16.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
@@ -450,6 +463,12 @@ vulkan/dense_q6k_decode_dot.spv: vulkan/dense_kquant_decode.comp
 
 vulkan/mtp_head_q5k_dot.spv: vulkan/dense_kquant_decode.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_INT_DOT=1 -DQ36_Q5K_ONLY=1 -DQ36_HEAD_MASK=1 -o $@ $<
+
+vulkan/mtp_head_iq4_xs.spv: vulkan/dense_iq4_xs_decode.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_HEAD_MASK=1 -DQ36_ROWS=2 -o $@ $<
+
+vulkan/dense_q2k_decode.spv: vulkan/dense_kquant_decode.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_Q2K_ONLY=1 -o $@ $<
 
 vulkan/matmul_q8_0_f32b.spv: vulkan/matmul_q8_0_f32b.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
@@ -633,14 +652,15 @@ cpu: q36_cli_cpu.o linenoise_cpu.o q36_server_cpu.o rax_cpu.o q36_bench_cpu.o q3
 	$(CC) $(CPU_CFLAGS) -o q36_test q36_test_cpu.o rax_cpu.o q36_ssd_cpu.o q36_prompt_prefix.o $(CPU_CORE_OBJS) $(LDLIBS)
 
 # --- GPU (default) objects ---
+# q36.c also contains the CPU oracle; preserve its rounding in GPU builds.
 q36_gpu_core.o: q36.c q36.h q36_mtp.h q36_image.h q36_gpu.h q36_quant.h q36_ssd.h q36_iq_tables.h q36_iq3s_grid_values.inc q36_streaming_hotlist.inc
-	$(CC) $(GPU_CFLAGS) -c -o $@ q36.c
+	$(CC) $(filter-out -ffast-math,$(GPU_CFLAGS)) -c -o $@ q36.c
 
 q36_gpu_core_metal.o: q36.c q36.h q36_mtp.h q36_image.h q36_gpu.h q36_quant.h q36_ssd.h q36_iq_tables.h q36_iq3s_grid_values.inc q36_streaming_hotlist.inc
-	$(CC) $(GPU_CFLAGS) -DQ36_METAL -c -o $@ q36.c
+	$(CC) $(filter-out -ffast-math,$(GPU_CFLAGS)) -DQ36_METAL -c -o $@ q36.c
 
 q36_gpu_core_metal_test.o: q36.c q36.h q36_mtp.h q36_gpu.h q36_quant.h q36_ssd.h q36_iq_tables.h q36_iq3s_grid_values.inc q36_streaming_hotlist.inc
-	$(CC) $(GPU_CFLAGS) -DQ36_METAL -DQ36_METAL_TEST_COMPAT -c -o $@ q36.c
+	$(CC) $(filter-out -ffast-math,$(GPU_CFLAGS)) -DQ36_METAL -DQ36_METAL_TEST_COMPAT -c -o $@ q36.c
 
 q36_cli_metal.o: q36_prompt_prefix.h q36_cli.c q36.h q36_ssd.h linenoise.h
 	$(CC) $(GPU_CFLAGS) -DQ36_METAL -c -o $@ q36_cli.c
@@ -711,8 +731,17 @@ vulkan/rms_norm_finish_q8_k.spv: vulkan/rms_norm_finish_q8_k.comp
 vulkan/gdn_front.spv: vulkan/gdn_front.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
+vulkan/gdn_front_bf16.spv: vulkan/gdn_front.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_BF16=1 -o $@ $<
+
 vulkan/matmul_f32_fast.spv: vulkan/matmul_f32_fast.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
+
+vulkan/matmul_bf16.spv: vulkan/matmul_f16.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_BF16=1 -o $@ $<
+
+vulkan/matmul_bf16_fast.spv: vulkan/matmul_f32_fast.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_BF16=1 -o $@ $<
 
 vulkan/matmul_q8_0.spv: vulkan/matmul_q8_0.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<

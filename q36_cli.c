@@ -118,8 +118,6 @@ static void usage(FILE *fp) {
         "      Select backend explicitly: metal, vulkan, or cpu.\n"
         "  -t, --threads N\n"
         "      CPU helper threads for host-side or reference work.\n"
-        "  --quality\n"
-        "      Prefer exact kernels where faster approximate paths exist; MTP uses strict verification.\n"
         "  --dir-steering-file FILE\n"
         "      Load one hidden-width f32 direction per model layer.\n"
         "  --dir-steering-ffn F\n"
@@ -1594,8 +1592,6 @@ static cli_config parse_options(int argc, char **argv) {
             c.gen.min_p_set = true;
         } else if (!strcmp(arg, "--seed")) {
             c.gen.seed = parse_u64(need_arg(&i, argc, argv, arg), arg);
-        } else if (!strcmp(arg, "--quality")) {
-            c.engine.quality = true;
         } else if (!strcmp(arg, "--ssd-streaming")) {
             c.engine.ssd_streaming = true;
         } else if (!strcmp(arg, "--ssd-streaming-cold")) {
