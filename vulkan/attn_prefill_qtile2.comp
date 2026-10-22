@@ -58,7 +58,13 @@ layout(push_constant) uniform Push {
 #define HD 256u
 #define ROWS HQ
 #define VD 4u
+#ifdef Q36_K_Q4
+#define K_HEAD_BYTES 144u
+#define K_PAIR_BYTES 36u
+#else
 #define K_HEAD_BYTES 272u
+#define K_PAIR_BYTES 68u
+#endif
 #define V_HEAD_BYTES 144u
 
 shared float sh_q[QT * HQ * HD];
@@ -149,7 +155,7 @@ void main(void) {
                     uint key = base + key_t;
                     uint kb = key * pc.k_row_bytes + kvh * K_HEAD_BYTES;
                     for (uint p = quad; p < 4u; p += 4u) {
-                        uint wi = (kb + p * 68u) >> 2u;
+                        uint wi = (kb + p * K_PAIR_BYTES) >> 2u;
                         uint prev = kc[wi];
                         float d0 = unpackHalf2x16(prev).x;
                         float s0[ROWS];
@@ -158,6 +164,22 @@ void main(void) {
                             s0[rr] = 0.0;
                             s1[rr] = 0.0;
                         }
+#ifdef Q36_K_Q4
+                        /* Match decode's low/high nibble accumulation order. */
+                        for (uint k = 0u; k < 4u; k++) {
+                            uint next = kc[wi + 1u + k];
+                            uint sw = (prev >> 16u) | (next << 16u);
+                            prev = next;
+                            vec4 lo = vec4(unpack8(int(sw & 0x0f0f0f0fu))) - vec4(8.0);
+                            vec4 hi = vec4(unpack8(int((sw >> 4u) & 0x0f0f0f0fu))) - vec4(8.0);
+                            uint qi = p * 64u + 4u * k;
+                            for (uint rr = 0u; rr < ROWS; rr++) {
+                                uint a = (r0 + rr) * HD + qi;
+                                s0[rr] += dot4(lo, vec4(sh_q[a], sh_q[a + 1u], sh_q[a + 2u], sh_q[a + 3u]));
+                                s0[rr] += dot4(hi, vec4(sh_q[a + 16u], sh_q[a + 17u], sh_q[a + 18u], sh_q[a + 19u]));
+                            }
+                        }
+#else
                         for (uint k = 0u; k < 8u; k++) {
                             uint next = kc[wi + 1u + k];
                             uint sw = (prev >> 16u) | (next << 16u);
@@ -170,7 +192,21 @@ void main(void) {
                                                        sh_q[qb + 2u], sh_q[qb + 3u]));
                             }
                         }
+#endif
                         float d1 = unpackHalf2x16(prev).y;
+#ifdef Q36_K_Q4
+                        for (uint k = 0u; k < 4u; k++) {
+                            uint sw = kc[wi + 5u + k];
+                            vec4 lo = vec4(unpack8(int(sw & 0x0f0f0f0fu))) - vec4(8.0);
+                            vec4 hi = vec4(unpack8(int((sw >> 4u) & 0x0f0f0f0fu))) - vec4(8.0);
+                            uint qi = p * 64u + 32u + 4u * k;
+                            for (uint rr = 0u; rr < ROWS; rr++) {
+                                uint a = (r0 + rr) * HD + qi;
+                                s1[rr] += dot4(lo, vec4(sh_q[a], sh_q[a + 1u], sh_q[a + 2u], sh_q[a + 3u]));
+                                s1[rr] += dot4(hi, vec4(sh_q[a + 16u], sh_q[a + 17u], sh_q[a + 18u], sh_q[a + 19u]));
+                            }
+                        }
+#else
                         for (uint k = 0u; k < 8u; k++) {
                             vec4 kv = vec4(unpack8(int(kc[wi + 9u + k])));
                             uint qi = p * 64u + 32u + 4u * k;
@@ -180,6 +216,7 @@ void main(void) {
                                                        sh_q[qb + 2u], sh_q[qb + 3u]));
                             }
                         }
+#endif
                         for (uint rr = 0u; rr < ROWS; rr++)
                             dots[rr] += d0 * s0[rr] + d1 * s1[rr];
                     }

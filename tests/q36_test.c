@@ -4747,6 +4747,9 @@ static void test_vulkan_attn_decode_fused(void) {
     test_vulkan_attn_case(12, 4094, 5, Q36_KV_CACHE_Q8_0, Q36_KV_CACHE_Q4_0, 256);
     test_vulkan_attn_case(12, 1534, 5, Q36_KV_CACHE_Q8_0, Q36_KV_CACHE_Q4_0, 256);
     test_vulkan_attn_case(12, 4094, 5, Q36_KV_CACHE_Q4_0, Q36_KV_CACHE_Q4_0, 256);
+    test_vulkan_attn_case(12, 129, 3, Q36_KV_CACHE_Q4_0, Q36_KV_CACHE_Q4_0, 256);
+    test_vulkan_attn_case(12, 1534, 5, Q36_KV_CACHE_Q4_0, Q36_KV_CACHE_Q4_0, 256);
+    test_vulkan_attn_case(24, 8190, 5, Q36_KV_CACHE_Q4_0, Q36_KV_CACHE_Q4_0, 256);
 #endif
 }
 
@@ -7013,6 +7016,8 @@ static void test_vulkan_session_batch(void) {
                                             Q36_KV_CACHE_F16, true));
     } else {
         TEST_ASSERT(test_session_batch_mode(Q36_KV_CACHE_Q8_0,
+                                            Q36_KV_CACHE_Q4_0, false));
+        TEST_ASSERT(test_session_batch_mode(Q36_KV_CACHE_Q4_0,
                                             Q36_KV_CACHE_Q4_0, false));
     }
 }

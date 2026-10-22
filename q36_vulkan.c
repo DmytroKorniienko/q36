@@ -232,6 +232,7 @@ typedef struct {
     q36_vk_kernel attn_prefill_qtile;
     q36_vk_kernel attn_prefill_qtile2;
     q36_vk_kernel attn_prefill_qtile1_gqa6;
+    q36_vk_kernel attn_prefill_qtile1_gqa6_q4;
     q36_vk_kernel attn_prefill_qtile2_gqa6;
     q36_vk_kernel attn_combine;
     q36_vk_kernel moe_gate_up;
@@ -2929,6 +2930,7 @@ int q36_gpu_init(void) {
     q36_vk.attn_prefill_qtile = Q36_VK_KERNEL("vulkan/attn_prefill_qtile.spv", 5, 48, 1u << 4);
     q36_vk.attn_prefill_qtile2 = Q36_VK_KERNEL("vulkan/attn_prefill_qtile2.spv", 5, 48, 1u << 4);
     q36_vk.attn_prefill_qtile1_gqa6 = Q36_VK_KERNEL("vulkan/attn_prefill_qtile1_gqa6.spv", 5, 48, 1u << 4);
+    q36_vk.attn_prefill_qtile1_gqa6_q4 = Q36_VK_KERNEL("vulkan/attn_prefill_qtile1_gqa6_q4.spv", 5, 48, 1u << 4);
     q36_vk.attn_prefill_qtile2_gqa6 = Q36_VK_KERNEL("vulkan/attn_prefill_qtile2_gqa6.spv", 5, 48, 1u << 4);
     q36_vk.attn_combine = Q36_VK_KERNEL("vulkan/attn_combine.spv", 4, 32, 1u << 3);
     q36_vk.moe_gate_up = Q36_VK_KERNEL("vulkan/moe_gate_up.spv", 8, 28, 1u << 6);
@@ -3533,6 +3535,7 @@ void q36_gpu_cleanup(void) {
     q36_vk_kernel_destroy(&q36_vk.attn_prefill_qtile);
     q36_vk_kernel_destroy(&q36_vk.attn_prefill_qtile2);
     q36_vk_kernel_destroy(&q36_vk.attn_prefill_qtile1_gqa6);
+    q36_vk_kernel_destroy(&q36_vk.attn_prefill_qtile1_gqa6_q4);
     q36_vk_kernel_destroy(&q36_vk.attn_prefill_qtile2_gqa6);
     q36_vk_kernel_destroy(&q36_vk.attn_combine);
     q36_vk_kernel_destroy(&q36_vk.attn_reduce);
@@ -7120,8 +7123,12 @@ int q36_gpu_attn_decode_tensor(q36_gpu_tensor *out,
                            head_dim == 256u &&
                            (n_head / n_head_kv == 6u || n_head / n_head_kv == 8u) &&
                            k_cache_type == 1u && v_cache_type == 2u;
-                bool qt1 = qt2 && q36_vk.bc250 && n_head / n_head_kv == 6u;
-                q36_vk_kernel *kernel = qt1 ? &q36_vk.attn_prefill_qtile1_gqa6 :
+                bool qt1_q4 = q36_vk.bc250 && q36_vk_use_attn_qtile2() &&
+                              head_dim == 256u && n_head / n_head_kv == 6u &&
+                              k_cache_type == 2u && v_cache_type == 2u;
+                bool qt1 = qt1_q4 || (qt2 && q36_vk.bc250 && n_head / n_head_kv == 6u);
+                q36_vk_kernel *kernel = qt1_q4 ? &q36_vk.attn_prefill_qtile1_gqa6_q4 :
+                    qt1 ? &q36_vk.attn_prefill_qtile1_gqa6 :
                     qt2 ? (n_head / n_head_kv == 6u ? &q36_vk.attn_prefill_qtile2_gqa6 :
                                                      &q36_vk.attn_prefill_qtile2) :
                           &q36_vk.attn_prefill_qtile;

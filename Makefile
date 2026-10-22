@@ -123,6 +123,7 @@ VULKAN_SHADERS := \
 	vulkan/attn_prefill_qtile.spv \
 	vulkan/attn_prefill_qtile2.spv \
 	vulkan/attn_prefill_qtile1_gqa6.spv \
+	vulkan/attn_prefill_qtile1_gqa6_q4.spv \
 	vulkan/attn_prefill_qtile2_gqa6.spv \
 	vulkan/attn_combine.spv \
 	vulkan/moe_gate_up.spv \
@@ -561,6 +562,9 @@ vulkan/attn_prefill_qtile.spv: vulkan/attn_prefill_qtile.comp
 
 vulkan/attn_prefill_qtile1_gqa6.spv: vulkan/attn_prefill_qtile2.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_QT=1 -DQ36_GQA_HEADS=6 -o $@ $<
+
+vulkan/attn_prefill_qtile1_gqa6_q4.spv: vulkan/attn_prefill_qtile2.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_QT=1 -DQ36_GQA_HEADS=6 -DQ36_K_Q4=1 -o $@ $<
 
 vulkan/attn_prefill_qtile2.spv: vulkan/attn_prefill_qtile2.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
