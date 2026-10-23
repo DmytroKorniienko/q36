@@ -280,6 +280,55 @@ float block_dot(uint row, uint qb, uint group, int qv[8]) {
     return d * sum;
 }
 
+#if Q36_TOKENS > 1 && !defined(Q36_TYPE)
+/* IQ1_S grids are -1, 0, 1 plus a shared +/-1/8 offset. Both terms
+ * sum exactly in f32; the existing Q8 block sums supply the offset term.
+ * Reuse each grid across tokens, then apply the decode scales in order. */
+void iq1_verify(void) {
+    uint lid = gl_LocalInvocationID.x, group = lid & 7u;
+    uint first_row = gl_WorkGroupID.x * ROWS;
+    float acc[N_TOKENS][ROWS];
+    UNROLL for (uint t = 0u; t < N_TOKENS; t++)
+        UNROLL for (uint r = 0u; r < ROWS; r++) acc[t][r] = 0.0;
+    for (uint b = lid >> 3u; b < pc.blocks; b += 8u) {
+        UNROLL for (uint r = 0u; r < ROWS; r++) {
+            uint row = first_row + r;
+            if (row >= pc.out_dim) continue;
+            uint base = row * pc.row_bytes + b * 50u;
+            uint high = load_u16(base + 34u + 2u * group);
+            float d = unpackHalf2x16(load_u16(base)).x * float(2u * ((high >> 12u) & 7u) + 1u);
+            float delta = (high & 0x8000u) != 0u ? -0.125 : 0.125;
+            int sum[N_TOKENS];
+            UNROLL for (uint t = 0u; t < N_TOKENS; t++) sum[t] = 0;
+            UNROLL for (uint l = 0u; l < 4u; l++) {
+                uint entry = load_u8(base + 2u + 4u * group + l) | (((high >> (3u * l)) & 7u) << 8u);
+                int w0 = int(tables[TAB_IQ1S + 2u * entry]);
+                int w1 = int(tables[TAB_IQ1S + 2u * entry + 1u]);
+                UNROLL for (uint t = 0u; t < N_TOKENS; t++) {
+                    uint qbase = (t * pc.blocks + b) * Q8K_WORDS + 2u + 8u * group + 2u * l;
+                    sum[t] += dotPacked4x8EXT(w0, int(q8[qbase]));
+                    sum[t] += dotPacked4x8EXT(w1, int(q8[qbase + 1u]));
+                }
+            }
+            UNROLL for (uint t = 0u; t < N_TOKENS; t++) {
+                uint qb = (t * pc.blocks + b) * Q8K_WORDS;
+                uint bs = q8[qb + 66u + group];
+                int qsum = bitfieldExtract(int(bs), 0, 16) + bitfieldExtract(int(bs), 16, 16);
+                float value = d * (float(sum[t]) + delta * float(qsum));
+                acc[t][r] = fma(uintBitsToFloat(q8[qb]), value, acc[t][r]);
+            }
+        }
+    }
+    UNROLL for (uint t = 0u; t < N_TOKENS; t++) {
+        UNROLL for (uint r = 0u; r < ROWS; r++) {
+            float total = subgroupAdd(acc[t][r]);
+            if (lid == 0u && first_row + r < pc.out_dim)
+                y[t * pc.out_dim + first_row + r] = total * pc.scale;
+        }
+    }
+}
+#endif
+
 #if Q36_TOKENS > 1 && defined(Q36_TYPE) && (Q36_TYPE == 17 || Q36_TYPE == 22)
 /* Decode each weight group once, but keep every token's scaled sum local
  * so the compiler retains the ordinary decode contraction order. */
@@ -379,8 +428,15 @@ void main(void) {
         }
     }
 }
+
 #else
 void main(void) {
+#if Q36_TOKENS > 1 && !defined(Q36_TYPE)
+    if (QTYPE == IQ1_S) {
+        iq1_verify();
+        return;
+    }
+#endif
 #ifdef Q36_SIGN_LUT
     init_signs();
 #endif

@@ -3580,6 +3580,8 @@ static void test_vulkan_small_tiles(void) {
         test_vulkan_small_dims(23, 136, iq3_shapes[i][1], iq3_shapes[i][0]);
     }
     test_vulkan_small_dims(23, 136, 1024, 5120);
+    test_vulkan_small_dims(19, 50, 1024, 5120);
+    test_vulkan_small_dims(19, 50, 17408, 5120);
 #endif
 }
 
