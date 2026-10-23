@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-model=${Q36_TEST_MODEL:-gguf/Qwen3.6-35B-A3B-AntirezExperts-IQ2XXS-gateup-Q2K-down-Q8rest.gguf}
+model=${Q36_TEST_MODEL:-gguf/Qwen3.6-35B-A3B-IQ2XXS-Q2K-Q8.gguf}
 port=${Q36_TEST_SERVER_PORT:-$((20000 + $$ % 1000))}
 tmp=$(mktemp -d /tmp/q36-server-bench.XXXXXX)
 pid=

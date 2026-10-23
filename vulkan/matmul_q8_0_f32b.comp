@@ -25,6 +25,10 @@ layout(set = 0, binding = 2) writeonly buffer Output {
     float y[];
 };
 
+#ifdef Q36_HEAD_MASK
+layout(set = 0, binding = 3) readonly buffer Mask { uint ages[]; };
+#endif
+
 layout(push_constant) uniform Push {
     uint out_dim;
     uint n_tok;
@@ -43,6 +47,12 @@ void main(void) {
     /* y splits the row range so the vocab head fits the 65535 group limit. */
     uint row = gl_WorkGroupID.y * 16384u + gl_WorkGroupID.x;
     if (row >= pc.out_dim) return;
+#ifdef Q36_HEAD_MASK
+    if (ages[row / 64u] == 0u) {
+        if (tid == 0u) y[row] = uintBitsToFloat(0xff800000u);
+        return;
+    }
+#endif
     uint row_base = row * pc.blocks * Q8_0_U16;
     /* Thread t covers 8 consecutive elements: block (t>>2), byte pair
      * (t&3)*8. 64 threads span 16 blocks per iteration. */

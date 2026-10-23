@@ -21,7 +21,7 @@ stream_args=
 if [ "$streaming" = "--ssd-streaming" ]; then
     stream_args="--ssd-streaming --ssd-streaming-cache-experts ${Q36_TEST_STREAM_CACHE_EXPERTS:-512}"
 fi
-model=${Q36_TEST_MODEL:-gguf/Qwen3.6-35B-A3B-AntirezExperts-IQ2XXS-gateup-Q2K-down-Q8rest.gguf}
+model=${Q36_TEST_MODEL:-gguf/Qwen3.6-35B-A3B-IQ2XXS-Q2K-Q8.gguf}
 port=${Q36_TEST_SERVER_PORT:-$((19000 + $$ % 1000))}
 base=http://127.0.0.1:$port
 tmp=$(mktemp -d /tmp/q36-server-batch.XXXXXX)

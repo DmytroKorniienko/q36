@@ -7,6 +7,7 @@ all: qwen36-quantize
 
 test: qwen36-quantize
 	python3 tests/test_strip_nextn.py ./qwen36-quantize
+	python3 tests/test_mtp_tools.py ./qwen36-quantize
 
 qwen36-quantize: qwen36-quantize.c quants.c quants.h
 	$(CC) $(CFLAGS) -o $@ qwen36-quantize.c quants.c $(LDFLAGS) $(LDLIBS)

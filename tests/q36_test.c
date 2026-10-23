@@ -61,8 +61,7 @@ static const char *test_model_path(void) {
 
 static const char *test_mtp_path(void) {
     const char *path = getenv("Q36_TEST_MTP");
-    return path && path[0] ? path :
-        "gguf/Qwen3.6-35B-A3B-MTP-Q4K-Q8_0-F32.gguf";
+    return path && path[0] ? path : test_model_path();
 }
 
 static q36_engine *test_get_engine(void) {
@@ -3462,7 +3461,7 @@ static void test_vulkan_small_dims(uint32_t type, uint32_t block_bytes,
             q36_gpu_tensor_free(yi);
         }
         TEST_ASSERT(q36_gpu_tensor_read(ref, 0, want, 8u * out_dim * sizeof(float)) != 0);
-        if (type == 13 || type == 23) {
+        if (type == 8 || type == 13 || type == 23) {
             uint32_t blocks = (out_dim + 63u) / 64u;
             uint32_t *ages = calloc(blocks, sizeof(*ages));
             q36_gpu_tensor *mask = q36_gpu_tensor_alloc((uint64_t)blocks * sizeof(*ages));
@@ -3477,7 +3476,7 @@ static void test_vulkan_small_dims(uint32_t type, uint32_t block_bytes,
                 TEST_ASSERT(q36_gpu_tensor_read(out, 0, got, y_bytes) != 0);
                 for (uint32_t i = 0; i < out_dim; i++) {
                     if (ages[i / 64u]) {
-                        if (type == 13) TEST_ASSERT(memcmp(got + i, want + i, sizeof(float)) == 0);
+                        if (type == 8 || type == 13) TEST_ASSERT(memcmp(got + i, want + i, sizeof(float)) == 0);
                         else TEST_ASSERT(fabsf(got[i] - want[i]) <= 1.0e-6f * fmaxf(1.0f, fabsf(want[i])));
                     } else TEST_ASSERT(isinf(got[i]) && got[i] < 0.0f);
                 }
@@ -3556,7 +3555,7 @@ static void test_vulkan_small_tiles(void) {
 #if defined(Q36_NO_GPU) || defined(Q36_METAL)
     test_skip("vulkan-small-tiles", "Vulkan-only test");
 #else
-    const uint32_t q8_rows[] = {1, 7, 31, 48, 63};
+    const uint32_t q8_rows[] = {1, 7, 31, 48, 63, 131};
     for (unsigned i = 0; i < sizeof(q8_rows) / sizeof(q8_rows[0]); i++)
         test_vulkan_small_one(8, 34, q8_rows[i]);
     const uint32_t types[] = {10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23},
@@ -4365,6 +4364,39 @@ static void test_vulkan_moe_gemm(void) {
         TEST_ASSERT(differs);
 #endif
     }
+
+#ifndef Q36_METAL
+    /* Verification widens the decode schedule; every row must retain the
+     * ordinary fused gate/up and routing-sum arithmetic. */
+    for (uint32_t t = 0; t < 8u; t++) {
+        q36_gpu_tensor *xi = q36_gpu_tensor_view(x, (uint64_t)t * in_dim * sizeof(float),
+                                                   (uint64_t)in_dim * sizeof(float));
+        q36_gpu_tensor *si = q36_gpu_tensor_view(selected, (uint64_t)t * n_used * sizeof(uint32_t),
+                                                   n_used * sizeof(uint32_t));
+        q36_gpu_tensor *wi = q36_gpu_tensor_view(weights, (uint64_t)t * n_used * sizeof(float),
+                                                   n_used * sizeof(float));
+        TEST_ASSERT(xi && si && wi);
+        if (xi && si && wi) {
+            TEST_ASSERT(q36_gpu_moe_ffn_f32_tensor(out, model, model_alloc,
+                &gate, &up, &down, si, wi, 0, n_used, xi, 1u,
+                in_dim, mid_dim, out_dim, n_expert) != 0);
+            TEST_ASSERT(q36_gpu_tensor_read(out, 0, got_mv + t * out_dim,
+                                             out_dim * sizeof(float)) != 0);
+        }
+        q36_gpu_tensor_free(wi);
+        q36_gpu_tensor_free(si);
+        q36_gpu_tensor_free(xi);
+    }
+    q36_gpu_set_micro_batch(true);
+    for (uint32_t n = 2; n <= 8u; n++) {
+        TEST_ASSERT(q36_gpu_moe_ffn_f32_tensor(out, model, model_alloc,
+            &gate, &up, &down, selected, weights, 0, n_used, x, n,
+            in_dim, mid_dim, out_dim, n_expert) != 0);
+        TEST_ASSERT(q36_gpu_tensor_read(out, 0, got_gemm, n * out_dim * sizeof(float)) != 0);
+        TEST_ASSERT(memcmp(got_gemm, got_mv, n * out_dim * sizeof(float)) == 0);
+    }
+    q36_gpu_set_micro_batch(false);
+#endif
 
 done:
     q36_gpu_tensor_free(out);

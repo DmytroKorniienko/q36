@@ -48,6 +48,7 @@ float fma32(float a, float b, float c) {
 void main(void) {
     uint tid = gl_LocalInvocationID.x;
     uint row = gl_WorkGroupID.x;
+    uint slot = gl_WorkGroupID.y * pc.n_used;
     uint itid = tid & 15u;
     uint ix = tid >> 4u;
     uint v_im = itid >> 3u;
@@ -59,9 +60,9 @@ void main(void) {
     float sum = 0.0;
 
     for (uint u = 0u; u < pc.n_used; u++) {
-        uint expert = selected[u];
+        uint expert = selected[slot + u];
         uint base_u16 = (expert * pc.out_dim + row) * row_u16;
-        uint m2 = u * pc.in_dim / 2u;
+        uint m2 = (slot + u) * pc.in_dim / 2u;
         float acc = 0.0;
 
         for (uint i = ix; i < pc.blocks; i += 2u) {
@@ -121,8 +122,8 @@ void main(void) {
         acc = subgroupAdd(acc);
         if (tid == 0u) {
             float sc = pc.has_scales != 0u ? scales[expert] : 1.0;
-            sum = fma32(acc * sc, route[u], sum);
+            sum = fma32(acc * sc, route[slot + u], sum);
         }
     }
-    if (tid == 0u) y[row] = sum;
+    if (tid == 0u) y[gl_WorkGroupID.y * pc.out_dim + row] = sum;
 }

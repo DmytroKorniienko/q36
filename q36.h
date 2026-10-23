@@ -8,7 +8,7 @@
 
 #include "q36_ssd.h"
 
-#define Q36_DEFAULT_MODEL_FILE "Qwen3.6-35B-A3B-AntirezExperts-IQ2XXS-gateup-Q2K-down-Q8rest.gguf"
+#define Q36_DEFAULT_MODEL_FILE "Qwen3.6-35B-A3B-IQ2XXS-Q2K-Q8.gguf"
 #define Q36_DEFAULT_MODEL_PATH "gguf/" Q36_DEFAULT_MODEL_FILE
 #define Q36_DEFAULT_VISION_PATH "gguf/Qwen3.6-35B-A3B-mmproj-F16.gguf"
 #define Q36_DENSE_VISION_PATH "gguf/Qwen3.8-27B-mmproj-F16.gguf"

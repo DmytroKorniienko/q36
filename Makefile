@@ -135,6 +135,7 @@ VULKAN_SHADERS := \
 	vulkan/rms_norm_rope_kv_qwen_quant.spv \
 	vulkan/top2.spv \
 	vulkan/mtp_head_mask.spv \
+	vulkan/mtp_head_q8.spv \
 	vulkan/mtp_head_q5k.spv \
 	vulkan/mtp_head_iq4_xs.spv \
 	vulkan/mtp_head_q5k_dot.spv \
@@ -301,6 +302,9 @@ vulkan/mtp_head_q5k.spv: vulkan/dense_kquant_decode.comp
 
 vulkan/mtp_head_mask.spv: vulkan/mtp_head_mask.comp
 	$(GLSLC) -O --target-env=vulkan1.1 $< -o $@
+
+vulkan/mtp_head_q8.spv: vulkan/matmul_q8_0_f32b.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_HEAD_MASK=1 $< -o $@
 
 vulkan/dense_iq2_s_verify.spv: vulkan/dense_extra_decode.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_ROWS=4 -DQ36_TOKENS=8 -DQ36_TYPE=22 $< -o $@

@@ -4338,7 +4338,7 @@ static bool q36_layer_is_full_attention(uint32_t il) {
 }
 
 static bool tensor_type_is_routed_gate_up(uint32_t type) {
-    return type == Q36_TENSOR_Q4_K || type == Q36_TENSOR_IQ2_XXS ||
+    return type == Q36_TENSOR_Q2_K || type == Q36_TENSOR_Q4_K || type == Q36_TENSOR_IQ2_XXS ||
            type == Q36_TENSOR_IQ2_S || type == Q36_TENSOR_IQ3_S ||
            type == Q36_TENSOR_Q8_0;
 }
@@ -6468,10 +6468,8 @@ static q36_vulkan_runtime *q36_vulkan_runtime_create(int ctx_size,
         if (!rt->mtp_target_h) goto fail;
         Q36_GPU_ALLOC_MTP_F32(mtp_cur, Q36_N_EMBD);
         Q36_GPU_ALLOC_MTP_F32(mtp_logits, Q36_N_VOCAB);
-        if (Q36_MODEL_DENSE) {
-            rt->mtp_head_mask = q36_gpu_tensor_alloc(((uint64_t)Q36_N_VOCAB + 63u) / 64u * sizeof(uint32_t));
-            if (!rt->mtp_head_mask) goto fail;
-        }
+        rt->mtp_head_mask = q36_gpu_tensor_alloc(((uint64_t)Q36_N_VOCAB + 63u) / 64u * sizeof(uint32_t));
+        if (!rt->mtp_head_mask) goto fail;
     }
     for (uint32_t il = 0; il < Q36_N_LAYER; il++) {
         if (q36_layer_is_full_attention(il)) {
@@ -7862,7 +7860,8 @@ static bool q36_forward_ffn_vulkan(q36_session *s,
                                         n_tok,
                                         inp,
                                         out,
-                                        false, inp_q8_ready);
+                                        ((q36_vulkan_runtime *)s->runtime)->spec_verifying,
+                                        inp_q8_ready);
 }
 
 /* Token row t rotates at absolute position pos0 + t. Explicit positions
@@ -9086,8 +9085,21 @@ static bool q36_vulkan_verify_suffix_tops(q36_session *s,
     if (!rt || !rt->spec_logits) return false;
     /* Other recurrent paths have different batch rounding. Verify their
      * rows with ordinary decode kernels and keep each normalized hidden. */
-    bool serial = !Q36_MODEL_DENSE || e->ssd_streaming ||
-                  !q36_gpu_gdn_front_supported(Q36_N_EMBD, Q36_N_SSM_GROUP, Q36_N_SSM_DT_RANK);
+    bool serial = e->ssd_streaming || (Q36_MODEL_DENSE &&
+                  !q36_gpu_gdn_front_supported(Q36_N_EMBD, Q36_N_SSM_GROUP, Q36_N_SSM_DT_RANK));
+    if (!Q36_MODEL_DENSE) {
+        const char *env = getenv("Q36_MOE_MTP_BATCH");
+        if (env && env[0] == '0') serial = true;
+        for (uint32_t il = 0; il < Q36_N_LAYER; il++) {
+            const q36_layer_weights *l = &e->weights.layer[il];
+            if (l->ffn_gate_exps->type != Q36_TENSOR_IQ2_XXS ||
+                l->ffn_up_exps->type != Q36_TENSOR_IQ2_XXS ||
+                l->ffn_down_exps->type != Q36_TENSOR_Q2_K ||
+                l->ffn_gate_shexp->type != Q36_TENSOR_Q8_0 ||
+                l->ffn_up_shexp->type != Q36_TENSOR_Q8_0 ||
+                l->ffn_down_shexp->type != Q36_TENSOR_Q8_0) serial = true;
+        }
+    }
     *target_saved = serial;
     rt->spec_verifying = true;
     q36_gpu_set_micro_batch(!serial);
@@ -12083,20 +12095,21 @@ static int q36_session_eval_speculative(q36_session *s, int first_token,
             accepted[0] = first_token;
             return 1;
         }
-        /* Long copied tails amortize verification; recursive MTP is cheaper
-         * in the small decode tiles on dense Vulkan models. */
-        mtp_cap = Q36_MODEL_DENSE && e->backend == Q36_BACKEND_VULKAN && draft_cap > 4 ? 4 : draft_cap;
+        /* Long copied tails amortize verification; recursive drafting stops
+         * before low-acceptance rows widen the target work. */
+        mtp_cap = e->backend == Q36_BACKEND_VULKAN && draft_cap > 4 ? 4 : draft_cap;
         const char *depth_env = getenv("Q36_MTP_DEPTH");
-        if (Q36_MODEL_DENSE && e->backend == Q36_BACKEND_VULKAN && depth_env) {
+        if (e->backend == Q36_BACKEND_VULKAN && depth_env) {
             int depth = atoi(depth_env);
             if (depth >= 2 && depth < mtp_cap) mtp_cap = depth;
         }
         /* Follow this prefix's MTP confidence; timing estimates can go stale
          * when the continuation changes. */
-        bool confident = !depth_env && Q36_MODEL_DENSE &&
+        bool confident = !depth_env &&
             e->backend == Q36_BACKEND_VULKAN && !e->ssd_streaming &&
             e->mtp_margin <= 0.0f && mtp_cap > 2 &&
-            q36_gpu_gdn_front_supported(Q36_N_EMBD, Q36_N_SSM_GROUP, Q36_N_SSM_DT_RANK);
+            (!Q36_MODEL_DENSE ||
+             q36_gpu_gdn_front_supported(Q36_N_EMBD, Q36_N_SSM_GROUP, Q36_N_SSM_DT_RANK));
         /* After an unlikely sampled seed, probe before paying for deep
          * recursion. Sampling already made these target logits available. */
         if (confident && s->gpu_top2_valid && s->logits_host_valid &&

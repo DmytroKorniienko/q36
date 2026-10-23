@@ -6,9 +6,7 @@ KAT_REPO="Ninnix96/KAT-Coder-V2.5-Dev-gguf"
 DENSE_REPO="unsloth/Qwen3.8-27B-GGUF"
 DENSE_SMALL_REPO="ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF"
 VISION_REPO="unsloth/Qwen3.6-35B-A3B-GGUF"
-Q2_FILE="Qwen3.6-35B-A3B-AntirezExperts-IQ2XXS-gateup-Q2K-down-Q8rest.gguf"
-Q2_Q4_FILE="Qwen3.6-35B-A3B-Layers34-39Q4KExperts-OtherExpertLayersIQ2XXSGateUp-Q2KDown-Q8Rest-imatrix.gguf"
-MTP_FILE="Qwen3.6-35B-A3B-MTP-Q4K-Q8_0-F32.gguf"
+Q2_FILE="Qwen3.6-35B-A3B-IQ2XXS-Q2K-Q8.gguf"
 KAT_FILE="KAT-Coder-V2.5-Dev-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-imatrix.gguf"
 DENSE_FILE="Qwen3.8-27B-UD-IQ3_S.gguf"
 DENSE_SMALL_FILE="Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf"
@@ -29,26 +27,20 @@ usage() {
 QuarkStar GGUF downloader
 
 Usage:
-  ./download_model.sh q2-imatrix [--token TOKEN]
-  ./download_model.sh q2-q4-imatrix [--token TOKEN]
+  ./download_model.sh q2 [--token TOKEN]
   ./download_model.sh kat-coder [--token TOKEN]
   ./download_model.sh 27b [--token TOKEN]
   ./download_model.sh 27b-iq3-xxs [--token TOKEN]
   ./download_model.sh qwen36-vision [--token TOKEN]
   ./download_model.sh qwen38-vision [--token TOKEN]
-  ./download_model.sh mtp [--token TOKEN]
 
 Targets:
-  q2-imatrix
-       q2-imatrix quant from $REPO, about 10 GB on disk.
+  q2
+       Qwen3.6 MoE quant from $REPO, about 12.1 GB on disk.
        Routed MoE experts use IQ2_XXS for gate/up and Q2_K for down.
        The rest of the tensors are left at higher precision. This model
        fits a BC-250 with 16 GB of unified GDDR6 fully resident.
-
-  q2-q4-imatrix
-       Mixed quant: same as q2-imatrix but the last 6 layers (34..39) use
-       Q4_K routed experts. About 13 GB on disk, higher quality inference.
-       On a 16 GB BC-250 run it with --ssd-streaming to keep memory free.
+       Includes a 333 MB MTP head; enable it with --mtp.
 
   kat-coder
        KAT-Coder V2.5 Dev IQ2_XXS imatrix quant from $KAT_REPO,
@@ -70,9 +62,6 @@ Targets:
        Qwen3.8 27B F16 vision projector from $DENSE_REPO.
        It is downloaded as $DENSE_VISION_FILE and does not update ./q36moe.gguf.
 
-  mtp  Optional speculative decoding component for the Qwen3.6 MoE targets.
-       It must be enabled explicitly with --mtp when starting a runtime.
-
 Options:
   --token TOKEN  Hugging Face token. Otherwise HF_TOKEN or the local HF
                  token cache is used if present. The main repository is
@@ -85,15 +74,12 @@ Environment:
 After a main-model download the script updates the legacy link:
   ./q36moe.gguf -> <download directory>/<selected model>
 
-With the default output directory, q2-imatrix matches the compiled model path:
+With the default output directory, q2 matches the compiled model path:
   ./q36 -p "Hello"
   ./q36-server --ctx 32768
 
-Select q2-q4-imatrix explicitly:
-  ./q36 -m $OUT_DIR/$Q2_Q4_FILE --ssd-streaming -p "Hello"
-
-After downloading mtp, enable it explicitly, for example:
-  ./q36 --mtp <download directory>/$MTP_FILE --mtp-draft 2
+Enable the embedded MTP head:
+  ./q36 --mtp -p "Hello"
 
 EOF
 }
@@ -110,8 +96,7 @@ MODEL_REPO=$REPO
 MODEL_REMOTE=
 
 case "$MODEL" in
-    q2-imatrix) MODEL_FILE=$Q2_FILE ;;
-    q2-q4-imatrix) MODEL_FILE=$Q2_Q4_FILE ;;
+    q2) MODEL_FILE=$Q2_FILE ;;
     kat-coder) MODEL_REPO=$KAT_REPO; MODEL_FILE=$KAT_FILE ;;
     27b) MODEL_REPO=$DENSE_REPO; MODEL_FILE=$DENSE_FILE ;;
     27b-iq3-xxs) MODEL_REPO=$DENSE_SMALL_REPO; MODEL_FILE=$DENSE_SMALL_FILE ;;
@@ -127,7 +112,6 @@ case "$MODEL" in
         MODEL_FILE=$DENSE_VISION_FILE
         LINK_MODEL=0
         ;;
-    mtp) MODEL_FILE=$MTP_FILE; LINK_MODEL=0 ;;
     -h|--help|help)
         usage
         exit 0
@@ -205,12 +189,7 @@ download_one() {
 
 download_one "$MODEL_REPO" "$MODEL_REMOTE" "$MODEL_FILE"
 
-if [ "$MODEL" = "mtp" ]; then
-    echo
-    echo "MTP is an optional component for q2-imatrix."
-    echo "Enable it explicitly, for example:"
-    echo "  ./q36 --mtp $OUT_DIR/$MTP_FILE --mtp-draft 2"
-elif [ "$MODEL" = "qwen36-vision" ]; then
+if [ "$MODEL" = "qwen36-vision" ]; then
     echo
     echo "Vision projector downloaded. Use it with the standard model:"
     echo "  ./q36 --vision $OUT_DIR/$VISION_FILE"
@@ -222,7 +201,7 @@ elif [ "$LINK_MODEL" -eq 1 ]; then
     cd "$ROOT"
     ln -sfn "$OUT_DIR/$MODEL_FILE" q36moe.gguf
     echo "Linked ./q36moe.gguf -> $OUT_DIR/$MODEL_FILE"
-    if [ "$MODEL" = "27b-iq3-xxs" ]; then
+    if [ "$MODEL" = "q2" ] || [ "$MODEL" = "27b-iq3-xxs" ]; then
         echo "Enable the embedded MTP head with:"
         echo "  ./q36 -m $OUT_DIR/$MODEL_FILE --mtp"
     fi

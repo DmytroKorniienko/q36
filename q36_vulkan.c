@@ -244,6 +244,7 @@ typedef struct {
     q36_vk_kernel rms_norm_rope_kv_quant;
     q36_vk_kernel top2;
     q36_vk_kernel mtp_head_mask;
+    q36_vk_kernel mtp_head_q8;
     q36_vk_kernel mtp_head_q5k;
     q36_vk_kernel mtp_head_iq4_xs;
     q36_vk_kernel moe_gate_up_f32b;
@@ -2869,6 +2870,7 @@ int q36_gpu_init(void) {
                                             (1u << 2) | (1u << 4));
     q36_vk.top2 = Q36_VK_KERNEL("vulkan/top2.spv", 3, 16, (1u << 1) | (1u << 2));
     q36_vk.mtp_head_mask = Q36_VK_KERNEL("vulkan/mtp_head_mask.spv", 3, 8, 1u << 0);
+    q36_vk.mtp_head_q8 = Q36_VK_KERNEL("vulkan/mtp_head_q8.spv", 4, 20, 1u << 2);
     q36_vk.mtp_head_q5k = Q36_VK_KERNEL("vulkan/mtp_head_q5k.spv", 4, 28, 1u << 2);
     q36_vk.mtp_head_iq4_xs = Q36_VK_KERNEL("vulkan/mtp_head_iq4_xs.spv", 4, 16, 1u << 2);
     q36_vk.copy_rows = Q36_VK_KERNEL("vulkan/copy_rows.spv", 2, 20, 1u << 1);
@@ -3435,6 +3437,7 @@ void q36_gpu_cleanup(void) {
     q36_vk_kernel_destroy(&q36_vk.ffn_tail);
     q36_vk_kernel_destroy(&q36_vk.top2);
     q36_vk_kernel_destroy(&q36_vk.mtp_head_mask);
+    q36_vk_kernel_destroy(&q36_vk.mtp_head_q8);
     q36_vk_kernel_destroy(&q36_vk.mtp_head_q5k);
     q36_vk_kernel_destroy(&q36_vk.mtp_head_iq4_xs);
     q36_vk_kernel_destroy(&q36_gdn_front);
@@ -7544,10 +7547,29 @@ int q36_gpu_mtp_head_tensor(q36_gpu_tensor *out,
                            uint32_t in_dim, uint32_t out_dim,
                            const q36_gpu_tensor *x, const q36_gpu_tensor *mask,
                            float scale) {
-    if (!q36_gpu_dense_model || q36_vk.subgroup_size != 64u ||
-        (weight_type != Q36_VK_TENSOR_Q5_K && weight_type != Q36_VK_TENSOR_IQ4_XS) ||
-        !in_dim || in_dim % 256u || !out_dim ||
+    if (q36_vk.subgroup_size != 64u ||
+        (weight_type != Q36_VK_TENSOR_Q8_0 &&
+         weight_type != Q36_VK_TENSOR_Q5_K && weight_type != Q36_VK_TENSOR_IQ4_XS) ||
+        !in_dim || in_dim % (weight_type == Q36_VK_TENSOR_Q8_0 ? 32u : 256u) || !out_dim ||
         !q36_vk_env_default_on("Q36_MTP_HEAD_MASK") || !q36_vk_env_default_on("Q36_VK_ARGMAX")) return 0;
+    if (weight_type == Q36_VK_TENSOR_Q8_0) {
+        uint64_t row_bytes = (uint64_t)in_dim / 32u * 34u;
+        uint64_t bytes = row_bytes * out_dim;
+        const void *source = q36_gpu_weight_bytes(model_map, model_size, weight_offset, bytes);
+        if (!source || !q36_gpu_tensor_range_ok(out, 0, (uint64_t)out_dim * sizeof(float)) ||
+            !q36_gpu_tensor_range_ok(x, 0, (uint64_t)in_dim * sizeof(float)) ||
+            !q36_gpu_tensor_range_ok(mask, 0, ((uint64_t)out_dim + 63u) / 64u * sizeof(uint32_t))) return 0;
+        struct { uint32_t out_dim, n_tok, blocks, row_bytes; float scale; }
+            push = { out_dim, 1u, in_dim / 32u, (uint32_t)row_bytes, scale };
+        pthread_mutex_lock(&q36_vk_mu);
+        q36_gpu_tensor *weights = q36_vk_weight_get_unlocked(source, bytes);
+        const q36_gpu_tensor *bindings[] = { weights, x, out, mask };
+        int ok = weights && q36_vk_run_unlocked("mtp_head", &q36_vk.mtp_head_q8,
+            bindings, &push, sizeof(push), out_dim < 16384u ? out_dim : 16384u,
+            (out_dim + 16383u) / 16384u, 1);
+        pthread_mutex_unlock(&q36_vk_mu);
+        return ok;
+    }
     uint64_t row_bytes = (uint64_t)(in_dim / 256u) *
         (weight_type == Q36_VK_TENSOR_IQ4_XS ? 136u : 176u);
     uint64_t weight_bytes = row_bytes * out_dim;
@@ -8848,8 +8870,9 @@ int q36_gpu_moe_ffn_f32_tensor(q36_gpu_tensor *out,
                                       uint32_t n_expert) {
     bool q4k = gate->type == Q36_VK_TENSOR_Q4_K && up->type == Q36_VK_TENSOR_Q4_K &&
                down->type == Q36_VK_TENSOR_Q4_K;
+    bool down_q4k = down->type == Q36_VK_TENSOR_Q4_K;
     uint64_t gu_stride = (uint64_t)(in_dim / Q36_VK_QK_K) * (q4k ? 144u : 66u) * mid_dim;
-    uint64_t down_stride = (uint64_t)(mid_dim / Q36_VK_QK_K) * (q4k ? 144u : 84u) * out_dim;
+    uint64_t down_stride = (uint64_t)(mid_dim / Q36_VK_QK_K) * (down_q4k ? 144u : 84u) * out_dim;
     uint64_t scale_bytes = (uint64_t)n_expert * sizeof(float);
     uint64_t n_slot = (uint64_t)n_tok * n_used;
     q36_gpu_tensor *tiles = NULL;
@@ -8871,7 +8894,8 @@ int q36_gpu_moe_ffn_f32_tensor(q36_gpu_tensor *out,
     if (!streamed && !q36_vk_moe_bank_cache) return 0;
     if (!q4k &&
         (gate->type != Q36_VK_TENSOR_IQ2_XXS || up->type != Q36_VK_TENSOR_IQ2_XXS ||
-         down->type != Q36_VK_TENSOR_Q2_K)) return 0;
+         (down->type != Q36_VK_TENSOR_Q2_K && !down_q4k))) return 0;
+    if (down_q4k && !q4k && (n_tok != 1u || streamed || !q36_vk_use_moe_down_sum_decode())) return 0;
     /* Q4_K rides the same identity-schedule decode kernels; batches and
      * streaming keep the q8_K fallback. */
     if (q4k && (streamed || n_tok != 1u || !q36_vk_use_moe_down_sum_decode() ||
@@ -8955,7 +8979,7 @@ int q36_gpu_moe_ffn_f32_tensor(q36_gpu_tensor *out,
 
     /* Decode: one distinct expert per slot, so the selection itself is the
      * schedule and the tile build dispatch is skipped. */
-    bool identity = n_tok == 1u && !overflow;
+    bool identity = (n_tok == 1u || (q36_vk_micro_batch && n_tok <= 8u && !streamed)) && !overflow;
     bool down_sum_decode = identity && q36_vk_use_moe_down_sum_decode();
     /* Prefill batches route to the register-tiled GEMM kernels: wider
      * expert token tiles amortize the dequant and weight reads that bound
@@ -9081,10 +9105,10 @@ int q36_gpu_moe_ffn_f32_tensor(q36_gpu_tensor *out,
                     down_scales ? down_scales : down_bank,
                     weights, out,
                 };
-                ok = q36_vk_run_unlocked(q4k ? "moe_q4k_down_sum_decode" : "moe_q2k_down_sum_decode",
-                                         q4k ? &q36_vk.moe_down_q4k_sum_decode : &q36_vk.moe_down_q2k_sum_decode,
+                ok = q36_vk_run_unlocked(down_q4k ? "moe_q4k_down_sum_decode" : "moe_q2k_down_sum_decode",
+                                         down_q4k ? &q36_vk.moe_down_q4k_sum_decode : &q36_vk.moe_down_q2k_sum_decode,
                                          db, &dpush, sizeof(dpush),
-                                         out_dim, 1, 1);
+                                         out_dim, n_tok, 1);
             } else {
                 const q36_gpu_tensor *db[5] = {
                     down_bank, mid8, schedule,

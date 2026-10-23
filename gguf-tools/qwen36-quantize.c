@@ -139,6 +139,8 @@ typedef struct {
     int q4_start;
     int q4_end;
     int q4_last;
+    int mtp_gate_up;
+    int mtp_down;
 } params;
 
 static void die(const char *msg) {
@@ -860,6 +862,12 @@ static decision classify_tensor(const tensor *t, const params *pa, q36q_type *ty
     int layer = -1;
     char kind[32];
     if (parse_routed(t->name, &layer, kind, sizeof(kind))) {
+        int mtp_type = !strcmp(kind, "down") ? pa->mtp_down : pa->mtp_gate_up;
+        if (layer == 40 && mtp_type >= 0) {
+            *type = (q36q_type)mtp_type;
+            *why = "explicit MTP expert type";
+            return !strcmp(kind, "down") ? DEC_DOWN : DEC_GATE_UP;
+        }
         if (layer == 40 && t->type == Q36Q_TYPE_Q4_K && !q4_layer(pa, layer)) {
             *why = "MTP routed experts already quantized";
             return DEC_KEEP;
@@ -1297,13 +1305,25 @@ static void usage(const char *argv0) {
     printf("  --threads N                quantization workers, default 1\n");
     printf("  --q4-expert-layers A-B     quantize routed experts in layers A..B as q4_k\n");
     printf("  --q4-expert-last N         quantize routed experts in the last N layers as q4_k\n");
+    printf("  --mtp-gate-up TYPE         layer 40 gate/up: q2_k, q4_k, iq2_xxs, q8_0\n");
+    printf("  --mtp-down TYPE            layer 40 down: q2_k, q4_k, iq2_xxs, q8_0\n");
     printf("  --strip-nextn              strip MTP/nextn layer 40 for q36 MoE compatibility\n");
     printf("  --dry-run                  parse metadata and print plan only\n");
     printf("  --force                    overwrite output\n");
 }
 
+static int mtp_type(const char *name) {
+    if (!strcmp(name, "q2_k")) return Q36Q_TYPE_Q2_K;
+    if (!strcmp(name, "q4_k")) return Q36Q_TYPE_Q4_K;
+    if (!strcmp(name, "iq2_xxs")) return Q36Q_TYPE_IQ2_XXS;
+    if (!strcmp(name, "q8_0")) return Q36Q_TYPE_Q8_0;
+    die("MTP type must be q2_k, q4_k, iq2_xxs or q8_0");
+    return -1;
+}
+
 static params parse_args(int argc, char **argv) {
-    params p = { .threads = 1, .q4_start = -1, .q4_end = -1 };
+    params p = { .threads = 1, .q4_start = -1, .q4_end = -1,
+                 .mtp_gate_up = -1, .mtp_down = -1 };
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
         if (!strcmp(a, "-h") || !strcmp(a, "--help")) {
@@ -1336,6 +1356,10 @@ static params parse_args(int argc, char **argv) {
         } else if (!strcmp(a, "--q4-expert-last")) {
             p.q4_last = atoi(need(argc, argv, &i, a));
             if (p.q4_last < 1) die("--q4-expert-last must be >= 1");
+        } else if (!strcmp(a, "--mtp-gate-up")) {
+            p.mtp_gate_up = mtp_type(need(argc, argv, &i, a));
+        } else if (!strcmp(a, "--mtp-down")) {
+            p.mtp_down = mtp_type(need(argc, argv, &i, a));
         } else {
             fprintf(stderr, "error: unknown argument: %s\n", a);
             exit(1);

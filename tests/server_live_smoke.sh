@@ -21,7 +21,11 @@ stream_args=
 if [ "$streaming" = "--ssd-streaming" ]; then
     stream_args="--ssd-streaming --ssd-streaming-cache-experts ${Q36_TEST_STREAM_CACHE_EXPERTS:-512}"
 fi
-model=${Q36_TEST_MODEL:-gguf/Qwen3.6-35B-A3B-AntirezExperts-IQ2XXS-gateup-Q2K-down-Q8rest.gguf}
+model=${Q36_TEST_MODEL:-gguf/Qwen3.6-35B-A3B-IQ2XXS-Q2K-Q8.gguf}
+mtp_args=
+if [ "${Q36_TEST_EMBEDDED_MTP:-0}" = 1 ]; then
+    mtp_args=--mtp
+fi
 port=${Q36_TEST_SERVER_PORT:-$((18000 + $$ % 1000))}
 base=http://127.0.0.1:$port
 tmp=$(mktemp -d /tmp/q36-server-live.XXXXXX)
@@ -38,7 +42,7 @@ trap cleanup EXIT INT TERM
 
 # stream_args is either empty or two validated CLI options. The cache value is
 # validated again by q36-server.
-./q36-server -m "$model" "$backend" $stream_args --ctx 4096 --tokens 8 \
+./q36-server -m "$model" "$backend" $stream_args $mtp_args --ctx 4096 --tokens 8 \
     --host 127.0.0.1 --port "$port" --cors >"$tmp/server.log" 2>&1 &
 pid=$!
 

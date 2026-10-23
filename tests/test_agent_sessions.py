@@ -20,8 +20,10 @@ ROOT = Path(__file__).resolve().parents[1]
 ANSI = re.compile(rb'\x1b\[[0-?]*[ -/]*[@-~]|\x1b[78]')
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--binary', type=Path, default=ROOT / 'q36-agent')
-parser.add_argument('--model', type=Path, default=ROOT / 'gguf/Qwen3.6-35B-A3B-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-v2-imatrix.gguf')
+parser.add_argument('--model', type=Path, default=ROOT / 'gguf/Qwen3.6-35B-A3B-IQ2XXS-Q2K-Q8.gguf')
 parser.add_argument('--vision', type=Path)
+parser.add_argument('--mtp', action='store_true', help='Enable the embedded MTP head')
+parser.add_argument('--resident', action='store_true', help='Keep the model resident instead of SSD streaming')
 parser.add_argument('--web', action='store_true', help='Also test Google search and page visits; permits browser startup')
 parser.add_argument('--output', type=Path, required=True)
 args = parser.parse_args()
@@ -54,9 +56,13 @@ class Agent:
         self.master, slave = pty.openpty()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 40, 120, 0, 0))
         cmd = [str(args.binary.resolve()), '-m', str(args.model.resolve()),
-               '--vulkan', '--ssd-streaming', '--ctx', '8192', '--nothink',
+               '--vulkan', '--ctx', '8192', '--nothink',
                '--temp', '0', '--tokens', '2048', '--seed', '12345',
                '--chdir', str(out), '--trace', str(self.trace_path)]
+        if not args.resident:
+            cmd.append('--ssd-streaming')
+        if args.mtp:
+            cmd.append('--mtp')
         if args.vision:
             cmd += ['--vision', str(args.vision.resolve())]
         (self.log / 'command.json').write_text(json.dumps(cmd))

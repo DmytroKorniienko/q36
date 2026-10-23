@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-model=${Q36_TEST_MODEL:-gguf/Qwen3.6-35B-A3B-AntirezExperts-IQ2XXS-gateup-Q2K-down-Q8rest.gguf}
+model=${Q36_TEST_MODEL:-gguf/Qwen3.6-35B-A3B-IQ2XXS-Q2K-Q8.gguf}
 prompt=${Q36_RELEASE_BENCH_PROMPT:-tests/long_context_story_prompt.txt}
 min_prefill=${Q36_RELEASE_MIN_PREFILL_TPS:-50}
 min_decode=${Q36_RELEASE_MIN_DECODE_TPS:-40}

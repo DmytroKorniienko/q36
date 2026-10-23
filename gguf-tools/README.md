@@ -30,6 +30,35 @@ weights when they are present. Existing Q4_K MTP experts stay Q4_K; BF16,
 F16, and Q8_0 MTP experts follow the same IQ2_XXS/Q2_K recipe as the trunk.
 `--q4-expert-last` counts only trunk layers 0..39.
 
+MTP expert types can be set separately from the trunk recipe with
+`--mtp-gate-up TYPE` and `--mtp-down TYPE`. Both accept `iq2_xxs`, `q2_k`,
+`q4_k`, or `q8_0`. Start from BF16/F16/Q8 source tensors; quantized sources
+are only copied when their type already matches. For a head-only GGUF with
+the twenty separate `blk.40` tensors, this recipe produces a 332.78 MB block:
+
+```sh
+gguf-tools/qwen36-quantize --in mtp-bf16.gguf --out mtp-iq2-q4k.gguf \
+  --mtp-gate-up iq2_xxs --mtp-down q4_k --allow-synthetic-imatrix --threads 8
+python3 gguf-tools/embed_mtp.py \
+  --base gguf/Qwen3.6-35B-A3B-AntirezExperts-IQ2XXS-gateup-Q2K-down-Q8rest.gguf \
+  --head mtp-iq2-q4k.gguf --out gguf/Qwen3.6-35B-A3B-IQ2XXS-Q2K-Q8.gguf
+```
+
+Use the original Qwen3.6 MTP tensors from
+[Unsloth's BF16 shards](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/tree/main/BF16).
+Expand its BF16 router and shared-expert gate to F32 before quantization;
+norms already use F32. Other non-routed BF16 tensors become Q8_0.
+The published imatrix has no block-40 entries, so this recipe uses
+weight-energy importance for IQ2_XXS, with no claim of activation calibration.
+Q2_K gate/up with Q4_K down produces the larger 370.53 MB alternative.
+
+The embedder copies the trunk tensor payloads and tokenizer metadata without
+requantization, replaces any existing block 40, and sets the MTP metadata.
+It rejects heads at or above 500 MB and existing output paths. Embeddings
+and output weights are shared with the target. The head's added bytes,
+rather than the size of a standalone GGUF containing duplicated embedding
+and output tensors, determine its inference weight overhead.
+
 ## Build
 
 ```sh
