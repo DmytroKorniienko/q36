@@ -4,6 +4,8 @@ This file is a rulebook for implementing new Quarkstar speedups and kernel optim
 
 * A speedup must remain effective as the context size grows. Benchmark `q36_bench.c` with multiple context sizes, such as 128, 2K, and 4K tokens. In some cases, also test 8K and 16K.
 
+* Test MTP on prose, code, and reasoning, with plain decode as the control. Include sampled generation when the default profile uses opportunistic MTP. Report slow cases alongside aggregate gains.
+
 * After a change brings a speedup, always verify that it is mathematically equivalent and produces logits consistent with the previous implementation. A good check is the parity test in `q36_test.c`:
 
   * CPU vs. llama: use 16 threads and short prompts only. This is required only if the `q36.c` CPU path was touched by the changes.

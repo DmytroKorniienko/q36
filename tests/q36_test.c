@@ -2021,9 +2021,10 @@ static void test_vulkan_split_norm(void) {
         TEST_ASSERT(t[i] != NULL);
         if (!t[i]) goto done;
     }
-    const unsigned widths[] = {4095, 4096, 5120, 5157};
+    const unsigned widths[] = {2047, 2048, 4095, 4096, 5120, 5157};
     for (unsigned wi = 0; wi < sizeof(widths) / sizeof(*widths); wi++) {
         unsigned n = widths[wi];
+        q36_gpu_set_dense_model(n >= 4095u);
         for (unsigned rows = 1; rows <= max_rows; rows++) {
             size_t nb = (size_t)n * rows * sizeof(float);
             for (unsigned fixture = 0; fixture < 3; fixture++) {
@@ -2850,6 +2851,53 @@ static void test_vulkan_shared_ffn_decode(void) {
     }
 #else
     TEST_ASSERT(memcmp(a, b, (size_t)out_dim * sizeof(float)) == 0);
+    {
+        enum { rows = 8 };
+        float inputs[rows * in_dim], seeds[rows * out_dim], scalars[rows];
+        float want[rows * out_dim], got[rows * out_dim];
+        q36_gpu_tensor *tx = q36_gpu_tensor_alloc(sizeof(inputs));
+        q36_gpu_tensor *tm = q36_gpu_tensor_alloc((uint64_t)rows * mid_dim * sizeof(float));
+        q36_gpu_tensor *ts = q36_gpu_tensor_alloc(sizeof(scalars));
+        q36_gpu_tensor *ty = q36_gpu_tensor_alloc(sizeof(seeds));
+        TEST_ASSERT(tx && tm && ts && ty);
+        if (tx && tm && ts && ty) {
+            for (unsigned t = 0; t < rows; t++) {
+                scalars[t] = (float)t * 0.25f - 0.75f;
+                for (unsigned i = 0; i < in_dim; i++)
+                    inputs[t * in_dim + i] = x_host[i] * (0.5f + t * 0.125f);
+                for (unsigned i = 0; i < out_dim; i++)
+                    seeds[t * out_dim + i] = out_host[i] + t * 0.03125f;
+                TEST_ASSERT(q36_gpu_tensor_write(x, 0, inputs + t * in_dim, in_dim * sizeof(float)) != 0);
+                TEST_ASSERT(q36_gpu_tensor_write(scalar, 0, scalars + t, sizeof(float)) != 0);
+                TEST_ASSERT(q36_gpu_tensor_write(fused, 0, seeds + t * out_dim, out_dim * sizeof(float)) != 0);
+                TEST_ASSERT(q36_gpu_shared_ffn_decode_tensor(fused, fused_mid, x, scalar,
+                    weights_raw, weight_alloc, 0, up_offset, down_offset,
+                    in_dim, mid_dim, out_dim, gate_scale, up_scale, down_scale) != 0);
+                TEST_ASSERT(q36_gpu_tensor_read(fused, 0, want + t * out_dim, out_dim * sizeof(float)) != 0);
+            }
+            TEST_ASSERT(q36_gpu_tensor_write(tx, 0, inputs, sizeof(inputs)) != 0);
+            TEST_ASSERT(q36_gpu_tensor_write(ts, 0, scalars, sizeof(scalars)) != 0);
+            for (unsigned n = 2; n <= rows; n++) {
+                TEST_ASSERT(q36_gpu_tensor_write(ty, 0, seeds, sizeof(seeds)) != 0);
+                int ok = q36_gpu_shared_ffn_rows_tensor(ty, tm, tx, ts, weights_raw, weight_alloc,
+                    0, up_offset, down_offset, in_dim, mid_dim, out_dim,
+                    gate_scale, up_scale, down_scale, n);
+                if (!ok && n == 2u) {
+                    test_skip("vulkan-shared-ffn-rows", "batched shared expert unavailable");
+                    break;
+                }
+                TEST_ASSERT(ok != 0);
+                TEST_ASSERT(q36_gpu_tensor_read(ty, 0, got, sizeof(got)) != 0);
+                TEST_ASSERT(memcmp(got, want, n * out_dim * sizeof(float)) == 0);
+                TEST_ASSERT(memcmp(got + n * out_dim, seeds + n * out_dim,
+                    (rows - n) * out_dim * sizeof(float)) == 0);
+            }
+        }
+        q36_gpu_tensor_free(tx);
+        q36_gpu_tensor_free(tm);
+        q36_gpu_tensor_free(ts);
+        q36_gpu_tensor_free(ty);
+    }
 #endif
 
 done:
@@ -3371,7 +3419,7 @@ static void test_vulkan_small_dims(uint32_t type, uint32_t block_bytes,
      * Q8 uses padded reference rows to select the original wide kernel. */
     enum { tokens = 9 };
     const uint32_t blocks = (type == 8 || type == 20) ? in_dim / 32u : in_dim / 256u;
-    const uint32_t ref_rows = type == 8 ? 131 : out_dim;
+    const uint32_t ref_rows = type == 8 && out_dim < 131u ? 131u : out_dim;
     const size_t ref_bytes = (size_t)tokens * ref_rows * sizeof(float);
     const uint32_t row_bytes = blocks * block_bytes;
     const size_t x_bytes = (size_t)tokens * in_dim * sizeof(float);
@@ -3558,6 +3606,8 @@ static void test_vulkan_small_tiles(void) {
     const uint32_t q8_rows[] = {1, 7, 31, 48, 63, 131};
     for (unsigned i = 0; i < sizeof(q8_rows) / sizeof(q8_rows[0]); i++)
         test_vulkan_small_one(8, 34, q8_rows[i]);
+    test_vulkan_small_dims(8, 34, 1028, 1056);
+    test_vulkan_small_dims(8, 34, 65540, 1024);
     const uint32_t types[] = {10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23},
                    bytes[] = {84, 110, 144, 176, 210, 66, 74, 98, 50, 18, 110, 82, 136};
     for (unsigned i = 0; i < sizeof(types) / sizeof(types[0]); i++) {
@@ -4742,6 +4792,17 @@ static void test_vulkan_attn_case(uint32_t n_head, uint32_t pos0, uint32_t n_tok
     }
     TEST_ASSERT(q36_gpu_tensor_read(out, 0, out_single, out_floats * sizeof(float)) != 0);
     TEST_ASSERT(memcmp(out_host, out_single, out_floats * sizeof(float)) == 0);
+#ifndef Q36_METAL
+    if (n_tok <= 8u) {
+        q36_gpu_set_micro_batch(true);
+        TEST_ASSERT(q36_gpu_attn_decode_tensor(out, q, qg, kc, vc, scores,
+            sinks_raw, sinks_alloc, 0, true, pos0, n_tok, n_head, n_head_kv,
+            head_dim, k_type, v_type, k_row_bytes, v_row_bytes) != 0);
+        q36_gpu_set_micro_batch(false);
+        TEST_ASSERT(q36_gpu_tensor_read(out, 0, out_single, out_floats * sizeof(float)) != 0);
+        TEST_ASSERT(memcmp(out_host, out_single, out_floats * sizeof(float)) == 0);
+    }
+#endif
 
     free(q_host);
     free(qg_host);
@@ -4776,6 +4837,8 @@ static void test_vulkan_attn_decode_fused(void) {
     test_vulkan_attn_case(12, 129, 3, Q36_KV_CACHE_Q4_0, Q36_KV_CACHE_Q4_0, 64);
     test_vulkan_attn_case(16, 510, 3, Q36_KV_CACHE_Q4_0, Q36_KV_CACHE_Q4_0, 128);
     test_vulkan_attn_case(16, 129, 3, Q36_KV_CACHE_Q8_0, Q36_KV_CACHE_Q4_0, 256);
+    test_vulkan_attn_case(16, 1534, 5, Q36_KV_CACHE_Q8_0, Q36_KV_CACHE_Q4_0, 256);
+    test_vulkan_attn_case(16, 4094, 257, Q36_KV_CACHE_Q8_0, Q36_KV_CACHE_Q4_0, 256);
     /* Six-head GQA, partial tiles crossing span and span-group boundaries. */
     test_vulkan_attn_case(12, 510, 3, Q36_KV_CACHE_Q8_0, Q36_KV_CACHE_Q4_0, 256);
     test_vulkan_attn_case(12, 4094, 5, Q36_KV_CACHE_Q8_0, Q36_KV_CACHE_Q4_0, 256);
@@ -4906,7 +4969,48 @@ done:
 #endif
 }
 
+static void test_vulkan_router_subgroups(void) {
+#if !defined(Q36_NO_GPU) && !defined(Q36_METAL)
+    enum { tokens = 7, experts = 256, used = 8 };
+    float input[tokens * experts], got_weights[tokens * used], want_weights[tokens * used];
+    uint32_t got[tokens * used], want[tokens * used];
+    q36_gpu_tensor *logits = q36_gpu_tensor_alloc(sizeof(input));
+    q36_gpu_tensor *selected = q36_gpu_tensor_alloc(sizeof(got));
+    q36_gpu_tensor *weights = q36_gpu_tensor_alloc(sizeof(got_weights));
+    TEST_ASSERT(logits && selected && weights);
+    char *old = getenv("Q36_VK_ROUTER_SUBGROUPS") ? strdup(getenv("Q36_VK_ROUTER_SUBGROUPS")) : NULL;
+    if (!logits || !selected || !weights) goto done;
+    const unsigned counts[] = {5, 32, 255, 256};
+    for (unsigned c = 0; c < sizeof(counts) / sizeof(counts[0]); c++) {
+        unsigned n = counts[c], k = n < used ? n : used;
+        for (unsigned fixture = 0; fixture < 3; fixture++) {
+            for (unsigned i = 0; i < tokens * n; i++)
+                input[i] = fixture == 0 ? 0.0f : fixture == 1 ?
+                    (float)((int)(i * 13u % 29u) - 14) : sinf(i * 0.37f) * 1000.0f;
+            TEST_ASSERT(q36_gpu_tensor_write(logits, 0, input, tokens * n * sizeof(float)) != 0);
+            for (unsigned arm = 0; arm < 2; arm++) {
+                setenv("Q36_VK_ROUTER_SUBGROUPS", arm ? "1" : "0", 1);
+                TEST_ASSERT(q36_gpu_router_topk_tensor(selected, weights, logits, n, k, tokens, 0.75f) != 0);
+                TEST_ASSERT(q36_gpu_tensor_read(selected, 0, arm ? got : want, tokens * k * sizeof(uint32_t)) != 0);
+                TEST_ASSERT(q36_gpu_tensor_read(weights, 0, arm ? got_weights : want_weights, tokens * k * sizeof(float)) != 0);
+            }
+            TEST_ASSERT(memcmp(got, want, tokens * k * sizeof(uint32_t)) == 0);
+            TEST_ASSERT(memcmp(got_weights, want_weights, tokens * k * sizeof(float)) == 0);
+        }
+    }
+done:
+    if (old) setenv("Q36_VK_ROUTER_SUBGROUPS", old, 1);
+    else unsetenv("Q36_VK_ROUTER_SUBGROUPS");
+    free(old);
+    q36_gpu_tensor_free(weights);
+    q36_gpu_tensor_free(selected);
+    q36_gpu_tensor_free(logits);
+    q36_gpu_cleanup();
+#endif
+}
+
 static void test_vulkan_kernels(void) {
+    test_vulkan_router_subgroups();
     test_vulkan_top2_rows();
     test_vulkan_host_overwrite();
     test_metal_f16_matvec_fast_nr0_4();

@@ -1,0 +1,67 @@
+#version 460
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
+
+/* Share each activation load across output rows, with the same block
+ * order and subgroup reduction as the single-token Q8 matvec. */
+layout(local_size_x = 128) in;
+layout(constant_id = 0) const uint NT = 2u;
+const uint NR = NT == 2u ? 2u : 4u;
+
+layout(set = 0, binding = 0) readonly buffer Weights { uint16_t w[]; };
+layout(set = 0, binding = 1) readonly buffer X { vec4 x[]; };
+layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };
+layout(push_constant) uniform Push {
+    uint out_dim;
+    uint n_tok;
+    uint blocks;
+    uint row_bytes;
+    float scale;
+} pc;
+
+shared float partial[4][NR][NT];
+
+void main(void) {
+    uint tid = gl_LocalInvocationID.x;
+    uint row0 = (gl_WorkGroupID.y * 16384u + gl_WorkGroupID.x) * NR;
+    if (row0 >= pc.out_dim) return;
+    float acc[NR][NT];
+    [[unroll]] for (uint r = 0u; r < NR; r++)
+        [[unroll]] for (uint t = 0u; t < NT; t++) acc[r][t] = 0.0;
+
+    for (uint b = tid >> 2u; b < pc.blocks; b += 32u) {
+        uint e = (tid & 3u) * 8u;
+        uint xi = (b * 32u + e) / 4u;
+        [[unroll]] for (uint r = 0u; r < NR; r++) {
+            uint base = ((row0 + r) * pc.blocks + b) * 17u;
+            uint q = base + 1u + e / 2u;
+            float d = unpackHalf2x16(uint(w[base])).x;
+            vec4 a = vec4(unpack8(int(uint(w[q]) | (uint(w[q + 1u]) << 16u))));
+            vec4 c = vec4(unpack8(int(uint(w[q + 2u]) | (uint(w[q + 3u]) << 16u))));
+            [[unroll]] for (uint t = 0u; t < NT; t++) {
+                uint xt = t * pc.blocks * 8u + xi;
+                acc[r][t] += d * (dot(a, x[xt]) + dot(c, x[xt + 1u]));
+            }
+        }
+    }
+    [[unroll]] for (uint r = 0u; r < NR; r++) {
+        [[unroll]] for (uint t = 0u; t < NT; t++) {
+            acc[r][t] = subgroupAdd(acc[r][t]);
+            if (subgroupElect()) partial[gl_SubgroupID][r][t] = acc[r][t];
+        }
+    }
+    barrier();
+    if (tid == 0u) {
+        [[unroll]] for (uint r = 0u; r < NR; r++) {
+            [[unroll]] for (uint t = 0u; t < NT; t++) {
+                float sum = partial[0][r][t];
+                for (uint i = 1u; i < gl_NumSubgroups; i++) sum += partial[i][r][t];
+                y[t * pc.out_dim + row0 + r] = sum * pc.scale;
+            }
+        }
+    }
+}

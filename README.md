@@ -278,21 +278,33 @@ routers/norms remain F32. Enable it with:
   -p "Write a C function that reverses a linked list."
 ```
 
-BC-250 resident Vulkan measurements with this head, greedy generation,
-Q8_0 K / Q4_0 V, and 128 generated tokens:
+BC-250 resident Vulkan measurements with this head and Q8_0 K / Q4_0 V
+cover prose, code, reasoning with thinking enabled, and structured output.
+The table gives MTP speedups over ordinary decode in the same build:
 
-| Context | Ordinary t/s | MTP t/s | Speedup |
-| ---: | ---: | ---: | ---: |
-| 128 | 91.51 | 97.01 | 1.06× |
-| 2K | 88.08 | 131.39 | 1.49× |
-| 4K | 84.71 | 105.27 | 1.24× |
-| 8K | 79.99 | 97.08 | 1.21× |
+| Workload | Greedy speedup | Sampled speedup |
+| --- | ---: | ---: |
+| Prose | 1.17–1.28× | 1.20–1.24× |
+| Code | 1.21–1.99× | 1.48–1.58× |
+| Reasoning | 1.40–1.50× | 1.51–1.60× |
+| JSON | 1.39–1.50× | 1.52–1.62× |
 
-These are single serialized story sweeps with draft ceiling eight and margin
-zero. The earlier scalar MoE verifier with the 496 MB Q4_K head and draft
-ceiling four measured 48.95, 71.13, and 58.70 t/s at 128, 2K, and 4K.
-Head-recipe comparisons, code sweeps, temperatures, and exact replay logs are
-in [the local benchmark artifacts](tests/test-vectors/local/q36-moe-mtp-20261023/README.md).
+These are serialized, warmed sweeps at 128, 2K, and 4K context with 192
+generated tokens, draft ceiling eight, and margin zero. All 24 greedy cases
+produce identical token sequences with MTP enabled or disabled. The 12
+sampled cases use temperature 0.6 and seed 42; opportunistic MTP samples each
+block boundary and uses a verified greedy tail, so its sampling distribution
+differs from ordinary per-token sampling.
+
+The current kernels improve MTP throughput by 19% geometrically over
+`d5b4e4b`, with 12–27% gains across the greedy cases. Q8 verification shares
+activation loads across output rows, shared experts verify multiple tokens
+together, and eight-head attention reuses K/V loads. The MoE normalization
+scratch adds 16 KiB; the model and head weights are unchanged. Measurements,
+temperatures, dense-optimization audit, and validation are in
+[the local speedup report](tests/test-vectors/local/q36-moe-speed-20261023/README.md).
+The [head-selection report](tests/test-vectors/local/q36-moe-mtp-20261023/README.md)
+records the earlier quantization comparisons.
 
 For greedy Vulkan generation with the dense embedded head:
 

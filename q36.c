@@ -7754,6 +7754,16 @@ static bool q36_forward_ffn_vulkan_model(q36_vulkan_runtime *rt,
         l->ffn_down_shexp->type == Q36_TENSOR_Q8_0) {
         const char *env = getenv("Q36_VK_SHARED_FFN_DECODE");
         if (!env || !env[0] || env[0] != '0') {
+#ifndef Q36_METAL
+            if (session_batch && n_tok > 1u && q36_gpu_shared_ffn_rows_tensor(
+                    out, rt->ffn_shared_mid, inp, rt->ffn_scalar, m->map, m->size,
+                    l->ffn_gate_shexp->abs_offset, l->ffn_up_shexp->abs_offset,
+                    l->ffn_down_shexp->abs_offset,
+                    Q36_N_EMBD, Q36_N_FF_SHARED, Q36_N_EMBD,
+                    q36_tensor_scalar_or(m, l->ffn_gate_shexp_scale, 1.0f),
+                    q36_tensor_scalar_or(m, l->ffn_up_shexp_scale, 1.0f),
+                    q36_tensor_scalar_or(m, l->ffn_down_shexp_scale, 1.0f), n_tok)) return true;
+#endif
             if (n_tok == 1 && q36_gpu_shared_ffn_decode_tensor(
                     out, rt->ffn_shared_mid, inp, rt->ffn_scalar,
                     m->map, m->size,

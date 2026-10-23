@@ -1,0 +1,90 @@
+#version 460
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#extension GL_EXT_control_flow_attributes : require
+
+/* The shared expert uses 64 lanes in decode. Retain that reduction while
+ * applying each loaded weight block to all verification rows. */
+layout(local_size_x = 64) in;
+layout(constant_id = 0) const uint NT = 2u;
+layout(set = 0, binding = 0) readonly buffer Weights { uint16_t w[]; };
+#ifdef Q36_GATE_UP
+layout(set = 0, binding = 1) readonly buffer Up { uint16_t up[]; };
+layout(set = 0, binding = 2) readonly buffer Input { vec4 x[]; };
+#else
+layout(set = 0, binding = 1) readonly buffer Input { vec4 x[]; };
+layout(set = 0, binding = 2) readonly buffer Scalar { float scalar[]; };
+#endif
+layout(set = 0, binding = 3) buffer Output { float y[]; };
+layout(push_constant) uniform Push {
+    uint out_dim;
+    uint blocks;
+    float scale;
+#ifdef Q36_GATE_UP
+    float up_scale;
+#endif
+} pc;
+
+float sigmoid_stable(float v) {
+    if (v >= 0.0) {
+        float z = exp(-v);
+        return 1.0 / (1.0 + z);
+    }
+    float z = exp(v);
+    return z / (1.0 + z);
+}
+
+void main(void) {
+    uint tid = gl_LocalInvocationID.x, row = gl_WorkGroupID.x;
+    float acc[NT];
+#ifdef Q36_GATE_UP
+    float uacc[NT];
+#endif
+    [[unroll]] for (uint t = 0u; t < NT; t++) {
+        acc[t] = 0.0;
+#ifdef Q36_GATE_UP
+        uacc[t] = 0.0;
+#endif
+    }
+    for (uint b = tid >> 2u; b < pc.blocks; b += 16u) {
+        uint e = (tid & 3u) * 8u;
+        uint base = (row * pc.blocks + b) * 17u;
+        uint q = base + 1u + e / 2u;
+        float d = unpackHalf2x16(uint(w[base])).x;
+        vec4 a = vec4(unpack8(int(uint(w[q]) | (uint(w[q + 1u]) << 16u))));
+        vec4 c = vec4(unpack8(int(uint(w[q + 2u]) | (uint(w[q + 3u]) << 16u))));
+#ifdef Q36_GATE_UP
+        float ud = unpackHalf2x16(uint(up[base])).x;
+        vec4 ua = vec4(unpack8(int(uint(up[q]) | (uint(up[q + 1u]) << 16u))));
+        vec4 uc = vec4(unpack8(int(uint(up[q + 2u]) | (uint(up[q + 3u]) << 16u))));
+#endif
+        [[unroll]] for (uint t = 0u; t < NT; t++) {
+            uint xi = t * pc.blocks * 8u + (b * 32u + e) / 4u;
+            vec4 x0 = x[xi], x1 = x[xi + 1u];
+            acc[t] += d * (dot(a, x0) + dot(c, x1));
+#ifdef Q36_GATE_UP
+            uacc[t] += ud * (dot(ua, x0) + dot(uc, x1));
+#endif
+        }
+    }
+    [[unroll]] for (uint t = 0u; t < NT; t++) {
+        acc[t] = subgroupAdd(acc[t]);
+#ifdef Q36_GATE_UP
+        uacc[t] = subgroupAdd(uacc[t]);
+#endif
+    }
+    if (tid == 0u) {
+        [[unroll]] for (uint t = 0u; t < NT; t++) {
+            uint dst = t * pc.out_dim + row;
+#ifdef Q36_GATE_UP
+            float g = acc[t] * pc.scale;
+            y[dst] = (g / (1.0 + exp(-g))) * (uacc[t] * pc.up_scale);
+#else
+            y[dst] = fma(acc[t] * pc.scale, sigmoid_stable(scalar[t]), y[dst]);
+#endif
+        }
+    }
+}

@@ -88,12 +88,15 @@ VULKAN_SHADERS := \
 	vulkan/matmul_q8_0_f32b.spv \
 	vulkan/matmul_q8_0_f32b_pair.spv \
 	vulkan/shared_gate_up_decode.spv \
+	vulkan/shared_gate_up_verify.spv \
+	vulkan/shared_down_verify.spv \
 	vulkan/shared_down_tail_decode.spv \
 	vulkan/matmul_q8_0_mm.spv \
 	vulkan/matmul_q8_0_mm_small.spv \
 	vulkan/matmul_q8_0_mm_f16.spv \
 	vulkan/matmul_q8_0_mm_f16_out32.spv \
 	vulkan/matmul_q8_0_f32b_nx.spv \
+	vulkan/matmul_q8_0_verify.spv \
 	vulkan/matmul_q8_0_decode.spv \
 	vulkan/matmul_q8_0_decode_q36.spv \
 	vulkan/matmul_q8_0_decode_b64.spv \
@@ -119,15 +122,19 @@ VULKAN_SHADERS := \
 	vulkan/attn_decode_fused.spv \
 	vulkan/attn_decode_split.spv \
 	vulkan/attn_decode_gqa6.spv \
+	vulkan/attn_decode_gqa8.spv \
+	vulkan/attn_decode_gqa8_q4.spv \
 	vulkan/attn_decode_gqa6_q4.spv \
 	vulkan/attn_prefill_qtile.spv \
 	vulkan/attn_prefill_qtile2.spv \
 	vulkan/attn_prefill_qtile1_gqa6.spv \
+	vulkan/attn_prefill_qtile1_gqa8.spv \
 	vulkan/attn_prefill_qtile1_gqa6_q4.spv \
 	vulkan/attn_prefill_qtile2_gqa6.spv \
 	vulkan/attn_combine.spv \
 	vulkan/moe_gate_up.spv \
 	vulkan/router_topk.spv \
+	vulkan/router_topk_fast.spv \
 	vulkan/moe_tiles.spv \
 	vulkan/kv_store.spv \
 	vulkan/kv_store_quant.spv \
@@ -301,6 +308,24 @@ vulkan/mtp_head_q5k.spv: vulkan/dense_kquant_decode.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_Q5K_ONLY=1 -DQ36_HEAD_MASK=1 $< -o $@
 
 vulkan/mtp_head_mask.spv: vulkan/mtp_head_mask.comp
+	$(GLSLC) -O --target-env=vulkan1.1 $< -o $@
+
+vulkan/router_topk_fast.spv: vulkan/router_topk.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_SUBGROUPS=1 $< -o $@
+
+vulkan/attn_prefill_qtile1_gqa8.spv: vulkan/attn_prefill_qtile2.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_QT=1 -DQ36_GQA_HEADS=8 $< -o $@
+
+vulkan/attn_decode_gqa8.spv: vulkan/attn_decode_gqa6.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_GQA8=1 $< -o $@
+
+vulkan/attn_decode_gqa8_q4.spv: vulkan/attn_decode_gqa6.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_GQA8=1 -DQ36_K_Q4=1 $< -o $@
+
+vulkan/shared_gate_up_verify.spv: vulkan/shared_ffn_verify.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -DQ36_GATE_UP=1 $< -o $@
+
+vulkan/shared_down_verify.spv: vulkan/shared_ffn_verify.comp
 	$(GLSLC) -O --target-env=vulkan1.1 $< -o $@
 
 vulkan/mtp_head_q8.spv: vulkan/matmul_q8_0_f32b.comp
@@ -499,6 +524,9 @@ vulkan/matmul_q8_0_mm_f16_out32.spv: vulkan/matmul_q8_0_mm_f16_out32.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
 vulkan/matmul_q8_0_f32b_nx.spv: vulkan/matmul_q8_0_f32b_nx.comp
+	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
+
+vulkan/matmul_q8_0_verify.spv: vulkan/matmul_q8_0_verify.comp
 	$(GLSLC) -O --target-env=vulkan1.1 -o $@ $<
 
 vulkan/moe_gate_up_f32b.spv: vulkan/moe_gate_up_f32b.comp

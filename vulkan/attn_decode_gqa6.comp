@@ -3,7 +3,17 @@
 #extension GL_KHR_shader_subgroup_clustered : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 
-/* Three adjacent heads share one GQA key/value stream. Each vector lane
+#ifdef Q36_GQA8
+#define qvec vec4
+#define GROUP 4u
+#define GQA 8u
+#else
+#define qvec vec3
+#define GROUP 3u
+#define GQA 6u
+#endif
+
+/* Adjacent heads share one GQA key/value stream. Each vector lane
  * keeps the split kernel's scalar reduction and softmax order. */
 layout(local_size_x = 256) in;
 layout(set = 0, binding = 0) readonly buffer Q {
@@ -25,22 +35,30 @@ layout(push_constant) uniform Push {
     uint pos0, n_head, n_head_kv, head_dim, n_spans, has_sinks, k_type, v_type, k_row_bytes,
         v_row_bytes;
 } pc;
-shared float sh_q[768];
-shared vec3 sh_w[64];
+shared float sh_q[256u * GROUP];
+shared qvec sh_w[64];
 
-vec3 qdot(uint word, uint qi) {
+qvec qdot(uint word, uint qi) {
     vec4 k = vec4(unpack8(int(word)));
-    return vec3(dot(k, vec4(sh_q[qi], sh_q[qi + 1u], sh_q[qi + 2u], sh_q[qi + 3u])),
+    return qvec(dot(k, vec4(sh_q[qi], sh_q[qi + 1u], sh_q[qi + 2u], sh_q[qi + 3u])),
                 dot(k, vec4(sh_q[qi + 256u], sh_q[qi + 257u], sh_q[qi + 258u], sh_q[qi + 259u])),
-                dot(k, vec4(sh_q[qi + 512u], sh_q[qi + 513u], sh_q[qi + 514u], sh_q[qi + 515u])));
+                dot(k, vec4(sh_q[qi + 512u], sh_q[qi + 513u], sh_q[qi + 514u], sh_q[qi + 515u]))
+#ifdef Q36_GQA8
+                , dot(k, vec4(sh_q[qi + 768u], sh_q[qi + 769u], sh_q[qi + 770u], sh_q[qi + 771u]))
+#endif
+                );
 }
 
 #ifdef Q36_K_Q4
-vec3 qdot4(uint word, uint qi) {
+qvec qdot4(uint word, uint qi) {
     vec4 k = vec4(unpack8(int(word))) - vec4(8.0);
-    return vec3(dot(k, vec4(sh_q[qi], sh_q[qi + 1u], sh_q[qi + 2u], sh_q[qi + 3u])),
+    return qvec(dot(k, vec4(sh_q[qi], sh_q[qi + 1u], sh_q[qi + 2u], sh_q[qi + 3u])),
                 dot(k, vec4(sh_q[qi + 256u], sh_q[qi + 257u], sh_q[qi + 258u], sh_q[qi + 259u])),
-                dot(k, vec4(sh_q[qi + 512u], sh_q[qi + 513u], sh_q[qi + 514u], sh_q[qi + 515u])));
+                dot(k, vec4(sh_q[qi + 512u], sh_q[qi + 513u], sh_q[qi + 514u], sh_q[qi + 515u]))
+#ifdef Q36_GQA8
+                , dot(k, vec4(sh_q[qi + 768u], sh_q[qi + 769u], sh_q[qi + 770u], sh_q[qi + 771u]))
+#endif
+                );
 }
 
 const uint K_PAIR_BYTES = 36u;
@@ -48,11 +66,11 @@ const uint K_PAIR_BYTES = 36u;
 const uint K_PAIR_BYTES = 68u;
 #endif
 
-vec3 kdot(uint b, uint p) {
+qvec kdot(uint b, uint p) {
 #ifdef Q36_K_Q4
     uint wi = b >> 2u, prev = kc[wi];
     float d0 = unpackHalf2x16(prev).x;
-    vec3 s0 = vec3(0.0);
+    qvec s0 = qvec(0.0);
     for (uint k = 0u; k < 4u; k++) {
         uint next = kc[wi + 1u + k];
         uint sw = (prev >> 16u) | (next << 16u);
@@ -62,7 +80,7 @@ vec3 kdot(uint b, uint p) {
         s0 += qdot4((sw >> 4u) & 0x0f0f0f0fu, qi + 16u);
     }
     float d1 = unpackHalf2x16(prev).y;
-    vec3 s1 = vec3(0.0);
+    qvec s1 = qvec(0.0);
     for (uint k = 0u; k < 4u; k++) {
         uint sw = kc[wi + 5u + k];
         uint qi = p * 64u + 32u + 4u * k;
@@ -73,7 +91,7 @@ vec3 kdot(uint b, uint p) {
 #else
     uint wi = b >> 2u, prev = kc[wi];
     float d0 = unpackHalf2x16(prev).x;
-    vec3 s0 = vec3(0.0);
+    qvec s0 = qvec(0.0);
     for (uint k = 0u; k < 8u; k++) {
         uint next = kc[wi + 1u + k];
         uint sw = (prev >> 16u) | (next << 16u);
@@ -81,7 +99,7 @@ vec3 kdot(uint b, uint p) {
         s0 += qdot(sw, p * 64u + 4u * k);
     }
     float d1 = unpackHalf2x16(prev).y;
-    vec3 s1 = vec3(0.0);
+    qvec s1 = qvec(0.0);
     for (uint k = 0u; k < 8u; k++)
         s1 += qdot(kc[wi + 9u + k], p * 64u + 32u + 4u * k);
     return d0 * s0 + d1 * s1;
@@ -98,7 +116,7 @@ float v_q4(uint t, uint vblk, uint vqo, uint vsh) {
 }
 
 void main() {
-    uint tid = gl_LocalInvocationID.x, h = 3u * gl_WorkGroupID.x, tok = gl_WorkGroupID.y,
+    uint tid = gl_LocalInvocationID.x, h = GROUP * gl_WorkGroupID.x, tok = gl_WorkGroupID.y,
          span = gl_WorkGroupID.z;
     uint n_kv = pc.pos0 + tok + 1u, span0 = span * 512u, span_end = min(span0 + 512u, n_kv);
     uint pbase = ((tok * pc.n_head + h) * pc.n_spans + span) * 258u;
@@ -106,30 +124,38 @@ void main() {
     uint plast = pnext + pc.n_spans * 258u;
     if (span0 >= n_kv)
         return;
-    uint kvh = h / 6u;
+    uint kvh = h / GQA;
     sh_q[tid] = q[(tok * pc.n_head + h) * 256u + tid];
     sh_q[tid + 256u] = q[(tok * pc.n_head + h + 1u) * 256u + tid];
     sh_q[tid + 512u] = q[(tok * pc.n_head + h + 2u) * 256u + tid];
+#ifdef Q36_GQA8
+    sh_q[tid + 768u] = q[(tok * pc.n_head + h + 3u) * 256u + tid];
+#endif
     barrier();
-    vec3 m = span == 0u && pc.has_sinks != 0u ? vec3(sinks[h], sinks[h + 1u], sinks[h + 2u])
-                                              : vec3(-3.402823466e38);
-    vec3 l = vec3(0.0), acc = vec3(0.0);
+#ifdef Q36_GQA8
+    qvec m = span == 0u && pc.has_sinks != 0u ? qvec(sinks[h], sinks[h + 1u], sinks[h + 2u], sinks[h + 3u])
+                                              : qvec(-3.402823466e38);
+#else
+    qvec m = span == 0u && pc.has_sinks != 0u ? qvec(sinks[h], sinks[h + 1u], sinks[h + 2u])
+                                              : qvec(-3.402823466e38);
+#endif
+    qvec l = qvec(0.0), acc = qvec(0.0);
     uint vblk = kvh * 144u + (tid >> 5u) * 18u;
     uint vqo = 2u + (tid & 15u), vsh = (tid & 31u) < 16u ? 0u : 4u;
     for (uint base = span0; base < span_end; base += 64u) {
         uint tile_n = min(64u, span_end - base), key = base + (tid >> 2u), quad = tid & 3u;
-        vec3 dot = vec3(0.0);
+        qvec dot = qvec(0.0);
         if ((tid >> 2u) < tile_n)
             dot += kdot(key * pc.k_row_bytes + kvh * (4u * K_PAIR_BYTES) + quad * K_PAIR_BYTES, quad);
         dot = subgroupClusteredAdd(dot, 4u);
         if (quad == 0u && (tid >> 2u) < tile_n)
             sh_w[tid >> 2u] = dot * 0.0625;
         barrier();
-        vec3 tmax = vec3(-3.402823466e38);
+        qvec tmax = qvec(-3.402823466e38);
         for (uint t = gl_SubgroupInvocationID & 31u; t < tile_n; t += 32u)
             tmax = max(tmax, sh_w[t]);
         tmax = subgroupClusteredMax(tmax, 32u);
-        vec3 nm = max(m, tmax), r = exp(m - nm);
+        qvec nm = max(m, tmax), r = exp(m - nm);
         l *= r;
         acc *= r;
         barrier();
@@ -138,7 +164,7 @@ void main() {
         barrier();
         uint t = 0u;
         for (; t + 4u <= tile_n; t += 4u) {
-            vec3 w0 = sh_w[t], w1 = sh_w[t + 1u], w2 = sh_w[t + 2u], w3 = sh_w[t + 3u];
+            qvec w0 = sh_w[t], w1 = sh_w[t + 1u], w2 = sh_w[t + 2u], w3 = sh_w[t + 3u];
             float v0 = v_q4(base + t, vblk, vqo, vsh), v1 = v_q4(base + t + 1u, vblk, vqo, vsh);
             float v2 = v_q4(base + t + 2u, vblk, vqo, vsh),
                   v3 = v_q4(base + t + 3u, vblk, vqo, vsh);
@@ -152,7 +178,7 @@ void main() {
             acc += w3 * v3;
         }
         for (; t < tile_n; t++) {
-            vec3 w = sh_w[t];
+            qvec w = sh_w[t];
             l += w;
             acc += w * v_q4(base + t, vblk, vqo, vsh);
         }
@@ -162,6 +188,10 @@ void main() {
     part[pbase + tid] = acc.x;
     part[pnext + tid] = acc.y;
     part[plast + tid] = acc.z;
+#ifdef Q36_GQA8
+    uint pextra = plast + pc.n_spans * 258u;
+    part[pextra + tid] = acc.w;
+#endif
     if (tid == 0u) {
         part[pbase + 256u] = m.x;
         part[pbase + 257u] = l.x;
@@ -169,5 +199,9 @@ void main() {
         part[pnext + 257u] = l.y;
         part[plast + 256u] = m.z;
         part[plast + 257u] = l.z;
+#ifdef Q36_GQA8
+        part[pextra + 256u] = m.w;
+        part[pextra + 257u] = l.w;
+#endif
     }
 }

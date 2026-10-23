@@ -31,6 +31,9 @@ void main(void) {
     } else if (pc.n == 4096u) {
         [[unroll]] for (uint k = 0u; k < 16u; k++)
             add_square(base, lid + 256u * k, ss);
+    } else if (pc.n == 2048u) {
+        [[unroll]] for (uint k = 0u; k < 8u; k++)
+            add_square(base, lid + 256u * k, ss);
     } else {
         for (uint i = lid; i < pc.n; i += 256u)
             add_square(base, i, ss);

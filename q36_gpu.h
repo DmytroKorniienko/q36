@@ -527,6 +527,14 @@ int q36_gpu_shared_ffn_decode_tensor(
         float                 up_scale,
         float                 down_scale);
 
+int q36_gpu_shared_ffn_rows_tensor(
+        q36_gpu_tensor *out, q36_gpu_tensor *mid,
+        const q36_gpu_tensor *x, const q36_gpu_tensor *scalar,
+        const void *model_map, uint64_t model_size,
+        uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+        uint32_t in_dim, uint32_t mid_dim, uint32_t out_dim,
+        float gate_scale, float up_scale, float down_scale, uint32_t n_tok);
+
 
 /* q36_ssm_conv_apply() + SiLU over n_tok windows: each window holds n_taps
  * rows of conv_dim, oldest first; the kernel weight is the model ssm_conv1d
