@@ -813,7 +813,6 @@ typedef struct {
     q36_think_mode think_mode;
     int thinking_budget;
     bool has_tools;
-    bool kat_coder;
     bool qwen38;
     bool preserve_thinking;
     bool prompt_preserves_reasoning;
@@ -933,9 +932,7 @@ static void request_init(request *r, req_kind kind, int max_tokens) {
 static void request_set_model_profile(request *r, q36_engine *e) {
     free(r->model);
     r->model = xstrdup(q36_engine_model_name(e));
-    r->kat_coder = q36_engine_is_kat_coder(e);
     r->qwen38 = q36_engine_is_qwen38(e);
-    if (r->kat_coder) r->presence_penalty = 1.5f;
 }
 
 static void request_apply_model_sampling_defaults(q36_engine *engine, request *r) {
@@ -1153,13 +1150,11 @@ static bool parse_output_config_effort(const char **p, q36_think_mode *effort) {
 }
 
 static bool model_alias_disables_thinking(const char *model) {
-    return model && (!strcmp(model, "qwen3.6-35b-a3b-nothink") ||
-                     !strcmp(model, "kat-coder-v2.5-dev-nothink"));
+    return model && !strcmp(model, "qwen3.6-35b-a3b-nothink");
 }
 
 static bool model_alias_enables_thinking(const char *model) {
-    return model && (!strcmp(model, "qwen3.6-35b-a3b-think") ||
-                     !strcmp(model, "kat-coder-v2.5-dev-think"));
+    return model && !strcmp(model, "qwen3.6-35b-a3b-think");
 }
 
 static void stop_list_clear(stop_list *stops) {
@@ -2655,128 +2650,6 @@ static char *assistant_message_parts(const chat_msg *m, char **reasoning_out) {
     return chat_content_text(end + strlen(tag), false, NULL);
 }
 
-static void append_kat_tools_prompt_text(buf *b, const char *tool_schemas) {
-    append_tools_prompt_text(b, tool_schemas);
-}
-
-static void append_kat_tool_calls_text(buf *b, const tool_calls *calls,
-                                       const tool_schema_orders *orders,
-                                       bool content_nonempty) {
-    if (!calls || calls->len == 0) return;
-    if (calls->raw_tool_text && calls->raw_tool_text[0]) {
-        if (content_nonempty) buf_puts(b, "\n\n");
-        buf_puts(b, calls->raw_tool_text);
-        return;
-    }
-    for (int i = 0; i < calls->len; i++) {
-        const tool_call *tc = &calls->v[i];
-        const tool_schema_order *order = tool_schema_orders_find(orders, tc->name);
-        if (i) buf_putc(b, '\n');
-        else if (content_nonempty) buf_puts(b, "\n\n");
-        buf_puts(b, "<tool_call>\n<function=");
-        buf_puts(b, tc->name ? tc->name : "");
-        buf_puts(b, ">\n");
-        append_qwen_arguments(b, tc->arguments, order);
-        buf_puts(b, "</function>\n</tool_call>");
-    }
-}
-
-static char *render_kat_chat_prompt_text(const chat_msgs *msgs,
-                                         const char *tool_schemas,
-                                         const tool_schema_orders *tool_orders,
-                                         q36_think_mode think_mode,
-                                         bool preserve_thinking) {
-    bool thinking = q36_think_mode_enabled(think_mode);
-    int last_query = last_chat_query(msgs);
-    int failures = 0;
-
-    buf out = {0};
-    int system_head = 0;
-    char *first_content = leading_system_content(msgs, &system_head, &thinking);
-    if (tool_schemas && tool_schemas[0]) {
-        buf_puts(&out, "<|im_start|>system\n");
-        append_kat_tools_prompt_text(&out, tool_schemas);
-        if (text_has_trimmed_content(first_content)) {
-            buf_puts(&out, "\n\n");
-            buf_puts(&out, first_content);
-        }
-        buf_puts(&out, "<|im_end|>\n");
-    } else if (text_has_trimmed_content(first_content)) {
-        buf_puts(&out, "<|im_start|>system\n");
-        buf_puts(&out, first_content);
-        buf_puts(&out, "<|im_end|>\n");
-    }
-    free(first_content);
-
-    for (int i = 0; i < msgs->len; i++) {
-        const chat_msg *m = &msgs->v[i];
-        if (role_is_system(m->role)) {
-            if (i < system_head) continue;
-            char *content = chat_content_text(m->content, true, &thinking);
-            buf_puts(&out, "<|im_start|>system\n");
-            buf_puts(&out, content);
-            buf_puts(&out, "<|im_end|>\n");
-            free(content);
-        } else if (!strcmp(m->role, "user")) {
-            char *content = chat_content_text(m->content, true, &thinking);
-            failures = 0;
-            buf_puts(&out, "<|im_start|>user\n");
-            buf_puts(&out, content);
-            buf_puts(&out, "<|im_end|>\n");
-            free(content);
-        } else if (!strcmp(m->role, "assistant")) {
-            char *reasoning = NULL;
-            char *content = assistant_message_parts(m, &reasoning);
-            bool keep_reasoning = (preserve_thinking || i > last_query) &&
-                                  text_has_trimmed_content(reasoning);
-            bool content_nonempty = text_has_trimmed_content(content);
-            buf_puts(&out, "<|im_start|>assistant\n");
-            if (keep_reasoning) {
-                buf_puts(&out, "<think>\n");
-                buf_puts(&out, reasoning);
-                buf_puts(&out, "\n</think>\n\n");
-            }
-            buf_puts(&out, content);
-            append_kat_tool_calls_text(&out, &m->calls, tool_orders,
-                                       content_nonempty);
-            buf_puts(&out, "<|im_end|>\n");
-            free(reasoning);
-            free(content);
-        } else if (!strcmp(m->role, "tool") || !strcmp(m->role, "function")) {
-            bool first = i == 0 || (strcmp(msgs->v[i - 1].role, "tool") &&
-                                    strcmp(msgs->v[i - 1].role, "function"));
-            bool last = i + 1 == msgs->len ||
-                        (strcmp(msgs->v[i + 1].role, "tool") &&
-                         strcmp(msgs->v[i + 1].role, "function"));
-            char *content = chat_content_text(m->content, false, NULL);
-            failures = tool_response_is_error(content) ? failures + 1 : 0;
-            if (first) buf_puts(&out, "<|im_start|>user");
-            buf_puts(&out, "\n<tool_response>\n");
-            buf_puts(&out, content);
-            append_tool_error_warning(&out, failures);
-            buf_puts(&out, "\n</tool_response>");
-            if (last) buf_puts(&out, "<|im_end|>\n");
-            free(content);
-        } else {
-            char *content = chat_content_text(m->content, false, NULL);
-            buf_puts(&out, "<|im_start|>user\n[");
-            buf_puts(&out, m->role);
-            buf_puts(&out, "]: ");
-            buf_puts(&out, content);
-            buf_puts(&out, "<|im_end|>\n");
-            free(content);
-        }
-    }
-
-    buf_puts(&out, "<|im_start|>assistant\n");
-    if (!thinking) buf_puts(&out, "<think>\n\n</think>\n\n");
-    else {
-        buf_puts(&out, "<think>\n");
-        if (think_mode == Q36_THINK_MAX) buf_puts(&out, q36_think_max_prefix());
-    }
-    return buf_take(&out);
-}
-
 static char *render_qwen_chat_prompt_text(const chat_msgs *msgs, const char *tool_schemas,
                                           const tool_schema_orders *tool_orders,
                                           q36_think_mode think_mode,
@@ -2875,29 +2748,15 @@ static char *render_qwen_chat_prompt_text(const chat_msgs *msgs, const char *too
     return buf_take(&out);
 }
 
-static char *render_chat_prompt_text_profile(const chat_msgs *msgs,
-                                             const char *tool_schemas,
-                                             const tool_schema_orders *tool_orders,
-                                             q36_think_mode think_mode,
-                                             bool kat_coder,
-                                             bool preserve_thinking) {
-    if (kat_coder) return render_kat_chat_prompt_text(msgs, tool_schemas, tool_orders,
-                                                      think_mode, preserve_thinking);
-    return render_qwen_chat_prompt_text(msgs, tool_schemas, tool_orders, think_mode,
-                                        preserve_thinking, NULL);
-}
-
 static char *render_chat_prompt_text_model(const chat_msgs *msgs,
                                            const char *tool_schemas,
                                            const tool_schema_orders *tool_orders,
                                            q36_think_mode think_mode,
-                                           bool kat_coder, bool qwen38,
+                                           bool qwen38,
                                            bool preserve_thinking) {
-    if (!qwen38) return render_chat_prompt_text_profile(
-        msgs, tool_schemas, tool_orders, think_mode, kat_coder, preserve_thinking);
     return render_qwen_chat_prompt_text(
         msgs, tool_schemas, tool_orders, think_mode, preserve_thinking,
-        q36_qwen38_effort_instruction(think_mode));
+        qwen38 ? q36_qwen38_effort_instruction(think_mode) : NULL);
 }
 
 #ifdef Q36_SERVER_TEST
@@ -3229,7 +3088,7 @@ static bool parse_chat_request(q36_engine *e, server *s, const char *body, int d
         chat_prompt_preserves_reasoning(&msgs, r->preserve_thinking);
     r->prompt_text = render_chat_prompt_text_model(
         &msgs, active_tool_schemas, &r->tool_orders, r->think_mode,
-        r->kat_coder, r->qwen38, r->preserve_thinking);
+        r->qwen38, r->preserve_thinking);
     request_note_tool_continuation(r, &msgs, active_tool_schemas);
     if (!request_tokenize_multimodal_prompt(e, s, r, &msgs, err, errlen)) goto image_error;
     chat_msgs_free(&msgs);
@@ -3619,7 +3478,7 @@ static bool parse_responses_request(q36_engine *e, server *s, const char *body,
         chat_prompt_preserves_reasoning(&msgs, r->preserve_thinking);
     r->prompt_text = render_chat_prompt_text_model(
         &msgs, active_tools, &r->tool_orders, r->think_mode,
-        r->kat_coder, r->qwen38, r->preserve_thinking);
+        r->qwen38, r->preserve_thinking);
     request_note_tool_continuation(r, &msgs, active_tools);
     if (!request_tokenize_multimodal_prompt(e, s, r, &msgs, err, errlen)) goto image_error;
     chat_msgs_free(&msgs);
@@ -3879,7 +3738,7 @@ static bool parse_anthropic_request(q36_engine *e, server *s, const char *body, 
         chat_prompt_preserves_reasoning(&msgs, r->preserve_thinking);
     r->prompt_text = render_chat_prompt_text_model(
         &msgs, active_tool_schemas, &r->tool_orders, r->think_mode,
-        r->kat_coder, r->qwen38, r->preserve_thinking);
+        r->qwen38, r->preserve_thinking);
     request_note_tool_continuation(r, &msgs, active_tool_schemas);
     if (!request_tokenize_multimodal_prompt(e, s, r, &msgs, err, errlen)) goto image_error;
     chat_msgs_free(&msgs);
@@ -4104,7 +3963,7 @@ static bool parse_completion_request(q36_engine *e, const char *body, int def_to
         think_mode_from_enabled(thinking_enabled,
             think_mode_from_budget(r, reasoning_effort)), ctx_size);
     r->prompt_text = render_chat_prompt_text_model(
-        &msgs, NULL, NULL, r->think_mode, r->kat_coder, r->qwen38,
+        &msgs, NULL, NULL, r->think_mode, r->qwen38,
         r->preserve_thinking);
     q36_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
     chat_msgs_free(&msgs);
@@ -8543,12 +8402,11 @@ static bool should_canonicalize_thinking_checkpoint(const request *r,
                                                     const thinking_state *thinking,
                                                     const char *finish) {
     if (!r || r->kind != REQ_CHAT) return false;
-    if (!r->kat_coder && !q36_think_mode_enabled(r->think_mode))
+    if (!q36_think_mode_enabled(r->think_mode))
         return !finish || (!strcmp(finish, "stop") &&
                            (!thinking || !thinking->inside));
-    if (r->has_tools && !r->kat_coder) return false;
+    if (r->has_tools) return false;
     if (r->prompt_preserves_reasoning) return false;
-    if (!q36_think_mode_enabled(r->think_mode)) return false;
     if (finish && (!strcmp(finish, "error") || !strcmp(finish, "length"))) return false;
     if (thinking && thinking->inside) return false;
     return true;
@@ -8916,17 +8774,6 @@ static void server_progress_cb(void *ud, const char *event, int current, int tot
 static char *build_tool_checkpoint_suffix(const request *r, const char *content,
                                           const char *reasoning, const tool_calls *calls) {
     buf suffix = {0};
-    if (r && r->kat_coder) {
-        if (q36_think_mode_enabled(r->think_mode)) {
-            buf_puts_trimmed(&suffix, reasoning);
-            buf_puts(&suffix, "\n</think>\n\n");
-        }
-        buf_puts_trimmed(&suffix, content);
-        append_kat_tool_calls_text(&suffix, calls, &r->tool_orders,
-                                   text_has_trimmed_content(content));
-        buf_puts(&suffix, "<|im_end|>\n");
-        return buf_take(&suffix);
-    }
     if (r && q36_think_mode_enabled(r->think_mode)) {
         buf_puts_trimmed(&suffix, reasoning);
         buf_puts(&suffix, "\n</think>\n\n");
@@ -9076,7 +8923,7 @@ static void canonicalize_tool_checkpoint(server *s, server_slot *slot,
     size_t prefix_len = strlen(j->req.prompt_text);
     const char *empty_think = "<think>\n\n</think>\n\n";
     size_t empty_len = strlen(empty_think);
-    bool strip_empty = !calls->replay_empty_think && !j->req.kat_coder &&
+    bool strip_empty = !calls->replay_empty_think &&
                        !q36_think_mode_enabled(j->req.think_mode) &&
                        prefix_len >= empty_len &&
                        !memcmp(j->req.prompt_text + prefix_len - empty_len,
@@ -9810,7 +9657,7 @@ static void generate_job(server *s, server_slot *slot, job *j) {
             /* Known tool IDs can replay Qwen's empty thinking prelude exactly,
              * preserving recurrent and vision state without a full rebuild. */
             parsed_calls.replay_empty_think = !s->disable_exact_tool_replay &&
-                !j->req.kat_coder && !q36_think_mode_enabled(j->req.think_mode);
+                !q36_think_mode_enabled(j->req.think_mode);
             tool_memory_remember(s, &parsed_calls);
             final_finish = "tool_calls";
         }
@@ -10217,10 +10064,10 @@ static void append_model_json_values(buf *b, int ctx, int default_tokens) {
 #endif
 
 static void append_model_json(buf *b, const server *s) {
-    const bool kat = q36_engine_is_kat_coder(s->engine);
     append_model_json_profile(b, q36_session_ctx(s->session), s->default_tokens,
                               q36_engine_model_name(s->engine),
-                              kat ? "KAT-Coder V2.5 Dev" : "Qwen 3.6 35B A3B");
+                              q36_engine_is_qwen38(s->engine) ?
+                              "Qwen 3.8 27B" : "Qwen 3.6 35B A3B");
 }
 
 static bool send_model(server *s, int fd) {
@@ -10573,9 +10420,8 @@ static void usage(FILE *fp) {
         "  Only reasoning_effort=max or output_config.effort=max requests Think Max.\n"
         "  Think Max requires --ctx >= 98304; smaller contexts use high.\n"
         "  thinking={type:disabled}, think=false, chat_template_kwargs.enable_thinking=false, or a -nothink model alias selects non-thinking mode.\n"
-        "  Qwen and KAT-Coder preserve prior thinking by default; chat_template_kwargs.preserve_thinking=false strips it.\n"
+        "  Qwen models preserve prior thinking by default; chat_template_kwargs.preserve_thinking=false strips it.\n"
         "  Qwen defaults are temperature=1, top_k=0, top_p=1, min_p=0.05.\n"
-        "  KAT defaults are temperature=0.7, top_k=20, top_p=0.8, min_p=0.05.\n"
         "  Model defaults apply only to omitted sampling knobs; explicit client values win.\n"
         "\n"
         "Disk KV cache:\n"
@@ -11879,15 +11725,15 @@ static void test_qwen38_effort_prompt(void) {
     chat_msgs_push(&msgs, (chat_msg){.role = xstrdup("user"),
                                      .content = xstrdup("Hello")});
     char *low = render_chat_prompt_text_model(&msgs, NULL, NULL,
-        Q36_THINK_LOW, false, true, true);
+        Q36_THINK_LOW, true, true);
     char *medium = render_chat_prompt_text_model(&msgs, NULL, NULL,
-        Q36_THINK_MEDIUM, false, true, true);
+        Q36_THINK_MEDIUM, true, true);
     char *xhigh = render_chat_prompt_text_model(&msgs, NULL, NULL,
-        Q36_THINK_XHIGH, false, true, true);
+        Q36_THINK_XHIGH, true, true);
     char *off = render_chat_prompt_text_model(&msgs, NULL, NULL,
-        Q36_THINK_NONE, false, true, true);
+        Q36_THINK_NONE, true, true);
     char *moe = render_chat_prompt_text_model(&msgs, NULL, NULL,
-        Q36_THINK_LOW, false, false, true);
+        Q36_THINK_LOW, false, true);
     TEST_ASSERT(strstr(low, "<|im_start|>system\nReasoning effort is set to low.") == low);
     TEST_ASSERT(strstr(low, "\n\nBe precise.<|im_end|>") != NULL);
     TEST_ASSERT(strstr(medium, "Reasoning effort is set to") == NULL);
@@ -11956,7 +11802,7 @@ static void test_render_drops_old_reasoning_without_tools(void) {
     user2.content = xstrdup("second");
     chat_msgs_push(&msgs, user2);
 
-    char *prompt = render_chat_prompt_text_profile(
+    char *prompt = render_chat_prompt_text_model(
         &msgs, NULL, NULL, Q36_THINK_HIGH, false, false);
     TEST_ASSERT(prompt != NULL);
     TEST_ASSERT(strstr(prompt, "old hidden reasoning") == NULL);
@@ -13433,7 +13279,7 @@ static void test_thinking_checkpoint_canonical_matches_future_prompt(void) {
     chat_msgs_push(&prefix_msgs, user1);
 
     /* This is what prompt_text looks like for the first generation */
-    char *prompt_text = render_chat_prompt_text_profile(
+    char *prompt_text = render_chat_prompt_text_model(
         &prefix_msgs, NULL, NULL, Q36_THINK_HIGH, false, false);
     /* prompt_text should end with <think> and its canonical newline. */
     size_t pt_len = strlen(prompt_text);
@@ -13468,7 +13314,7 @@ static void test_thinking_checkpoint_canonical_matches_future_prompt(void) {
     h_user2.content = xstrdup("Thanks!");
     chat_msgs_push(&history_msgs, h_user2);
 
-    char *future_prompt = render_chat_prompt_text_profile(
+    char *future_prompt = render_chat_prompt_text_model(
         &history_msgs, NULL, NULL, Q36_THINK_HIGH, false, false);
 
     /* The future prompt should START with our canonical text */
@@ -13503,7 +13349,7 @@ static void test_thinking_canonical_empty_content(void) {
     user.content = xstrdup("Think about life");
     chat_msgs_push(&msgs, user);
 
-    char *prompt_text = render_chat_prompt_text_profile(
+    char *prompt_text = render_chat_prompt_text_model(
         &msgs, NULL, NULL, Q36_THINK_HIGH, false, false);
     size_t pt_len = strlen(prompt_text);
 
@@ -13529,7 +13375,7 @@ static void test_thinking_canonical_empty_content(void) {
     h_u2.content = xstrdup("Continue");
     chat_msgs_push(&history, h_u2);
 
-    char *future = render_chat_prompt_text_profile(
+    char *future = render_chat_prompt_text_model(
         &history, NULL, NULL, Q36_THINK_HIGH, false, false);
     TEST_ASSERT(strlen(future) > canonical.len);
     TEST_ASSERT(!memcmp(future, canonical.ptr, canonical.len));
@@ -13564,7 +13410,7 @@ static void test_thinking_canonical_multi_turn(void) {
     chat_msgs_push(&turn2_prefix, u2);
 
     /* prompt_text for the 2nd generation (includes 1st assistant turn) */
-    char *prompt_text = render_chat_prompt_text_profile(
+    char *prompt_text = render_chat_prompt_text_model(
         &turn2_prefix, NULL, NULL, Q36_THINK_HIGH, false, false);
     size_t pt_len = strlen(prompt_text);
     TEST_ASSERT(!memcmp(prompt_text + pt_len - 8, "<think>\n", 8));
@@ -13597,7 +13443,7 @@ static void test_thinking_canonical_multi_turn(void) {
     chat_msg fu3 = {0}; fu3.role = xstrdup("user"); fu3.content = xstrdup("Great");
     chat_msgs_push(&future_msgs, fu3);
 
-    char *future = render_chat_prompt_text_profile(
+    char *future = render_chat_prompt_text_model(
         &future_msgs, NULL, NULL, Q36_THINK_HIGH, false, false);
     /* Both reasonings dropped */
     TEST_ASSERT(strstr(future, "first reasoning") == NULL);
@@ -13673,133 +13519,48 @@ static void test_thinking_canonical_non_thinking_mode_noop(void) {
     chat_msgs_free(&msgs);
 }
 
-static void test_kat_template_thinking_controls(void) {
+static void test_fixed_template_inline_controls(void) {
     chat_msgs msgs = {0};
-    chat_msg system = {.role = xstrdup("system"), .content = xstrdup("  sys  ")};
-    chat_msg user = {.role = xstrdup("user"), .content = xstrdup("  hello  ")};
+    chat_msg system = {
+        .role = xstrdup("system"),
+        .content = xstrdup("sys <|think_off|>"),
+    };
+    chat_msg user = {
+        .role = xstrdup("user"),
+        .content = xstrdup("hello"),
+    };
     chat_msgs_push(&msgs, system);
     chat_msgs_push(&msgs, user);
 
-    char *prompt = render_chat_prompt_text_profile(
-        &msgs, NULL, NULL, Q36_THINK_HIGH, true, false);
-    TEST_ASSERT(!strcmp(prompt,
-        "<|im_start|>system\nsys<|im_end|>\n"
-        "<|im_start|>user\nhello<|im_end|>\n"
-        "<|im_start|>assistant\n<think>\n"));
-    free(prompt);
-
-    prompt = render_chat_prompt_text_profile(
-        &msgs, NULL, NULL, Q36_THINK_NONE, true, false);
-    TEST_ASSERT(strstr(prompt,
-        "<|im_start|>assistant\n<think>\n\n</think>\n\n") != NULL);
-    TEST_ASSERT(strstr(prompt, "<|im_start|>assistant\n</think>") == NULL);
+    bool thinking = true;
+    apply_chat_thinking_controls(&msgs, &thinking);
+    TEST_ASSERT(!thinking);
+    char *prompt = render_chat_prompt_text_model(
+        &msgs, NULL, NULL, Q36_THINK_HIGH, false, true);
+    TEST_ASSERT(strstr(prompt, "think_off") == NULL);
+    TEST_ASSERT(strstr(prompt, "system\nsys<|im_end|>") != NULL);
+    TEST_ASSERT(strstr(prompt, "<|im_start|>assistant\n<think>\n\n</think>\n\n") != NULL);
     free(prompt);
     chat_msgs_free(&msgs);
-}
 
-static void test_kat_template_preserve_thinking(void) {
-    chat_msgs msgs = {0};
-    chat_msg user1 = {.role = xstrdup("user"), .content = xstrdup("first")};
-    chat_msg assistant = {
-        .role = xstrdup("assistant"),
-        .content = xstrdup("answer"),
-        .reasoning = xstrdup("old reasoning"),
+    msgs = (chat_msgs){0};
+    system = (chat_msg){
+        .role = xstrdup("system"),
+        .content = xstrdup("  <|think_off|>  "),
     };
-    chat_msg user2 = {.role = xstrdup("user"), .content = xstrdup("next")};
-    chat_msgs_push(&msgs, user1);
-    chat_msgs_push(&msgs, assistant);
-    chat_msgs_push(&msgs, user2);
-
-    char *prompt = render_chat_prompt_text_profile(
-        &msgs, NULL, NULL, Q36_THINK_HIGH, true, false);
-    TEST_ASSERT(strstr(prompt, "old reasoning") == NULL);
-    TEST_ASSERT(strstr(prompt, "<|im_start|>assistant\nanswer<|im_end|>") != NULL);
-    free(prompt);
-
-    prompt = render_chat_prompt_text_profile(
-        &msgs, NULL, NULL, Q36_THINK_HIGH, true, true);
-    TEST_ASSERT(strstr(prompt,
-        "<|im_start|>assistant\n<think>\nold reasoning\n</think>\n\nanswer<|im_end|>") != NULL);
-    free(prompt);
-    chat_msgs_free(&msgs);
-}
-
-static void test_kat_template_tool_round(void) {
-    chat_msgs msgs = {0};
-    chat_msg user = {.role = xstrdup("user"), .content = xstrdup("inspect")};
-    chat_msg assistant = {
-        .role = xstrdup("assistant"),
-        .reasoning = xstrdup("need reads"),
+    user = (chat_msg){
+        .role = xstrdup("user"),
+        .content = xstrdup("hello"),
     };
-    tool_call call = {
-        .name = xstrdup("read"),
-        .arguments = xstrdup("{\"path\":\"a.c\"}"),
-    };
-    tool_calls_push(&assistant.calls, call);
-    chat_msg tool1 = {.role = xstrdup("tool"), .content = xstrdup("one")};
-    chat_msg tool2 = {.role = xstrdup("tool"), .content = xstrdup("two")};
+    chat_msgs_push(&msgs, system);
     chat_msgs_push(&msgs, user);
-    chat_msgs_push(&msgs, assistant);
-    chat_msgs_push(&msgs, tool1);
-    chat_msgs_push(&msgs, tool2);
-
-    char *prompt = render_chat_prompt_text_profile(
-        &msgs, "{\"name\":\"read\"}", NULL, Q36_THINK_HIGH, true, false);
-    TEST_ASSERT(strstr(prompt, "<IMPORTANT>\nReminder:") != NULL);
-    TEST_ASSERT(strstr(prompt, "Do NOT nest <tool_call> blocks.") != NULL);
-    TEST_ASSERT(strstr(prompt,
-        "<think>\nneed reads\n</think>\n\n<tool_call>\n<function=read>") != NULL);
-    TEST_ASSERT(strstr(prompt,
-        "<|im_start|>user\n<tool_response>\none\n</tool_response>"
-        "\n<tool_response>\ntwo\n</tool_response><|im_end|>\n") != NULL);
+    prompt = render_chat_prompt_text_model(
+        &msgs, NULL, NULL, Q36_THINK_HIGH, false, true);
+    TEST_ASSERT(!strncmp(prompt, "<|im_start|>user\nhello",
+                         strlen("<|im_start|>user\nhello")));
+    TEST_ASSERT(strstr(prompt, "<|im_start|>system") == NULL);
     free(prompt);
     chat_msgs_free(&msgs);
-}
-
-static void test_fixed_template_inline_controls(void) {
-    for (int kat = 0; kat < 2; kat++) {
-        chat_msgs msgs = {0};
-        chat_msg system = {
-            .role = xstrdup("system"),
-            .content = xstrdup("sys <|think_off|>"),
-        };
-        chat_msg user = {
-            .role = xstrdup("user"),
-            .content = xstrdup("hello"),
-        };
-        chat_msgs_push(&msgs, system);
-        chat_msgs_push(&msgs, user);
-
-        bool thinking = true;
-        apply_chat_thinking_controls(&msgs, &thinking);
-        TEST_ASSERT(!thinking);
-        char *prompt = render_chat_prompt_text_profile(
-            &msgs, NULL, NULL, Q36_THINK_HIGH, kat, true);
-        TEST_ASSERT(strstr(prompt, "think_off") == NULL);
-        TEST_ASSERT(strstr(prompt, "system\nsys<|im_end|>") != NULL);
-        TEST_ASSERT(strstr(prompt, "<|im_start|>assistant\n<think>\n\n</think>\n\n") != NULL);
-        free(prompt);
-        chat_msgs_free(&msgs);
-
-        msgs = (chat_msgs){0};
-        system = (chat_msg){
-            .role = xstrdup("system"),
-            .content = xstrdup("  <|think_off|>  "),
-        };
-        user = (chat_msg){
-            .role = xstrdup("user"),
-            .content = xstrdup("hello"),
-        };
-        chat_msgs_push(&msgs, system);
-        chat_msgs_push(&msgs, user);
-        prompt = render_chat_prompt_text_profile(
-            &msgs, NULL, NULL, Q36_THINK_HIGH, kat, true);
-        TEST_ASSERT(!strncmp(prompt, "<|im_start|>user\nhello",
-                             strlen("<|im_start|>user\nhello")));
-        TEST_ASSERT(strstr(prompt, "<|im_start|>system") == NULL);
-        free(prompt);
-        chat_msgs_free(&msgs);
-    }
 }
 
 static void test_fixed_template_chronological_system_messages(void) {
@@ -13849,33 +13610,31 @@ static void test_fixed_template_chronological_system_messages(void) {
 }
 
 static void test_fixed_template_tool_error_recovery(void) {
-    for (int kat = 0; kat < 2; kat++) {
-        chat_msgs msgs = {0};
-        chat_msg user = {.role = xstrdup("user"), .content = xstrdup("run")};
-        chat_msg tool1 = {.role = xstrdup("tool"), .content = xstrdup("Error: bad argument")};
-        chat_msg tool2 = {.role = xstrdup("tool"), .content = xstrdup("failed to open")};
-        chat_msgs_push(&msgs, user);
-        chat_msgs_push(&msgs, tool1);
-        chat_msgs_push(&msgs, tool2);
+    chat_msgs msgs = {0};
+    chat_msg user = {.role = xstrdup("user"), .content = xstrdup("run")};
+    chat_msg tool1 = {.role = xstrdup("tool"), .content = xstrdup("Error: bad argument")};
+    chat_msg tool2 = {.role = xstrdup("tool"), .content = xstrdup("failed to open")};
+    chat_msgs_push(&msgs, user);
+    chat_msgs_push(&msgs, tool1);
+    chat_msgs_push(&msgs, tool2);
 
-        char *prompt = render_chat_prompt_text_profile(
-            &msgs, NULL, NULL, Q36_THINK_HIGH, kat, true);
-        TEST_ASSERT(strstr(prompt,
-            "⚠️ SYSTEM WARNING: The previous tool call returned an error. "
-            "Diagnose the failure and retry with completely corrected arguments.") != NULL);
-        TEST_ASSERT(strstr(prompt,
-            "⚠️ SYSTEM WARNING: 2 consecutive tool errors detected. "
-            "Your previous approach is incorrect. You MUST use a fundamentally "
-            "different approach or corrected arguments.") != NULL);
-        TEST_ASSERT(strstr(prompt,
-            "<|im_start|>assistant\n<think>\n") != NULL);
-        TEST_ASSERT(strstr(prompt,
-            "<|im_start|>assistant\n<think>\n\n</think>\n\n") == NULL);
-        TEST_ASSERT(strstr(prompt,
-            "</tool_response>\n<tool_response>") != NULL);
-        free(prompt);
-        chat_msgs_free(&msgs);
-    }
+    char *prompt = render_chat_prompt_text_model(
+        &msgs, NULL, NULL, Q36_THINK_HIGH, false, true);
+    TEST_ASSERT(strstr(prompt,
+        "⚠️ SYSTEM WARNING: The previous tool call returned an error. "
+        "Diagnose the failure and retry with completely corrected arguments.") != NULL);
+    TEST_ASSERT(strstr(prompt,
+        "⚠️ SYSTEM WARNING: 2 consecutive tool errors detected. "
+        "Your previous approach is incorrect. You MUST use a fundamentally "
+        "different approach or corrected arguments.") != NULL);
+    TEST_ASSERT(strstr(prompt,
+        "<|im_start|>assistant\n<think>\n") != NULL);
+    TEST_ASSERT(strstr(prompt,
+        "<|im_start|>assistant\n<think>\n\n</think>\n\n") == NULL);
+    TEST_ASSERT(strstr(prompt,
+        "</tool_response>\n<tool_response>") != NULL);
+    free(prompt);
+    chat_msgs_free(&msgs);
 
     TEST_ASSERT(!tool_response_is_error("{\"error_count\": 0, \"result\": \"ok\"}"));
     TEST_ASSERT(!tool_response_is_error("{\"error\": null, \"result\": \"ok\"}"));
@@ -14509,9 +14268,6 @@ static void q36_server_unit_tests_run(void) {
     test_thinking_canonical_multi_turn();
     test_thinking_canonical_with_tools_preserves_reasoning();
     test_thinking_canonical_non_thinking_mode_noop();
-    test_kat_template_thinking_controls();
-    test_kat_template_preserve_thinking();
-    test_kat_template_tool_round();
     test_fixed_template_inline_controls();
     test_fixed_template_chronological_system_messages();
     test_fixed_template_tool_error_recovery();

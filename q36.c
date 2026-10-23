@@ -617,7 +617,6 @@ struct q36_engine {
     bool ssd_streaming_full_layers_set;
     bool mtp_ready;
     bool vision_ready;
-    bool kat_coder;
     bool gsq_rco;
     q36_variant variant;
 };
@@ -10619,8 +10618,6 @@ int q36_engine_open(q36_engine **out, const q36_engine_options *opt) {
     {
         q36_str name = {0};
         if (model_get_string(&e->model, "general.name", &name)) {
-            e->kat_coder = q36_str_contains(name, "KAT Coder") ||
-                           q36_str_contains(name, "KAT-Coder");
             e->gsq_rco = q36_str_contains(name, "GSQ-RCO");
         }
     }
@@ -10666,7 +10663,7 @@ int q36_engine_open(q36_engine **out, const q36_engine_options *opt) {
         fprintf(stderr, "q36: vision sidecar mapped from disk: %s\n", opt->vision_path);
     }
     if (Q36_MODEL_DENSE && e->ssd_streaming) {
-        fprintf(stderr, "q36: Qwen3.6 27B dense does not use expert SSD streaming\n");
+        fprintf(stderr, "q36: Qwen3.8 27B dense does not use expert SSD streaming\n");
         q36_engine_close(e);
         return 1;
     }
@@ -10992,13 +10989,11 @@ int q36_engine_set_power(q36_engine *e, int power_percent) {
 }
 
 const char *q36_engine_model_name(q36_engine *e) {
-    if (e && e->kat_coder) return "kat-coder-v2.5-dev";
-    if (e && e->variant == Q36_VARIANT_27B) return "qwen3.6-27b";
+    if (e && e->variant == Q36_VARIANT_27B) return "qwen3.8-27b";
     return "qwen3.6-35b-a3b";
 }
 
 int q36_engine_model_id(q36_engine *e) {
-    if (e && e->kat_coder) return 2;
     /* Different dense weights must never restore each other's KV state. */
     if (e && e->variant == Q36_VARIANT_27B && e->gsq_rco) return 4;
     return e && e->variant == Q36_VARIANT_27B ? 3 : 1;
@@ -11008,22 +11003,14 @@ bool q36_engine_is_qwen38(q36_engine *e) {
     return e && e->variant == Q36_VARIANT_27B;
 }
 
-bool q36_engine_is_kat_coder(q36_engine *e) {
-    return e && e->kat_coder;
-}
-
 void q36_engine_sampling_defaults(q36_engine *e, float *temperature,
                                   int *top_k, float *top_p, float *min_p) {
+    (void)e;
     if (!temperature || !top_k || !top_p || !min_p) return;
     *temperature = Q36_DEFAULT_TEMPERATURE;
     *top_k = 0;
     *top_p = Q36_DEFAULT_TOP_P;
     *min_p = Q36_DEFAULT_MIN_P;
-    if (!e || !e->kat_coder) return;
-    *temperature = 0.7f;
-    *top_k = 20;
-    *top_p = 0.8f;
-    *min_p = 0.05f;
 }
 
 int q36_inspect_model(const char *model_path) {

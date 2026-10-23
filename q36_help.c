@@ -205,7 +205,7 @@ static void print_sampling(FILE *fp, const help_colors *c, bool full) {
     opt(fp, c, "--think", "Use normal thinking mode.");
     opt(fp, c, "--think-max", "Use Think Max with at least 98304 context tokens.");
     opt(fp, c, "--nothink", "Disable thinking and ask for direct replies.");
-    para(fp, c, "Qwen defaults to temp=1, top-k=0, top-p=1, min-p=0.05. KAT defaults to 0.7/20/0.8/0.05. Eval always defaults to Qwen sampling. Explicit options win.");
+    para(fp, c, "Sampling defaults to temp=1, top-k=0, top-p=1, min-p=0.05. Explicit options win.");
     if (full) {
         opt(fp, c, "-sys, --system TEXT", "System prompt. Empty string disables the default where supported.");
         opt(fp, c, "-p, --prompt TEXT", "One-shot prompt text.");
@@ -312,7 +312,7 @@ static void print_server_api(FILE *fp, const help_colors *c) {
     opt(fp, c, "--cors", "Add Access-Control-Allow-* headers for browser JS clients.");
     opt(fp, c, "--trace FILE", "Write prompts, cache decisions, output, and tool calls.");
     para(fp, c, "Endpoints: /v1/chat/completions, /v1/responses, /v1/completions, and /v1/messages.");
-    para(fp, c, "The model ID follows the loaded GGUF: qwen3.6-35b-a3b or kat-coder-v2.5-dev.");
+    para(fp, c, "The model ID follows the loaded GGUF: qwen3.6-35b-a3b or qwen3.8-27b.");
     fputc('\n', fp);
 }
 

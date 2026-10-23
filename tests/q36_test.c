@@ -7847,116 +7847,6 @@ static void test_qwen_tool_call_format(void) {
     fprintf(stderr, "q36-test: Qwen tool format round-trip test passed\n");
 }
 
-static void test_kat_model_support(void) {
-    const char *path = getenv("Q36_TEST_KAT");
-    if (!path || !path[0]) {
-        path = "gguf/KAT-Coder-V2.5-Dev-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-imatrix.gguf";
-    }
-    if (!test_model_available(path)) {
-        test_skip("kat-model-support", "model file not found");
-        return;
-    }
-
-    q36_engine *engine = NULL;
-    q36_engine_options opt = {.model_path = path, .backend = Q36_BACKEND_CPU};
-    TEST_ASSERT(q36_engine_open(&engine, &opt) == 0);
-    if (!engine) return;
-    TEST_ASSERT(q36_engine_is_kat_coder(engine));
-    TEST_ASSERT(q36_engine_model_id(engine) == 2);
-    TEST_ASSERT(!strcmp(q36_engine_model_name(engine), "kat-coder-v2.5-dev"));
-
-    static const char *specials[] = {
-        "<tool_call>", "</tool_call>",
-        "<tool_response>", "</tool_response>",
-        "<think>", "</think>", "<|fim_prefix|>",
-    };
-    buf rendered = {0};
-    for (size_t i = 0; i < sizeof(specials) / sizeof(specials[0]); i++)
-        buf_puts(&rendered, specials[i]);
-    q36_tokens tokens = {0};
-    q36_tokenize_rendered_chat(engine, rendered.ptr, &tokens);
-    TEST_ASSERT(tokens.len == (int)(sizeof(specials) / sizeof(specials[0])));
-    for (int i = 0; i < tokens.len; i++) {
-        char *piece = q36_token_text(engine, tokens.v[i], NULL);
-        TEST_ASSERT(!strcmp(piece, specials[i]));
-        free(piece);
-    }
-
-    request request = {0};
-    char err[160] = {0};
-    const char *body =
-        "{\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],"
-        "\"presence_penalty\":1.5,"
-        "\"chat_template_kwargs\":{\"enable_thinking\":false,"
-        "\"preserve_thinking\":true}}";
-    TEST_ASSERT(parse_chat_request(engine, NULL, body, 128, 4096,
-                                   &request, err, sizeof(err)));
-    TEST_ASSERT(request.kat_coder);
-    TEST_ASSERT(request.think_mode == Q36_THINK_NONE);
-    TEST_ASSERT(request.preserve_thinking);
-    TEST_ASSERT(request.presence_penalty == 1.5f);
-    TEST_ASSERT(!strcmp(request.model, "kat-coder-v2.5-dev"));
-    TEST_ASSERT(strstr(request.prompt_text,
-        "<|im_start|>assistant\n<think>\n\n</think>\n\n") != NULL);
-    float temperature, top_p, min_p;
-    int top_k;
-    request_apply_model_sampling_defaults(engine, &request);
-    request_sampling(&request, &temperature, &top_k, &top_p, &min_p);
-    TEST_ASSERT(temperature == 0.7f);
-    TEST_ASSERT(top_k == 20);
-    TEST_ASSERT(top_p == 0.8f);
-    TEST_ASSERT(min_p == 0.05f);
-    request_free(&request);
-
-    q36_engine_sampling_defaults(engine, &temperature, &top_k, &top_p, &min_p);
-    TEST_ASSERT(temperature == 0.7f);
-    TEST_ASSERT(top_k == 20);
-    TEST_ASSERT(top_p == 0.8f);
-    TEST_ASSERT(min_p == 0.05f);
-
-    const char *override_body =
-        "{\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],"
-        "\"temperature\":0.2,\"top_k\":7,\"top_p\":0.6,\"min_p\":0.01}";
-    TEST_ASSERT(parse_chat_request(engine, NULL, override_body, 128, 4096,
-                                   &request, err, sizeof(err)));
-    request_apply_model_sampling_defaults(engine, &request);
-    request_sampling(&request, &temperature, &top_k, &top_p, &min_p);
-    TEST_ASSERT(temperature == 0.2f);
-    TEST_ASSERT(top_k == 7);
-    TEST_ASSERT(top_p == 0.6f);
-    TEST_ASSERT(min_p == 0.01f);
-    request_free(&request);
-
-    q36_tokens direct = {0};
-    q36_encode_chat_prompt(engine, " system ", " user ", Q36_THINK_NONE, &direct);
-    TEST_ASSERT(direct.len > 0);
-    char *first = q36_token_text(engine, direct.v[0], NULL);
-    TEST_ASSERT(!strcmp(first, "<|im_start|>"));
-    free(first);
-    q36_tokens_free(&direct);
-
-    q36_encode_chat_prompt(engine, " <|think_off|> ", "user",
-                           Q36_THINK_HIGH, &direct);
-    buf direct_text = {0};
-    for (int i = 0; i < direct.len; i++) {
-        size_t len = 0;
-        char *piece = q36_token_text(engine, direct.v[i], &len);
-        buf_append(&direct_text, piece, len);
-        free(piece);
-    }
-    TEST_ASSERT(strstr(direct_text.ptr, "<|im_start|>system") == NULL);
-    TEST_ASSERT(!strncmp(direct_text.ptr, "<|im_start|>user\nuser",
-                         strlen("<|im_start|>user\nuser")));
-    TEST_ASSERT(strstr(direct_text.ptr,
-        "<|im_start|>assistant\n<think>\n\n</think>\n\n") != NULL);
-    buf_free(&direct_text);
-    q36_tokens_free(&direct);
-
-    q36_tokens_free(&tokens);
-    buf_free(&rendered);
-    q36_engine_close(engine);
-}
-
 static void test_qwen_tool_call_quality(void) {
     if (!test_model_available(test_model_path())) {
         test_skip("qwen-tool-call-quality", "model file not found");
@@ -8491,6 +8381,7 @@ static void test_dense_model_identity(void) {
         TEST_ASSERT(engine != NULL);
         if (!engine) return;
         TEST_ASSERT(q36_engine_is_qwen38(engine));
+        TEST_ASSERT(!strcmp(q36_engine_model_name(engine), "qwen3.8-27b"));
         ids[i] = q36_engine_model_id(engine);
         q36_engine_close(engine);
     }
@@ -8530,7 +8421,6 @@ static const q36_test_entry test_entries[] = {
     {"--mtp-verifier", "mtp-verifier", "exact MTP acceptance, recurrent rollback and checkpoint restore", test_mtp_verifier_replay},
     {"--mtp-opportunistic", "mtp-opportunistic", "sampled block seeds, greedy tails and exact target state", test_mtp_opportunistic},
     {"--qwen-tool-call-format", "qwen-tool-call-format", "Qwen tool-call rendering format unit test", test_qwen_tool_call_format},
-    {"--kat-model-support", "kat-model-support", "KAT model identity and special tokenizer tokens", test_kat_model_support},
     {"--vector-fixtures", "vector-fixtures", "llama.cpp fixture consistency check", test_vector_fixtures},
     {"--logprob-vectors", "logprob-vectors", "reference top-logprob vector comparison", test_logprob_vectors},
 #ifdef Q36_WITH_LLAMA

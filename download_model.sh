@@ -2,12 +2,10 @@
 set -e
 
 REPO="Ninnix96/Qwen3.6-35B-A3B-gguf"
-KAT_REPO="Ninnix96/KAT-Coder-V2.5-Dev-gguf"
 DENSE_REPO="unsloth/Qwen3.8-27B-GGUF"
 DENSE_SMALL_REPO="ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF"
 VISION_REPO="unsloth/Qwen3.6-35B-A3B-GGUF"
 Q2_FILE="Qwen3.6-35B-A3B-IQ2XXS-Q2K-Q8.gguf"
-KAT_FILE="KAT-Coder-V2.5-Dev-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-imatrix.gguf"
 DENSE_FILE="Qwen3.8-27B-UD-IQ3_S.gguf"
 DENSE_SMALL_FILE="Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf"
 VISION_REMOTE="mmproj-F16.gguf"
@@ -28,7 +26,6 @@ QuarkStar GGUF downloader
 
 Usage:
   ./download_model.sh q2 [--token TOKEN]
-  ./download_model.sh kat-coder [--token TOKEN]
   ./download_model.sh 27b [--token TOKEN]
   ./download_model.sh 27b-iq3-xxs [--token TOKEN]
   ./download_model.sh qwen36-vision [--token TOKEN]
@@ -41,10 +38,6 @@ Targets:
        The rest of the tensors are left at higher precision. This model
        fits a BC-250 with 16 GB of unified GDDR6 fully resident.
        Includes a 333 MB MTP head; enable it with --mtp.
-
-  kat-coder
-       KAT-Coder V2.5 Dev IQ2_XXS imatrix quant from $KAT_REPO,
-       about 11 GB on disk.
 
   27b
        Dense Qwen3.8 27B Dynamic 3.0 IQ3_S quant from $DENSE_REPO.
@@ -97,7 +90,6 @@ MODEL_REMOTE=
 
 case "$MODEL" in
     q2) MODEL_FILE=$Q2_FILE ;;
-    kat-coder) MODEL_REPO=$KAT_REPO; MODEL_FILE=$KAT_FILE ;;
     27b) MODEL_REPO=$DENSE_REPO; MODEL_FILE=$DENSE_FILE ;;
     27b-iq3-xxs) MODEL_REPO=$DENSE_SMALL_REPO; MODEL_FILE=$DENSE_SMALL_FILE ;;
     qwen36-vision)
