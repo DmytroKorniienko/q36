@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Generate an SVG throughput graph from a ds4-bench CSV file.
+"""Generate an SVG throughput graph from a q36-bench CSV file.
 
 The benchmark intentionally reports instantaneous throughput at each context
 frontier. This script keeps the plot equally direct: one line for incremental
-prefill t/s, one line for greedy generation t/s, and separate y axes because
-the two values live on very different scales.
+prefill t/s, one line for greedy generation t/s, and optional MTP generation.
+Prefill and generation use separate y axes because their scales differ.
 """
 
 import argparse
@@ -16,6 +16,7 @@ from pathlib import Path
 
 PREFILL_COLOR = "#2563eb"
 GEN_COLOR = "#dc2626"
+MTP_COLOR = "#16a34a"
 TEXT_COLOR = "#1f2933"
 MUTED_COLOR = "#64748b"
 GRID_COLOR = "#e2e8f0"
@@ -98,7 +99,7 @@ def points_to_polyline(points, x_min, x_max, y_max, plot):
     return " ".join(project(point) for point in points)
 
 
-def render_svg(rows, title, width, height):
+def render_svg(rows, title, width, height, mtp_rows=None):
     margin_left = 82
     margin_right = 82
     margin_top = 66
@@ -116,6 +117,9 @@ def render_svg(rows, title, width, height):
     ctx_values = [row[0] for row in rows]
     prefill_values = [row[1] for row in rows]
     gen_values = [row[2] for row in rows]
+    if mtp_rows:
+        gen_values.extend(row[2] for row in mtp_rows)
+    gen_label = "decode" if mtp_rows else "generation"
     x_min = 0
     x_max = max(ctx_values)
     prefill_max = nice_ceil(max(prefill_values) * 1.05)
@@ -175,23 +179,33 @@ def render_svg(rows, title, width, height):
             f'<line x1="{left}" y1="{bottom}" x2="{right}" y2="{bottom}" stroke="{AXIS_COLOR}" stroke-width="1.4"/>',
             f'<text class="axis-label" x="{width / 2:.1f}" y="{height - 20}" text-anchor="middle">ctx size</text>',
             f'<text class="axis-label" x="22" y="{top + plot_height / 2:.1f}" text-anchor="middle" transform="rotate(-90 22 {top + plot_height / 2:.1f})">prefill t/s</text>',
-            f'<text class="axis-label" x="{width - 22}" y="{top + plot_height / 2:.1f}" text-anchor="middle" transform="rotate(90 {width - 22} {top + plot_height / 2:.1f})">generation t/s</text>',
+            f'<text class="axis-label" x="{width - 22}" y="{top + plot_height / 2:.1f}" text-anchor="middle" transform="rotate(90 {width - 22} {top + plot_height / 2:.1f})">{gen_label} t/s</text>',
             f'<polyline fill="none" stroke="{PREFILL_COLOR}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" points="{prefill_poly}"/>',
             f'<polyline fill="none" stroke="{GEN_COLOR}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" points="{gen_poly}"/>',
         ]
     )
+    if mtp_rows:
+        mtp_points = [(row[0], row[2]) for row in mtp_rows]
+        mtp_poly = points_to_polyline(mtp_points, x_min, x_max, gen_max, plot)
+        parts.append(f'<polyline fill="none" stroke="{MTP_COLOR}" stroke-width="3" stroke-dasharray="8 5" stroke-linecap="round" stroke-linejoin="round" points="{mtp_poly}"/>')
 
     legend_x = right - 170
     legend_y = top + 18
+    legend_height = 88 if mtp_rows else 62
     parts.extend(
         [
-            f'<rect x="{legend_x - 14}" y="{legend_y - 18}" width="176" height="62" rx="6" fill="#ffffff" stroke="#cbd5e1"/>',
+            f'<rect x="{legend_x - 14}" y="{legend_y - 18}" width="176" height="{legend_height}" rx="6" fill="#ffffff" stroke="#cbd5e1"/>',
             f'<rect x="{legend_x}" y="{legend_y - 6}" width="12" height="12" fill="{PREFILL_COLOR}"/>',
             f'<text class="legend" x="{legend_x + 22}" y="{legend_y + 5}">prefill</text>',
             f'<rect x="{legend_x}" y="{legend_y + 20}" width="12" height="12" fill="{GEN_COLOR}"/>',
-            f'<text class="legend" x="{legend_x + 22}" y="{legend_y + 31}">generation</text>',
+            f'<text class="legend" x="{legend_x + 22}" y="{legend_y + 31}">{gen_label}</text>',
         ]
     )
+    if mtp_rows:
+        parts.extend([
+            f'<rect x="{legend_x}" y="{legend_y + 46}" width="12" height="12" fill="{MTP_COLOR}"/>',
+            f'<text class="legend" x="{legend_x + 22}" y="{legend_y + 57}">MTP decode</text>',
+        ])
 
     parts.append("</svg>")
     return "\n".join(parts) + "\n"
@@ -206,8 +220,9 @@ def frange(start, stop, step):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Plot ds4-bench throughput CSV data as SVG.")
-    parser.add_argument("csv", type=Path, help="input CSV produced by ds4-bench")
+    parser = argparse.ArgumentParser(description="Plot q36-bench throughput CSV data as SVG.")
+    parser.add_argument("csv", type=Path, help="input CSV produced by q36-bench")
+    parser.add_argument("--mtp-csv", type=Path, help="MTP CSV with the same context frontiers")
     parser.add_argument("-o", "--output", type=Path, help="output SVG path")
     parser.add_argument("--title", help="graph title; defaults to a title derived from the CSV name")
     parser.add_argument("--width", type=int, default=960, help="SVG width in pixels")
@@ -219,8 +234,11 @@ def main():
         output = args.csv.with_name(f"{args.csv.stem}_ts.svg")
 
     rows = read_points(args.csv)
+    mtp_rows = read_points(args.mtp_csv) if args.mtp_csv else None
+    if mtp_rows and [row[0] for row in rows] != [row[0] for row in mtp_rows]:
+        parser.error("plain and MTP CSV context frontiers must match")
     title = args.title or derive_title(args.csv)
-    output.write_text(render_svg(rows, title, args.width, args.height), encoding="utf-8")
+    output.write_text(render_svg(rows, title, args.width, args.height, mtp_rows), encoding="utf-8")
 
 
 if __name__ == "__main__":

@@ -403,55 +403,43 @@ frozen sources and complete results are in
 
 ## Speed
 
-Benchmarks on a **BC-250** (40 CUs unlocked, Cyan-Skillfish Governor performance
-mode at 500-2000 MHz, 85 °C thermal ceiling — a hot summer in Italy). Runs
-use greedy decoding, `--gen-tokens 128`, the extended long-context story
-prompt, and Q8_0 K / Q4_0 V cache. The q2 model is fully resident. The mixed
-q2-q4 model uses SSD streaming with the automatic 5724-expert (4.72 GiB)
-cache. Each row was measured in a separate process, with only one benchmark
-process running at a time.
+These recorded BC-250 sweeps use resident models, Q8_0 keys / Q4_0 values,
+and 128 greedy generation tokens per frontier. Prefill measures the newly
+added interval. MTP uses the embedded head with draft limit eight and
+adaptive confidence (`--mtp-margin 0`). All rates are in tokens per second.
 
-| Machine | Quant | Mode | Prompt | Prefill | Generation |
-| --- | ---: | --- | ---: | ---: | ---: |
-| BC-250 (40 CU) | q2 | Resident | 2048 ctx | 639.85 t/s | 81.85 t/s |
-| BC-250 (40 CU) | q2 | Resident | 4096 ctx | 597.10 t/s | 79.74 t/s |
-| BC-250 (40 CU) | q2 | Resident | 8192 ctx | 501.50 t/s | 74.72 t/s |
-| BC-250 (40 CU) | q2 | Resident | 16384 ctx | 373.32 t/s | 65.04 t/s |
-| BC-250 (40 CU) | q2 | Resident | 24576 ctx | 287.24 t/s | 56.17 t/s |
-| BC-250 (40 CU) | q2 | Resident | 32768 ctx | 244.06 t/s | 51.26 t/s |
-| BC-250 (40 CU) | q2-q4 | SSD streaming | 4096 ctx | 45.43 t/s | 14.52 t/s |
-| BC-250 (40 CU) | q2-q4 | SSD streaming | 8192 ctx | 48.78 t/s | 13.98 t/s |
+### Qwen3.6-35B-A3B
 
-![BC-250 Q2 t/s](speed-bench/bc250_ts.svg)
+`gguf/Qwen3.6-35B-A3B-IQ2XXS-Q2K-Q8.gguf`
 
-### Metal measurements
+| Context | Prefill | Decode | MTP decode |
+| ---: | ---: | ---: | ---: |
+| 2,048 | 666.62 | 91.42 | 132.85 |
+| 4,096 | 611.01 | 89.77 | 126.62 |
+| 8,192 | 508.24 | 86.26 | 119.27 |
+| 16,384 | 380.15 | 78.90 | 129.08 |
+| 32,768 | 252.53 | 65.02 | 70.51 |
+| 65,536 | 150.29 | 55.53 | 65.58 |
 
-The following single-process measurements used the default q2 GGUF fully
-resident and the mixed q2-q4 GGUF with SSD streaming on a 16 GB M2 Pro with
-macOS 26.5. The SSD run used the automatic 4240-expert (6.99 GiB) cache. Both
-runs used `tests/long_context_story_prompt.txt`, incremental prefill at doubling
-context frontiers, greedy decoding with 128 generated tokens per frontier, and
-Q8_0 K / Q4_0 V cache:
+![BC-250 Qwen3.6-35B-A3B prefill, decode, and MTP decode](speed-bench/bc250-20261024/qwen36_ts.svg)
 
-| Runtime | Quant | Expert residency | Prompt | Prefill | Generation |
-| --- | ---: | --- | ---: | ---: | ---: |
-| Metal | q2 | Full model resident | 2048 ctx | 448.75 t/s | 37.78 t/s |
-| Metal | q2 | Full model resident | 4096 ctx | 366.19 t/s | 34.93 t/s |
-| Metal | q2 | Full model resident | 8192 ctx | 270.02 t/s | 31.08 t/s |
-| Metal | q2 | Full model resident | 16384 ctx | 177.21 t/s | 25.64 t/s |
-| Metal SSD | q2-q4 | 4240 expert slots / 6.99 GiB | 4096 ctx | 58.74 t/s | 8.97 t/s |
-| Metal SSD | q2-q4 | 4240 expert slots / 6.99 GiB | 8192 ctx | 55.32 t/s | 9.20 t/s |
+### Qwen3.8-27B
 
-![M2 Pro Metal Q2 t/s](speed-bench/metal_q2_ts.svg)
+`gguf/Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf`
 
-These numbers show the expected capacity tradeoff, not a cross-machine
-performance promise. Metal generation, prefill, and SSD behavior should be
-remeasured on the oldest and smallest supported Mac before a release.
+| Context | Prefill | Decode | MTP decode |
+| ---: | ---: | ---: | ---: |
+| 2,048 | 201.56 | 25.06 | 30.69 |
+| 4,096 | 188.79 | 26.54 | 39.64 |
+| 8,192 | 165.34 | 25.64 | 33.19 |
+| 16,384 | 133.56 | 24.25 | 35.33 |
+| 32,768 | 96.15 | 20.13 | 26.72 |
+| 65,536 | 61.49 | 18.20 | 21.22 |
 
-Use `q36-bench` for reproducible prefill and decode measurements. Release
-builds also have a conservative BC-250 performance gate under
-`make benchmark-gate`; record results on the same board and power state when
-comparing changes.
+![BC-250 Qwen3.8-27B prefill, decode, and MTP decode](speed-bench/bc250-20261024/qwen38_ts.svg)
+
+Recorded on 2026-10-24. See [performance and benchmarking](docs/PERFORMANCE.md)
+for the raw data, commands, Metal measurements, and earlier baselines.
 
 ## Running Models Larger Than Available Memory
 
