@@ -738,7 +738,12 @@ typedef struct {
 
 typedef struct {
     char *name;
-    char **prop;
+    bool is_string;
+} tool_schema_property;
+
+typedef struct {
+    char *name;
+    tool_schema_property *prop;
     int len;
     int cap;
 } tool_schema_order;
@@ -869,7 +874,7 @@ static void chat_msgs_push(chat_msgs *msgs, chat_msg msg) {
 
 static void tool_schema_order_free(tool_schema_order *o) {
     free(o->name);
-    for (int i = 0; i < o->len; i++) free(o->prop[i]);
+    for (int i = 0; i < o->len; i++) free(o->prop[i].name);
     free(o->prop);
     memset(o, 0, sizeof(*o));
 }
@@ -880,7 +885,7 @@ static void tool_schema_orders_free(tool_schema_orders *orders) {
     memset(orders, 0, sizeof(*orders));
 }
 
-static void tool_schema_order_prop_push(tool_schema_order *o, char *prop) {
+static void tool_schema_order_prop_push(tool_schema_order *o, tool_schema_property prop) {
     if (o->len == o->cap) {
         o->cap = o->cap ? o->cap * 2 : 8;
         o->prop = xrealloc(o->prop, (size_t)o->cap * sizeof(o->prop[0]));
@@ -913,6 +918,13 @@ static void tool_schema_orders_push(tool_schema_orders *orders, tool_schema_orde
 static const tool_schema_order *tool_schema_orders_find(const tool_schema_orders *orders, const char *name) {
     int idx = tool_schema_orders_find_index(orders, name);
     return idx >= 0 ? &orders->v[idx] : NULL;
+}
+
+static bool tool_schema_property_is_string(const tool_schema_order *order, const char *name) {
+    for (int i = 0; order && i < order->len; i++) {
+        if (!strcmp(order->prop[i].name, name)) return order->prop[i].is_string;
+    }
+    return false;
 }
 
 static void request_init(request *r, req_kind kind, int max_tokens) {
@@ -1448,6 +1460,38 @@ static char *openai_function_schema_from_tool(const char *raw) {
     return NULL;
 }
 
+static bool tool_schema_is_string(const char *json) {
+    const char *p = json;
+    json_ws(&p);
+    if (*p++ != '{') return false;
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        if (!json_string(&p, &key)) return false;
+        json_ws(&p);
+        if (*p != ':') {
+            free(key);
+            return false;
+        }
+        p++;
+        bool type = !strcmp(key, "type");
+        free(key);
+        json_ws(&p);
+        if (type && *p == '"') {
+            char *value = NULL;
+            if (!json_string(&p, &value)) return false;
+            bool string = !strcmp(value, "string");
+            free(value);
+            return string;
+        }
+        if (!json_skip_value(&p)) return false;
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+    return false;
+}
+
 static bool parse_schema_properties(const char *json, tool_schema_order *order) {
     const char *p = json;
     json_ws(&p);
@@ -1478,8 +1522,14 @@ static bool parse_schema_properties(const char *json, tool_schema_order *order) 
                     return false;
                 }
                 p++;
-                tool_schema_order_prop_push(order, prop);
-                if (!json_skip_value(&p)) return false;
+                char *schema = NULL;
+                if (!json_raw_value(&p, &schema)) {
+                    free(prop);
+                    return false;
+                }
+                tool_schema_property property = {prop, tool_schema_is_string(schema)};
+                tool_schema_order_prop_push(order, property);
+                free(schema);
                 json_ws(&p);
                 if (*p == ',') p++;
                 json_ws(&p);
@@ -2388,7 +2438,7 @@ static void append_qwen_arguments(buf *b, const char *json,
     }
     if (order) {
         for (int i = 0; i < order->len; i++) {
-            int idx = json_args_find_unused(&args, order->prop[i]);
+            int idx = json_args_find_unused(&args, order->prop[i].name);
             if (idx < 0) continue;
             append_qwen_parameter(b, &args.v[idx]);
             args.v[idx].used = true;
@@ -4178,7 +4228,8 @@ static bool qwen_tool_read_tag(const char *raw, size_t raw_len, size_t pos,
     return true;
 }
 
-static void qwen_tool_append_json_value(buf *out, const char *value, size_t len) {
+static void qwen_tool_append_json_value(buf *out, const char *value, size_t len,
+                                       bool is_string) {
     if (len && value[0] == '\n') {
         value++;
         len--;
@@ -4186,7 +4237,8 @@ static void qwen_tool_append_json_value(buf *out, const char *value, size_t len)
     if (len && value[len - 1] == '\n') len--;
     char *raw = xstrndup(value, len);
     q36_tool_text_unescape(raw, Q36_PARAM_END);
-    if (json_raw_value_is_complete(raw)) {
+    /* Native string parameters are raw text, including JSON file contents. */
+    if (!is_string && json_raw_value_is_complete(raw)) {
         char *minified = json_minify_raw_value(raw);
         buf_puts(out, minified);
         free(minified);
@@ -4197,6 +4249,7 @@ static void qwen_tool_append_json_value(buf *out, const char *value, size_t len)
 }
 
 static bool parse_generated_message_ex(const char *text, bool thinking,
+                                       const tool_schema_orders *orders,
                                        char **content_out,
                                        char **reasoning_out, tool_calls *calls) {
     text = text ? text : "";
@@ -4238,6 +4291,7 @@ static bool parse_generated_message_ex(const char *text, bool thinking,
         tc.name = qwen_tool_tag_value(tag, Q36_INVOKE_START);
         free(tag);
         if (!tc.name) return false;
+        const tool_schema_order *order = tool_schema_orders_find(orders, tc.name);
         pos = after;
 
         buf args = {0};
@@ -4262,7 +4316,8 @@ static bool parse_generated_message_ex(const char *text, bool thinking,
             json_escape(&args, name);
             buf_putc(&args, ':');
             qwen_tool_append_json_value(&args, text + after,
-                                        (size_t)(end - (text + after)));
+                                        (size_t)(end - (text + after)),
+                                        tool_schema_property_is_string(order, name));
             free(name);
             wrote = true;
             pos = (size_t)(end - text) + strlen(Q36_PARAM_END);
@@ -4298,7 +4353,7 @@ bad_call:
 
 static bool parse_generated_message(const char *text, char **content_out,
                                     char **reasoning_out, tool_calls *calls) {
-    return parse_generated_message_ex(text, false, content_out, reasoning_out, calls);
+    return parse_generated_message_ex(text, false, NULL, content_out, reasoning_out, calls);
 }
 
 static const char *tool_parse_failure_recovery_finish(const char *finish) {
@@ -4312,6 +4367,7 @@ static const char *tool_parse_failure_recovery_finish(const char *finish) {
 
 static bool parse_generated_message_for_response(const char *text,
                                                  bool thinking,
+                                                 const tool_schema_orders *orders,
                                                  bool has_tools,
                                                  bool saw_tool_start,
                                                  const char **finish_io,
@@ -4323,7 +4379,7 @@ static bool parse_generated_message_for_response(const char *text,
                                                  bool *recovered_out) {
     if (recovered_out) *recovered_out = false;
 
-    bool parsed_ok = parse_generated_message_ex(text ? text : "", thinking,
+    bool parsed_ok = parse_generated_message_ex(text ? text : "", thinking, orders,
                                                 content_out, reasoning_out, calls);
     if (parsed_ok) return true;
 
@@ -4608,6 +4664,7 @@ typedef enum {
 
 typedef struct {
     openai_tool_stream_state state;
+    const tool_schema_order *order;
     const char *tool_calls_end;
     const char *invoke_start;
     const char *invoke_end;
@@ -5049,7 +5106,7 @@ static bool complete_tool_text(const char *text) {
     if (!text || !find_any_tool_end(text)) return false;
     char *content = NULL, *reasoning = NULL;
     tool_calls calls = {0};
-    bool complete = parse_generated_message_ex(text, false,
+    bool complete = parse_generated_message_ex(text, false, NULL,
         &content, &reasoning, &calls) && calls.len > 0;
     free(content);
     free(reasoning);
@@ -5125,6 +5182,7 @@ static bool openai_tool_start_invoke(int fd, server *s, const request *r, const 
     char *name = qwen_tool_tag_value(tag, ts->invoke_start);
     free(tag);
     if (!name) return openai_tool_stream_fail(ts);
+    ts->order = tool_schema_orders_find(&r->tool_orders, name);
 
     const char *tool_id = openai_tool_stream_id(s, ts, ts->index);
     bool ok = sse_chat_tool_call_start_delta(fd, r, id, ts->index, tool_id, name) &&
@@ -5174,7 +5232,8 @@ static bool openai_tool_finish_param(int fd, const request *r, const char *id,
     if (len && value[len - 1] == '\n') len--;
     char *plain = xstrndup(value, len);
     q36_tool_text_unescape(plain, Q36_PARAM_END);
-    bool json_value = json_raw_value_is_complete(plain);
+    bool json_value = !tool_schema_property_is_string(ts->order, ts->param_name) &&
+                      json_raw_value_is_complete(plain);
     if (!openai_tool_emit_param_prefix(fd, r, id, ts, ts->param_name,
                                        !json_value)) {
         free(plain);
@@ -9633,6 +9692,7 @@ static void generate_job(server *s, server_slot *slot, job *j) {
         bool parsed_ok = parse_generated_message_for_response(
             text.ptr ? text.ptr : "",
             q36_think_mode_enabled(j->req.think_mode),
+            &j->req.tool_orders,
             j->req.has_tools,
             saw_tool_start,
             &final_finish,
@@ -10907,8 +10967,8 @@ static void test_tool_schema_order_from_anthropic_schema(void) {
     const tool_schema_order *order = tool_schema_orders_find(&orders, "bash");
     TEST_ASSERT(order != NULL);
     TEST_ASSERT(order && order->len == 2);
-    TEST_ASSERT(order && !strcmp(order->prop[0], "command"));
-    TEST_ASSERT(order && !strcmp(order->prop[1], "description"));
+    TEST_ASSERT(order && !strcmp(order->prop[0].name, "command"));
+    TEST_ASSERT(order && !strcmp(order->prop[1].name, "description"));
     tool_schema_orders_free(&orders);
 }
 
@@ -10927,9 +10987,9 @@ static void test_tool_schema_order_from_openai_tools(void) {
     const tool_schema_order *order = tool_schema_orders_find(&orders, "edit");
     TEST_ASSERT(order != NULL);
     TEST_ASSERT(order && order->len == 3);
-    TEST_ASSERT(order && !strcmp(order->prop[0], "filePath"));
-    TEST_ASSERT(order && !strcmp(order->prop[1], "oldString"));
-    TEST_ASSERT(order && !strcmp(order->prop[2], "newString"));
+    TEST_ASSERT(order && !strcmp(order->prop[0].name, "filePath"));
+    TEST_ASSERT(order && !strcmp(order->prop[1].name, "oldString"));
+    TEST_ASSERT(order && !strcmp(order->prop[2].name, "newString"));
     free(schemas);
     tool_schema_orders_free(&orders);
 }
@@ -11973,6 +12033,90 @@ static void test_qwen_tool_parser_preserves_multiline_parameters(void) {
     tool_calls_free(&calls);
 }
 
+static void test_tool_arguments_preserve_schema_strings(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    r.stream = true;
+    r.think_mode = Q36_THINK_NONE;
+    r.has_tools = true;
+    const char *schemas =
+        "[{\"type\":\"function\",\"function\":{\"name\":\"write\",\"parameters\":{"
+        "\"type\":\"object\",\"properties\":{\"content\":{\"type\":\"string\"},"
+        "\"count\":{\"type\":\"integer\"},\"enabled\":{\"type\":\"boolean\"},"
+        "\"options\":{\"type\":\"object\"},\"items\":{\"type\":\"array\"}}}}},"
+        "{\"name\":\"typed\",\"input_schema\":{\"properties\":{"
+        "\"content\":{\"type\":\"integer\"}}}}]";
+    char *prompt_schemas = NULL;
+    TEST_ASSERT(parse_tools_value(&schemas, &prompt_schemas, &r.tool_orders));
+    free(prompt_schemas);
+    const char *values[] = {
+        "119", "119\n", "true", "false", "null", "{}", "[1, 2]",
+        "\"119\"", " 119 \n", "\n119\n", "é </parameter> &lt;\n",
+    };
+    size_t count = sizeof(values) / sizeof(*values);
+    for (size_t i = 0; i <= count; i++) {
+        buf args = {0}, raw = {0};
+        buf_puts(&args, "{\"content\":");
+        if (i < count) json_escape(&args, values[i]);
+        else buf_puts(&args, "119");
+        buf_puts(&args, ",\"count\":119,\"enabled\":true,\"options\":{\"n\":1},\"items\":[1,2]}");
+        tool_call tc = {0};
+        tc.name = xstrdup(i < count ? "write" : "typed");
+        tc.arguments = buf_take(&args);
+        tool_calls expected = {0};
+        tool_calls_push(&expected, tc);
+        append_qwen_tool_calls_text(&raw, &expected, &r.tool_orders, false);
+
+        char *content = NULL, *reasoning = NULL;
+        char err[128] = {0};
+        const char *finish = "tool_calls";
+        tool_calls calls = {0};
+        TEST_ASSERT(parse_generated_message_for_response(raw.ptr, false, &r.tool_orders,
+                    true, true, &finish, err, sizeof(err), &content, &reasoning, &calls, NULL));
+        TEST_ASSERT(calls.len == 1);
+        TEST_ASSERT(calls.len && !strcmp(calls.v[0].arguments, tc.arguments));
+
+        int sv[2] = {-1, -1};
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        if (sv[0] >= 0 && sv[1] >= 0) {
+            openai_stream st;
+            openai_stream_start(&r, &st);
+            for (size_t n = 1; n <= raw.len; n++) {
+                TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "schema_strings",
+                            &st, raw.ptr, n, false));
+            }
+            TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "schema_strings", &st,
+                        raw.ptr, raw.len, &calls, finish, 10, 10));
+            shutdown(sv[0], SHUT_WR);
+            char *wire = read_socket_text(sv[1]);
+            buf streamed = {0};
+            const char *p = wire;
+            while ((p = strstr(p, "\"arguments\":")) != NULL) {
+                p += strlen("\"arguments\":");
+                char *fragment = NULL;
+                if (!json_string(&p, &fragment)) {
+                    TEST_ASSERT(false);
+                    break;
+                }
+                buf_puts(&streamed, fragment);
+                free(fragment);
+            }
+            TEST_ASSERT(streamed.ptr && !strcmp(streamed.ptr, tc.arguments));
+            buf_free(&streamed);
+            free(wire);
+            openai_stream_free(&st);
+            close(sv[0]);
+            close(sv[1]);
+        }
+        free(content);
+        free(reasoning);
+        tool_calls_free(&calls);
+        tool_calls_free(&expected);
+        buf_free(&raw);
+    }
+    request_free(&r);
+}
+
 static void test_tool_parse_failure_returns_recoverable_finish(void) {
     const char *generated =
         "trying a tool\n\n"
@@ -11989,6 +12133,7 @@ static void test_tool_parse_failure_returns_recoverable_finish(void) {
 
     TEST_ASSERT(!parse_generated_message_for_response(generated,
                                                        false,
+                                                       NULL,
                                                        true,
                                                        true,
                                                        &finish,
@@ -12022,7 +12167,7 @@ static void test_thinking_tool_markers_are_not_executable(void) {
     char *reasoning = NULL;
     tool_calls calls = {0};
 
-    TEST_ASSERT(parse_generated_message_ex(valid, true, &content, &reasoning, &calls));
+    TEST_ASSERT(parse_generated_message_ex(valid, true, NULL, &content, &reasoning, &calls));
     TEST_ASSERT(reasoning && strstr(reasoning, Q36_TOOL_CALLS_START) != NULL);
     TEST_ASSERT(calls.len == 1 && !strcmp(calls.v[0].name, "bash"));
     free(content);
@@ -12032,7 +12177,7 @@ static void test_thinking_tool_markers_are_not_executable(void) {
     const char *unclosed = "reasoning " Q36_TOOL_CALLS_START;
     content = reasoning = NULL;
     memset(&calls, 0, sizeof(calls));
-    TEST_ASSERT(parse_generated_message_ex(unclosed, true, &content, &reasoning, &calls));
+    TEST_ASSERT(parse_generated_message_ex(unclosed, true, NULL, &content, &reasoning, &calls));
     TEST_ASSERT(calls.len == 0);
     TEST_ASSERT(content && !strcmp(content, ""));
     TEST_ASSERT(reasoning && !strcmp(reasoning, unclosed));
@@ -12049,7 +12194,7 @@ static void test_thinking_tool_markers_are_not_executable(void) {
         Q36_TOOL_CALLS_END;
     content = reasoning = NULL;
     memset(&calls, 0, sizeof(calls));
-    TEST_ASSERT(parse_generated_message_ex(recovered, true,
+    TEST_ASSERT(parse_generated_message_ex(recovered, true, NULL,
                                            &content, &reasoning, &calls));
     TEST_ASSERT(content && !strcmp(content, ""));
     TEST_ASSERT(reasoning && !strcmp(reasoning, "reasoning"));
@@ -14251,6 +14396,7 @@ static void q36_server_unit_tests_run(void) {
     test_streaming_holds_partial_utf8();
     test_parse_short_qwen_tool_and_canonical_suffix();
     test_qwen_tool_parser_preserves_multiline_parameters();
+    test_tool_arguments_preserve_schema_strings();
     test_tool_parse_failure_returns_recoverable_finish();
     test_thinking_tool_markers_are_not_executable();
     test_tool_checkpoint_suffix_is_future_prompt_canonical();

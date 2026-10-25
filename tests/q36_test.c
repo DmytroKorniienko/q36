@@ -8003,7 +8003,7 @@ static void test_think_tool_recovery_live(void) {
     char *content = NULL;
     char *reasoning = NULL;
     tool_calls calls = {0};
-    bool parsed = parse_generated_message_ex(text.ptr, true,
+    bool parsed = parse_generated_message_ex(text.ptr, true, NULL,
                                               &content, &reasoning, &calls);
     fprintf(stderr,
             "q36-test: think-tool-recovery generated=%d recovered=%d calls=%d name=%s\n",
