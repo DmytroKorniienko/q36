@@ -762,6 +762,7 @@ typedef struct {
     char *tool_call_id;
     char **result_ids;
     size_t result_count;
+    int tool_errors; /* Consecutive failures at the end of this result group. */
     bool other_content;
     tool_calls calls;
 } chat_msg;
@@ -1460,6 +1461,58 @@ static char *openai_function_schema_from_tool(const char *raw) {
     return NULL;
 }
 
+static char *qwen_tool_parameters(const char *schema);
+
+static char *anthropic_function_schema_from_tool(const char *raw) {
+    const char *p = raw;
+    json_ws(&p);
+    if (*p != '{') return NULL;
+    p++;
+    char *name = NULL, *description = NULL, *parameters = NULL;
+    json_ws(&p);
+    while (*p && *p != '}') {
+        char *key = NULL;
+        if (!json_string(&p, &key)) goto done;
+        json_ws(&p);
+        if (*p != ':') {
+            free(key);
+            goto done;
+        }
+        p++;
+        char **field = !strcmp(key, "name") ? &name :
+                       !strcmp(key, "description") ? &description :
+                       !strcmp(key, "input_schema") ? &parameters : NULL;
+        free(key);
+        if (field ? !json_raw_value_replace(&p, field) : !json_skip_value(&p)) goto done;
+        json_ws(&p);
+        if (*p == ',') p++;
+        json_ws(&p);
+    }
+    if (*p == '}' && name && parameters) {
+        buf b = {0};
+        buf_puts(&b, "{\"name\":");
+        buf_puts(&b, name);
+        if (description) {
+            buf_puts(&b, ",\"description\":");
+            buf_puts(&b, description);
+        }
+        buf_puts(&b, ",\"parameters\":");
+        char *schema = qwen_tool_parameters(parameters);
+        buf_puts(&b, schema);
+        free(schema);
+        buf_putc(&b, '}');
+        free(name);
+        free(description);
+        free(parameters);
+        return buf_take(&b);
+    }
+done:
+    free(name);
+    free(description);
+    free(parameters);
+    return NULL;
+}
+
 static bool tool_schema_is_string(const char *json) {
     const char *p = json;
     json_ws(&p);
@@ -1594,10 +1647,8 @@ done:
     tool_schema_order_free(&order);
 }
 
-/* OpenAI wraps tools as {"type":"function","function":{...}}. Anthropic sends
- * the function schema directly as {"name":...,"input_schema":...}. The Q36
- * prompt wants one raw function schema per line, so unwrap OpenAI tools and keep
- * already-direct schemas unchanged. */
+/* Qwen expects name/description/parameters. API transport controls must not
+ * change the function definition presented to the model. */
 static bool parse_tools_value(const char **p, char **out, tool_schema_orders *orders) {
     json_ws(p);
     if (json_lit(p, "null")) {
@@ -1613,6 +1664,7 @@ static bool parse_tools_value(const char **p, char **out, tool_schema_orders *or
         char *raw = NULL;
         if (!json_raw_value(p, &raw)) goto bad;
         char *function = openai_function_schema_from_tool(raw);
+        if (!function) function = anthropic_function_schema_from_tool(raw);
         const char *schema = function ? function : raw;
         append_raw_json_line(&schemas, schema);
         tool_schema_orders_add_json(orders, schema);
@@ -1904,6 +1956,7 @@ static bool parse_anthropic_image_source(const char **p,
  * assistant tool_use blocks to tool_calls, and keeps tool_result blocks as
  * escaped text because Q36 sees tool results in its chat template. */
 static bool parse_anthropic_content_mode(const char **p, chat_msg *msg, bool allow_tools);
+static char *chat_content_text(const char *s, bool controls, bool *thinking);
 
 static bool parse_anthropic_content_block(const char **p, chat_msg *msg, bool allow_tools) {
     if (**p != '{') return false;
@@ -1915,6 +1968,7 @@ static bool parse_anthropic_content_block(const char **p, chat_msg *msg, bool al
     char *name = NULL;
     char *input = NULL;
     char *tool_result = NULL;
+    bool is_error = false;
     chat_msg result = {0};
     char *source_type = NULL;
     char *media_type = NULL;
@@ -1965,6 +2019,11 @@ static bool parse_anthropic_content_block(const char **p, chat_msg *msg, bool al
                 free(key);
                 goto bad;
             }
+        } else if (!strcmp(key, "is_error")) {
+            if (!json_bool(p, &is_error)) {
+                free(key);
+                goto bad;
+            }
         } else if (!strcmp(key, "source")) {
             if (!parse_anthropic_image_source(p, &source_type, &media_type, &image_data)) {
                 free(key);
@@ -1991,6 +2050,7 @@ static bool parse_anthropic_content_block(const char **p, chat_msg *msg, bool al
         tc.arguments = input ? xstrdup(input) : xstrdup("{}");
         tool_calls_push(&msg->calls, tc);
     } else if (type && !strcmp(type, "tool_result")) {
+        msg->tool_errors = is_error ? msg->tool_errors + 1 : 0;
         if (!id || !id[0]) msg->other_content = true;
         else {
             msg->result_ids = xrealloc(msg->result_ids,
@@ -2002,7 +2062,9 @@ static bool parse_anthropic_content_block(const char **p, chat_msg *msg, bool al
         buf b = {0};
         buf_puts(&b, msg->content ? msg->content : "");
         buf_puts(&b, "<tool_response>\n");
-        append_xml_text_escaped(&b, result.content);
+        char *trimmed = chat_content_text(result.content, false, NULL);
+        append_xml_text_escaped(&b, trimmed);
+        free(trimmed);
         for (size_t i = 0; i < result.images.len; i++) {
             if (msg->images.len == msg->images.cap) {
                 msg->images.cap = msg->images.cap ? msg->images.cap * 2 : 2;
@@ -2147,6 +2209,7 @@ static bool parse_anthropic_messages(const char **p, chat_msgs *msgs) {
                 free(msg.result_ids);
                 msg.result_ids = parsed.result_ids;
                 msg.result_count = parsed.result_count;
+                msg.tool_errors = parsed.tool_errors;
                 msg.other_content = parsed.other_content;
                 parsed.result_ids = NULL;
                 parsed.result_count = 0;
@@ -2400,6 +2463,33 @@ static void append_json_arg_pair(buf *b, const json_arg *arg) {
     else buf_puts(b, arg->value);
 }
 
+static char *qwen_tool_parameters(const char *schema) {
+    /* Use the same native schema layout as OpenAI function definitions. */
+    static const char *keys[] = {"type", "required", "properties"};
+    json_args args = {0};
+    if (!json_args_parse(schema, &args)) return xstrdup(schema);
+    buf b = {0};
+    buf_putc(&b, '{');
+    bool wrote = false;
+    for (size_t i = 0; i < sizeof(keys) / sizeof(*keys); i++) {
+        int idx = json_args_find_unused(&args, keys[i]);
+        if (idx < 0) continue;
+        if (wrote) buf_putc(&b, ',');
+        append_json_arg_pair(&b, &args.v[idx]);
+        args.v[idx].used = true;
+        wrote = true;
+    }
+    for (int i = 0; i < args.len; i++) {
+        if (args.v[i].used) continue;
+        if (wrote) buf_putc(&b, ',');
+        append_json_arg_pair(&b, &args.v[i]);
+        wrote = true;
+    }
+    buf_putc(&b, '}');
+    json_args_free(&args);
+    return buf_take(&b);
+}
+
 static void append_json_object_or_empty(buf *b, const char *json) {
     json_args args = {0};
     if (!json_args_parse(json, &args)) {
@@ -2585,7 +2675,9 @@ static void append_tool_error_warning(buf *out, int failures) {
         buf_printf(out,
             "\n\n⚠️ SYSTEM WARNING: %d consecutive tool errors detected. "
             "Your previous approach is incorrect. You MUST use a fundamentally "
-            "different approach or corrected arguments.", failures);
+            "different approach or corrected arguments. "
+            "Do not repeat the failed call with unchanged arguments. "
+            "Check the original request and successful earlier results before retrying.", failures);
     } else if (failures == 1) {
         buf_puts(out,
             "\n\n⚠️ SYSTEM WARNING: The previous tool call returned an error. "
@@ -2741,9 +2833,15 @@ static char *render_qwen_chat_prompt_text(const chat_msgs *msgs, const char *too
             free(content);
         } else if (!strcmp(m->role, "user")) {
             char *content = chat_content_text(m->content, true, &thinking);
-            failures = 0;
             buf_puts(&out, "<|im_start|>user\n");
             buf_puts(&out, content);
+            if (m->result_count && !m->other_content) {
+                failures = m->tool_errors == (int)m->result_count ?
+                           failures + m->tool_errors : m->tool_errors;
+                append_tool_error_warning(&out, failures);
+            } else {
+                failures = 0;
+            }
             buf_puts(&out, "<|im_end|>\n");
             free(content);
         } else if (!strcmp(m->role, "tool") || !strcmp(m->role, "function")) {
@@ -10994,6 +11092,68 @@ static void test_tool_schema_order_from_openai_tools(void) {
     tool_schema_orders_free(&orders);
 }
 
+static void test_anthropic_tool_schema_uses_qwen_fields(void) {
+    const char *p =
+        "[{\"name\":\"write\",\"eager_input_streaming\":true,"
+        "\"description\":\"Write input_schema text\","
+        "\"cache_control\":{\"type\":\"ephemeral\"},"
+        "\"input_schema\":{\"type\":\"object\",\"properties\":{"
+        "\"content\":{\"type\":\"string\"},"
+        "\"cache_control\":{\"type\":\"boolean\"}}}}]";
+    char *schemas = NULL;
+    tool_schema_orders orders = {0};
+    TEST_ASSERT(parse_tools_value(&p, &schemas, &orders));
+    TEST_ASSERT(schemas && !strcmp(schemas,
+        "{\"name\":\"write\",\"description\":\"Write input_schema text\","
+        "\"parameters\":{\"type\":\"object\",\"properties\":{"
+        "\"content\":{\"type\":\"string\"},\"cache_control\":{\"type\":\"boolean\"}}}}"));
+    const tool_schema_order *order = tool_schema_orders_find(&orders, "write");
+    TEST_ASSERT(tool_schema_property_is_string(order, "content"));
+    TEST_ASSERT(!tool_schema_property_is_string(order, "cache_control"));
+    free(schemas);
+    tool_schema_orders_free(&orders);
+}
+
+static void test_anthropic_prompt_matches_openai_tool_result(void) {
+    const char *openai =
+        "[{\"type\":\"function\",\"function\":{\"name\":\"write\","
+        "\"description\":\"Write a file\",\"parameters\":{\"type\":\"object\","
+        "\"required\":[\"content\"],\"properties\":{\"content\":{\"type\":\"string\"}},"
+        "\"additionalProperties\":false}}}]";
+    const char *anthropic =
+        "[{\"input_schema\":{\"properties\":{\"content\":{\"type\":\"string\"}},"
+        "\"additionalProperties\":false,\"required\":[\"content\"],\"type\":\"object\"},"
+        "\"name\":\"write\",\"description\":\"Write a file\","
+        "\"eager_input_streaming\":true,\"cache_control\":{\"type\":\"ephemeral\"}}]";
+    tool_schema_orders a = {0}, b = {0};
+    char *schema_a = NULL, *schema_b = NULL;
+    TEST_ASSERT(parse_tools_value(&openai, &schema_a, &a));
+    TEST_ASSERT(parse_tools_value(&anthropic, &schema_b, &b));
+    TEST_ASSERT(schema_a && schema_b && !strcmp(schema_a, schema_b));
+
+    const char *messages_a =
+        "[{\"role\":\"user\",\"content\":\"Add the numbers\"},"
+        "{\"role\":\"tool\",\"tool_call_id\":\"read_1\",\"content\":\" 7\\n11\\n47\\n\"}]";
+    const char *messages_b =
+        "[{\"role\":\"user\",\"content\":\"Add the numbers\"},"
+        "{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"read_1\","
+        "\"content\":\" 7\\n11\\n47\\n\",\"is_error\":false}]}]";
+    chat_msgs msgs_a = {0}, msgs_b = {0};
+    TEST_ASSERT(parse_messages(&messages_a, &msgs_a));
+    TEST_ASSERT(parse_anthropic_messages(&messages_b, &msgs_b));
+    char *prompt_a = render_chat_prompt_text(&msgs_a, schema_a, &a, Q36_THINK_NONE);
+    char *prompt_b = render_chat_prompt_text(&msgs_b, schema_b, &b, Q36_THINK_NONE);
+    TEST_ASSERT(!strcmp(prompt_a, prompt_b));
+    free(prompt_a);
+    free(prompt_b);
+    free(schema_a);
+    free(schema_b);
+    tool_schema_orders_free(&a);
+    tool_schema_orders_free(&b);
+    chat_msgs_free(&msgs_a);
+    chat_msgs_free(&msgs_b);
+}
+
 static tool_calls make_swapped_bash_call(void) {
     tool_calls calls = {0};
     tool_call tc = {0};
@@ -13794,6 +13954,50 @@ static void test_fixed_template_tool_error_recovery(void) {
     TEST_ASSERT(tool_response_is_error(traceback));
 }
 
+static void test_anthropic_tool_error_recovery(void) {
+    const char *p =
+        "[{\"role\":\"user\",\"content\":\"Write numeric.txt\"},"
+        "{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\","
+        "\"tool_use_id\":\"one\",\"content\":\"EACCES: /numbers.txt\",\"is_error\":true}]},"
+        "{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\","
+        "\"tool_use_id\":\"two\",\"content\":\"ENOENT: /numbers.txt\",\"is_error\":true}]},"
+        "{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\","
+        "\"tool_use_id\":\"three\",\"content\":\"Error: example text\",\"is_error\":false},"
+        "{\"type\":\"tool_result\",\"tool_use_id\":\"four\",\"content\":\"Not found\",\"is_error\":true}]}]";
+    chat_msgs msgs = {0};
+    TEST_ASSERT(parse_anthropic_messages(&p, &msgs));
+    TEST_ASSERT(msgs.len == 4);
+    TEST_ASSERT(msgs.v[1].tool_errors == 1 && !msgs.v[1].other_content);
+    TEST_ASSERT(msgs.v[3].tool_errors == 1 && msgs.v[3].result_count == 2);
+    char *prompt = render_chat_prompt_text(&msgs, NULL, NULL, Q36_THINK_NONE);
+    TEST_ASSERT(strstr(prompt, "EACCES: /numbers.txt\n</tool_response>\n\n⚠️ SYSTEM WARNING:") != NULL);
+    TEST_ASSERT(strstr(prompt, "ENOENT: /numbers.txt\n</tool_response>\n\n⚠️ SYSTEM WARNING: 2 consecutive tool errors") != NULL);
+    TEST_ASSERT(strstr(prompt, "Not found\n</tool_response>\n\n⚠️ SYSTEM WARNING: The previous tool call") != NULL);
+    TEST_ASSERT(strstr(prompt, "3 consecutive tool errors") == NULL);
+    free(prompt);
+
+    msgs.v[3].tool_errors = 2;
+    prompt = render_chat_prompt_text(&msgs, NULL, NULL, Q36_THINK_NONE);
+    TEST_ASSERT(strstr(prompt, "4 consecutive tool errors") != NULL);
+    free(prompt);
+    msgs.v[3].tool_errors = 0;
+    prompt = render_chat_prompt_text(&msgs, NULL, NULL, Q36_THINK_NONE);
+    TEST_ASSERT(strstr(prompt, "Not found\n</tool_response>") != NULL);
+    free(prompt);
+    chat_msgs_free(&msgs);
+
+    p = "[{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\","
+        "\"tool_use_id\":\"one\",\"content\":\"Not found\",\"is_error\":true}]},"
+        "{\"role\":\"user\",\"content\":\"A new request\"},"
+        "{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\","
+        "\"tool_use_id\":\"two\",\"content\":\"Not found\",\"is_error\":true}]}]";
+    TEST_ASSERT(parse_anthropic_messages(&p, &msgs));
+    prompt = render_chat_prompt_text(&msgs, NULL, NULL, Q36_THINK_NONE);
+    TEST_ASSERT(strstr(prompt, "consecutive tool errors") == NULL);
+    free(prompt);
+    chat_msgs_free(&msgs);
+}
+
 static void test_fixed_template_reasoning_extraction(void) {
     chat_msgs msgs = {0};
     chat_msg user = {.role = xstrdup("user"), .content = xstrdup("question")};
@@ -14371,6 +14575,8 @@ static void q36_server_unit_tests_run(void) {
     test_render_preserves_reasoning_with_tools();
     test_tool_schema_order_from_anthropic_schema();
     test_tool_schema_order_from_openai_tools();
+    test_anthropic_tool_schema_uses_qwen_fields();
+    test_anthropic_prompt_matches_openai_tool_result();
     test_responses_input_parses_qwen_tool_continuation();
     test_responses_output_is_protocol_native();
     test_responses_stream_uses_responses_events();
@@ -14417,6 +14623,7 @@ static void q36_server_unit_tests_run(void) {
     test_fixed_template_inline_controls();
     test_fixed_template_chronological_system_messages();
     test_fixed_template_tool_error_recovery();
+    test_anthropic_tool_error_recovery();
     test_fixed_template_reasoning_extraction();
     test_reasoning_message_aliases();
     test_chat_template_kwargs_parse();
