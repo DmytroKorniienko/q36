@@ -414,14 +414,14 @@ adaptive confidence (`--mtp-margin 0`). All rates are in tokens per second.
 
 | Context | Prefill | Decode | MTP decode |
 | ---: | ---: | ---: | ---: |
-| 2,048 | 666.62 | 91.42 | 132.85 |
-| 4,096 | 611.01 | 89.77 | 126.62 |
-| 8,192 | 508.24 | 86.26 | 119.27 |
-| 16,384 | 380.15 | 78.90 | 129.08 |
-| 32,768 | 252.53 | 65.02 | 70.51 |
-| 65,536 | 150.29 | 55.53 | 65.58 |
+| 2,048 | 634.96 | 90.63 | 151.22 |
+| 4,096 | 634.74 | 91.21 | 131.39 |
+| 8,192 | 510.59 | 89.37 | 127.17 |
+| 16,384 | 371.32 | 83.78 | 143.14 |
+| 32,768 | 236.85 | 74.43 | 77.96 |
+| 65,536 | 137.01 | 64.72 | 83.00 |
 
-![BC-250 Qwen3.6-35B-A3B prefill, decode, and MTP decode](speed-bench/bc250-20261024/qwen36_ts.svg)
+![BC-250 Qwen3.6-35B-A3B prefill, decode, and MTP decode](speed-bench/bc250-20261025/qwen36_ts.svg)
 
 ### Qwen3.8-27B
 
@@ -429,16 +429,31 @@ adaptive confidence (`--mtp-margin 0`). All rates are in tokens per second.
 
 | Context | Prefill | Decode | MTP decode |
 | ---: | ---: | ---: | ---: |
-| 2,048 | 201.56 | 25.06 | 30.69 |
-| 4,096 | 188.79 | 26.54 | 39.64 |
-| 8,192 | 165.34 | 25.64 | 33.19 |
-| 16,384 | 133.56 | 24.25 | 35.33 |
-| 32,768 | 96.15 | 20.13 | 26.72 |
-| 65,536 | 61.49 | 18.20 | 21.22 |
+| 2,048 | 207.64 | 27.07 | 36.44 |
+| 4,096 | 194.88 | 26.94 | 40.31 |
+| 8,192 | 169.60 | 26.22 | 34.53 |
+| 16,384 | 135.21 | 25.11 | 37.49 |
+| 32,768 | 95.43 | 22.06 | 30.61 |
+| 65,536 | 59.48 | 20.18 | 25.32 |
 
-![BC-250 Qwen3.8-27B prefill, decode, and MTP decode](speed-bench/bc250-20261024/qwen38_ts.svg)
+![BC-250 Qwen3.8-27B prefill, decode, and MTP decode](speed-bench/bc250-20261025/qwen38-xxs_ts.svg)
 
-Recorded on 2026-10-24. See [performance and benchmarking](docs/PERFORMANCE.md)
+### Qwen3.8-27B (IQ3_S)
+
+`gguf/Qwen3.8-27B-UD-IQ3_S.gguf`
+
+| Context | Prefill | Decode | MTP decode |
+| ---: | ---: | ---: | ---: |
+| 2,048 | 212.70 | 25.61 | 39.47 |
+| 4,096 | 199.71 | 25.45 | 47.52 |
+| 8,192 | 173.53 | 24.80 | 45.21 |
+| 16,384 | 137.72 | 23.82 | 34.88 |
+| 32,768 | 96.68 | 21.48 | 29.32 |
+| 65,536 | 59.46 | 19.28 | 26.01 |
+
+![BC-250 Qwen3.8-27B IQ3_S prefill, decode, and MTP decode](speed-bench/bc250-20261025/qwen38-iq3s_ts.svg)
+
+Recorded on 2026-10-25. See [performance and benchmarking](docs/PERFORMANCE.md)
 for the raw data, commands, Metal measurements, and earlier baselines.
 
 ## Running Models Larger Than Available Memory

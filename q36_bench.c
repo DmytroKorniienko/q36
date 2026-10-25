@@ -727,8 +727,9 @@ int main(int argc, char **argv) {
 
         /* gen_tokens == 0 is a pure prefill benchmark: the live session stays
          * at the frontier and the next sync extends it.  Otherwise restore
-         * the pre-decode state (a full replay, outside both timings). */
-        if (cfg.gen_tokens > 0 &&
+         * the pre-decode state before extending the next frontier. The last
+         * frontier needs no replay after its measurements are complete. */
+        if (cfg.gen_tokens > 0 && frontier < cfg.ctx_max &&
             q36_session_load_snapshot(session, &snap, err, sizeof(err)) != 0) {
             fprintf(stderr, "q36-bench: restore at %d failed: %s\n", frontier, err);
             rc = 1;

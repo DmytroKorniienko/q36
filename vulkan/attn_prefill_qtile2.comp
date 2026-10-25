@@ -67,24 +67,29 @@ layout(push_constant) uniform Push {
 #endif
 #define V_HEAD_BYTES 144u
 
-shared float sh_q[QT * HQ * HD];
+/* Keep the four 64-dimensional dot stripes in different LDS banks. */
+shared float sh_q[QT * HQ * (HD + 16u)];
 shared float sh_w[QT * HQ * TILE];
 
 float dot4(vec4 a, vec4 b) {
     return dot(a, b);
 }
 
-uint load_v_u8(uint off) {
-    return (vc[off >> 2u] >> ((off & 3u) * 8u)) & 255u;
+uint qidx(uint a) {
+    uint d = a % HD;
+    return (a / HD) * (HD + 16u) + d + (d / 64u) * 4u;
 }
 
-float vc_at(uint key, uint kvh, uint i) {
-    uint base = key * pc.v_row_bytes + kvh * V_HEAD_BYTES + (i >> 5u) * 18u;
-    uint scale = load_v_u8(base) | (load_v_u8(base + 1u) << 8u);
-    uint j = i & 31u;
-    uint v = load_v_u8(base + 2u + (j & 15u));
-    v = j < 16u ? v & 15u : v >> 4u;
-    return unpackHalf2x16(scale).x * float(int(v) - 8);
+/* Adjacent output dimensions share a Q4 scale and four packed bytes. */
+vec4 vc_at(uint key, uint vblk, uint vqo, uint vsh) {
+    uint base = key * pc.v_row_bytes + vblk;
+    uint dw = vc[base >> 2u];
+    float scale = unpackHalf2x16((base & 2u) == 0u ? dw : dw >> 16u).x;
+    uint off = base + vqo;
+    uint wi = off >> 2u;
+    uint shift = (off & 3u) * 8u;
+    uint bits = shift == 0u ? vc[wi] : (vc[wi] >> shift) | (vc[wi + 1u] << (32u - shift));
+    return scale * (vec4(unpack8(int((bits >> vsh) & 0x0f0f0f0fu))) - vec4(8.0));
 }
 
 void main(void) {
@@ -92,6 +97,10 @@ void main(void) {
     uint rg = tid >> 6u;
     uint lane = tid & 63u;
     uint r0 = rg * ROWS;
+    uint vi = lane * 4u;
+    uint vblk = gl_WorkGroupID.x * V_HEAD_BYTES + (vi >> 5u) * 18u;
+    uint vqo = 2u + (vi & 15u);
+    uint vsh = (vi & 31u) < 16u ? 0u : 4u;
     uint kvh = gl_WorkGroupID.x;
     uint local0 = gl_WorkGroupID.y * QT;
     uint tok0 = pc.tok_base + local0;
@@ -112,7 +121,7 @@ void main(void) {
         uint ti = r / HQ;
         uint j = r % HQ;
         uint d = e & (HD - 1u);
-        sh_q[e] = ti < tn && j < heads ?
+        sh_q[qidx(e)] = ti < tn && j < heads ?
             q[((tok0 + ti) * pc.n_head + h0 + j) * HD + d] : 0.0;
     }
     barrier();
@@ -172,9 +181,9 @@ void main(void) {
                             prev = next;
                             vec4 lo = vec4(unpack8(int(sw & 0x0f0f0f0fu))) - vec4(8.0);
                             vec4 hi = vec4(unpack8(int((sw >> 4u) & 0x0f0f0f0fu))) - vec4(8.0);
-                            uint qi = p * 64u + 4u * k;
+                            uint qi = p * 68u + 4u * k;
                             for (uint rr = 0u; rr < ROWS; rr++) {
-                                uint a = (r0 + rr) * HD + qi;
+                                uint a = (r0 + rr) * (HD + 16u) + qi;
                                 s0[rr] += dot4(lo, vec4(sh_q[a], sh_q[a + 1u], sh_q[a + 2u], sh_q[a + 3u]));
                                 s0[rr] += dot4(hi, vec4(sh_q[a + 16u], sh_q[a + 17u], sh_q[a + 18u], sh_q[a + 19u]));
                             }
@@ -185,9 +194,9 @@ void main(void) {
                             uint sw = (prev >> 16u) | (next << 16u);
                             prev = next;
                             vec4 kv = vec4(unpack8(int(sw)));
-                            uint qi = p * 64u + 4u * k;
+                            uint qi = p * 68u + 4u * k;
                             for (uint rr = 0u; rr < ROWS; rr++) {
-                                uint qb = (r0 + rr) * HD + qi;
+                                uint qb = (r0 + rr) * (HD + 16u) + qi;
                                 s0[rr] += dot4(kv, vec4(sh_q[qb], sh_q[qb + 1u],
                                                        sh_q[qb + 2u], sh_q[qb + 3u]));
                             }
@@ -199,9 +208,9 @@ void main(void) {
                             uint sw = kc[wi + 5u + k];
                             vec4 lo = vec4(unpack8(int(sw & 0x0f0f0f0fu))) - vec4(8.0);
                             vec4 hi = vec4(unpack8(int((sw >> 4u) & 0x0f0f0f0fu))) - vec4(8.0);
-                            uint qi = p * 64u + 32u + 4u * k;
+                            uint qi = p * 68u + 32u + 4u * k;
                             for (uint rr = 0u; rr < ROWS; rr++) {
-                                uint a = (r0 + rr) * HD + qi;
+                                uint a = (r0 + rr) * (HD + 16u) + qi;
                                 s1[rr] += dot4(lo, vec4(sh_q[a], sh_q[a + 1u], sh_q[a + 2u], sh_q[a + 3u]));
                                 s1[rr] += dot4(hi, vec4(sh_q[a + 16u], sh_q[a + 17u], sh_q[a + 18u], sh_q[a + 19u]));
                             }
@@ -209,9 +218,9 @@ void main(void) {
 #else
                         for (uint k = 0u; k < 8u; k++) {
                             vec4 kv = vec4(unpack8(int(kc[wi + 9u + k])));
-                            uint qi = p * 64u + 32u + 4u * k;
+                            uint qi = p * 68u + 32u + 4u * k;
                             for (uint rr = 0u; rr < ROWS; rr++) {
-                                uint qb = (r0 + rr) * HD + qi;
+                                uint qb = (r0 + rr) * (HD + 16u) + qi;
                                 s1[rr] += dot4(kv, vec4(sh_q[qb], sh_q[qb + 1u],
                                                        sh_q[qb + 2u], sh_q[qb + 3u]));
                             }
@@ -271,8 +280,8 @@ void main(void) {
 
             float vv[VD];
             for (uint t = 0u; t < tile_n; t++) {
-                for (uint v = 0u; v < VD; v++)
-                    vv[v] = vc_at(base + t, kvh, lane + v * 64u);
+                vec4 val = vc_at(base + t, vblk, vqo, vsh);
+                for (uint v = 0u; v < VD; v++) vv[v] = val[v];
                 for (uint rr = 0u; rr < ROWS; rr++) {
                     uint r = r0 + rr;
                     uint ti = r / HQ;
@@ -320,7 +329,7 @@ void main(void) {
         uint pbase = (((local0 + ti) * pc.n_head + h0 + j) *
                       pc.n_spans + group) * (HD + 2u);
         for (uint v = 0u; v < VD; v++)
-            part[pbase + lane + v * 64u] = gacc[rr][v];
+            part[pbase + vi + v] = gacc[rr][v];
         if (lane == 0u) {
             part[pbase + HD] = gm[rr];
             part[pbase + HD + 1u] = gl[rr];

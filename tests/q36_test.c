@@ -4847,6 +4847,15 @@ static void test_vulkan_attn_decode_fused(void) {
     test_vulkan_attn_case(12, 129, 3, Q36_KV_CACHE_Q4_0, Q36_KV_CACHE_Q4_0, 256);
     test_vulkan_attn_case(12, 1534, 5, Q36_KV_CACHE_Q4_0, Q36_KV_CACHE_Q4_0, 256);
     test_vulkan_attn_case(24, 8190, 5, Q36_KV_CACHE_Q4_0, Q36_KV_CACHE_Q4_0, 256);
+#ifndef Q36_METAL
+    /* Verification and decode share 512-key spans. Prefill folds eight
+     * spans per group, so compare its long-context bits to a baseline run. */
+    q36_gpu_set_micro_batch(true);
+    test_vulkan_attn_case(12, 65534, 3, Q36_KV_CACHE_Q8_0, Q36_KV_CACHE_Q4_0, 256);
+    q36_gpu_set_micro_batch(true);
+    test_vulkan_attn_case(16, 32766, 3, Q36_KV_CACHE_Q8_0, Q36_KV_CACHE_Q4_0, 256);
+    q36_gpu_set_micro_batch(false);
+#endif
 #endif
 }
 

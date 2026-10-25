@@ -35,16 +35,18 @@ layout(push_constant) uniform Push {
     uint pos0, n_head, n_head_kv, head_dim, n_spans, has_sinks, k_type, v_type, k_row_bytes,
         v_row_bytes;
 } pc;
-shared float sh_q[256u * GROUP];
+/* Four dot-product lanes read 64-dimensional stripes. Padding each stripe
+ * by a vec4 keeps their query reads in different LDS banks. */
+shared float sh_q[272u * GROUP];
 shared qvec sh_w[64];
 
 qvec qdot(uint word, uint qi) {
     vec4 k = vec4(unpack8(int(word)));
     return qvec(dot(k, vec4(sh_q[qi], sh_q[qi + 1u], sh_q[qi + 2u], sh_q[qi + 3u])),
-                dot(k, vec4(sh_q[qi + 256u], sh_q[qi + 257u], sh_q[qi + 258u], sh_q[qi + 259u])),
-                dot(k, vec4(sh_q[qi + 512u], sh_q[qi + 513u], sh_q[qi + 514u], sh_q[qi + 515u]))
+                dot(k, vec4(sh_q[qi + 272u], sh_q[qi + 273u], sh_q[qi + 274u], sh_q[qi + 275u])),
+                dot(k, vec4(sh_q[qi + 544u], sh_q[qi + 545u], sh_q[qi + 546u], sh_q[qi + 547u]))
 #ifdef Q36_GQA8
-                , dot(k, vec4(sh_q[qi + 768u], sh_q[qi + 769u], sh_q[qi + 770u], sh_q[qi + 771u]))
+                , dot(k, vec4(sh_q[qi + 816u], sh_q[qi + 817u], sh_q[qi + 818u], sh_q[qi + 819u]))
 #endif
                 );
 }
@@ -53,10 +55,10 @@ qvec qdot(uint word, uint qi) {
 qvec qdot4(uint word, uint qi) {
     vec4 k = vec4(unpack8(int(word))) - vec4(8.0);
     return qvec(dot(k, vec4(sh_q[qi], sh_q[qi + 1u], sh_q[qi + 2u], sh_q[qi + 3u])),
-                dot(k, vec4(sh_q[qi + 256u], sh_q[qi + 257u], sh_q[qi + 258u], sh_q[qi + 259u])),
-                dot(k, vec4(sh_q[qi + 512u], sh_q[qi + 513u], sh_q[qi + 514u], sh_q[qi + 515u]))
+                dot(k, vec4(sh_q[qi + 272u], sh_q[qi + 273u], sh_q[qi + 274u], sh_q[qi + 275u])),
+                dot(k, vec4(sh_q[qi + 544u], sh_q[qi + 545u], sh_q[qi + 546u], sh_q[qi + 547u]))
 #ifdef Q36_GQA8
-                , dot(k, vec4(sh_q[qi + 768u], sh_q[qi + 769u], sh_q[qi + 770u], sh_q[qi + 771u]))
+                , dot(k, vec4(sh_q[qi + 816u], sh_q[qi + 817u], sh_q[qi + 818u], sh_q[qi + 819u]))
 #endif
                 );
 }
@@ -75,7 +77,7 @@ qvec kdot(uint b, uint p) {
         uint next = kc[wi + 1u + k];
         uint sw = (prev >> 16u) | (next << 16u);
         prev = next;
-        uint qi = p * 64u + 4u * k;
+        uint qi = p * 68u + 4u * k;
         s0 += qdot4(sw & 0x0f0f0f0fu, qi);
         s0 += qdot4((sw >> 4u) & 0x0f0f0f0fu, qi + 16u);
     }
@@ -83,7 +85,7 @@ qvec kdot(uint b, uint p) {
     qvec s1 = qvec(0.0);
     for (uint k = 0u; k < 4u; k++) {
         uint sw = kc[wi + 5u + k];
-        uint qi = p * 64u + 32u + 4u * k;
+        uint qi = p * 68u + 32u + 4u * k;
         s1 += qdot4(sw & 0x0f0f0f0fu, qi);
         s1 += qdot4((sw >> 4u) & 0x0f0f0f0fu, qi + 16u);
     }
@@ -96,12 +98,12 @@ qvec kdot(uint b, uint p) {
         uint next = kc[wi + 1u + k];
         uint sw = (prev >> 16u) | (next << 16u);
         prev = next;
-        s0 += qdot(sw, p * 64u + 4u * k);
+        s0 += qdot(sw, p * 68u + 4u * k);
     }
     float d1 = unpackHalf2x16(prev).y;
     qvec s1 = qvec(0.0);
     for (uint k = 0u; k < 8u; k++)
-        s1 += qdot(kc[wi + 9u + k], p * 64u + 32u + 4u * k);
+        s1 += qdot(kc[wi + 9u + k], p * 68u + 32u + 4u * k);
     return d0 * s0 + d1 * s1;
 #endif
 }
@@ -125,11 +127,12 @@ void main() {
     if (span0 >= n_kv)
         return;
     uint kvh = h / GQA;
-    sh_q[tid] = q[(tok * pc.n_head + h) * 256u + tid];
-    sh_q[tid + 256u] = q[(tok * pc.n_head + h + 1u) * 256u + tid];
-    sh_q[tid + 512u] = q[(tok * pc.n_head + h + 2u) * 256u + tid];
+    uint qj = tid + (tid / 64u) * 4u;
+    sh_q[qj] = q[(tok * pc.n_head + h) * 256u + tid];
+    sh_q[qj + 272u] = q[(tok * pc.n_head + h + 1u) * 256u + tid];
+    sh_q[qj + 544u] = q[(tok * pc.n_head + h + 2u) * 256u + tid];
 #ifdef Q36_GQA8
-    sh_q[tid + 768u] = q[(tok * pc.n_head + h + 3u) * 256u + tid];
+    sh_q[qj + 816u] = q[(tok * pc.n_head + h + 3u) * 256u + tid];
 #endif
     barrier();
 #ifdef Q36_GQA8
