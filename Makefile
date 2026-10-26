@@ -635,6 +635,7 @@ help:
 	@echo "  make steering-probe  Build the refusal-vector probability and KL validator"
 	@echo "  make test-release Run the complete model, Vulkan, reference, streaming, benchmark, and build gates"
 	@echo "  make benchmark-session-batch  Benchmark old, 1/2/4/8-slot, and ordered-fallback server decode"
+	@echo "  make speed-bench/session_concurrency_bench  Build the session concurrency benchmark"
 	@echo "  make benchmark-qwen27b  Benchmark q36 at 128, 2048, and 4096 prompt tokens, then llama.cpp at its fitting context"
 	@echo "  make benchmark-qwen27b-gate  Quick 128/2048 comparison gate with 32 decode tokens"
 	@echo "  make benchmark-qwen27b-metal-gate  Quick Metal 128/2048 gate with 32 decode tokens"
@@ -671,6 +672,9 @@ q36-server: q36_server.o rax.o q36_ssd.o q36_prompt_prefix.o $(CORE_OBJS)
 
 q36-bench: q36_bench.o q36_ssd.o q36_prompt_prefix.o $(CORE_OBJS)
 	$(CC) $(GPU_CFLAGS) -o $@ q36_bench.o q36_ssd.o q36_prompt_prefix.o $(CORE_OBJS) $(GPU_LDLIBS)
+
+speed-bench/session_concurrency_bench: speed-bench/session_concurrency_bench.c q36.h q36_gpu.h q36_ssd.o q36_prompt_prefix.o $(CORE_OBJS)
+	$(CC) $(GPU_CFLAGS) -I. -o $@ $< q36_ssd.o q36_prompt_prefix.o $(CORE_OBJS) $(GPU_LDLIBS)
 
 q36-agent: q36_agent.o q36_help.o q36_kvstore.o q36_ssd.o q36_prompt_prefix.o q36_web.o linenoise.o $(CORE_OBJS)
 	$(CC) $(GPU_CFLAGS) -o $@ q36_agent.o q36_help.o q36_kvstore.o q36_ssd.o q36_prompt_prefix.o q36_web.o linenoise.o $(CORE_OBJS) $(GPU_LDLIBS)
@@ -1079,6 +1083,7 @@ q36_agent_test_metal: q36_agent_test_metal.o q36_help.o q36_kvstore.o q36_ssd.o 
 	$(CC) $(METAL_LDFLAGS) -o $@ q36_agent_test_metal.o q36_help.o q36_kvstore.o q36_ssd.o q36_prompt_prefix.o q36_web.o linenoise.o $(METAL_CORE_OBJS) $(METAL_LDLIBS)
 
 clean:
+	rm -f speed-bench/session_concurrency_bench
 	rm -f q36 q36-server q36-bench q36-agent q36-eval q36_test q36_reference_test q36_llama_test q36_agent_test q36_agent_test_metal $(SAMPLING_TEST) tests/test_sampling.o tests/test_prompt_prefix tests/test_quality_api dir-steering/tools/probe gguf-tools/quality-testing/score_openrouter gguf-tools/quality-testing/score_openrouter.o *.o $(VULKAN_SHADERS)
 
 q36_prompt_prefix.o: q36_prompt_prefix.c q36_prompt_prefix.h q36.h

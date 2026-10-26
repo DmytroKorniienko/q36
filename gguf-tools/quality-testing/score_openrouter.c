@@ -46,6 +46,8 @@ typedef struct {
 
 typedef struct {
     double logprob;
+    unsigned char *bytes;
+    int len;
     api_alt *alts;
     int n_alts;
     int cap_alts;
@@ -212,6 +214,7 @@ static void api_alt_free(api_alt *alt) {
 }
 
 static void api_pos_free(api_pos *pos) {
+    free(pos->bytes);
     for (int i = 0; i < pos->n_alts; i++) api_alt_free(&pos->alts[i]);
     free(pos->alts);
     memset(pos, 0, sizeof(*pos));
@@ -324,6 +327,13 @@ static bool api_parse_pos(const char **pp, api_pos *pos) {
         p++;
         if (strcmp(key, "logprob") == 0) {
             if (!json_number(&p, &pos->logprob)) return false;
+        } else if (strcmp(key, "bytes") == 0) {
+            free(pos->bytes);
+            pos->bytes = NULL;
+            pos->len = 0;
+            p = json_ws(p);
+            if (strncmp(p, "null", 4) == 0) p += 4;
+            else if (!json_bytes_array(&p, &pos->bytes, &pos->len)) return false;
         } else if (strcmp(key, "top_logprobs") == 0) {
             if (!api_parse_alt_array(&p, pos)) return false;
         } else {
@@ -386,10 +396,29 @@ static bool api_ref_load(const char *path, api_ref *ref) {
     return ok;
 }
 
+static bool api_ref_matches_target(q36_engine *engine, const api_ref *ref,
+                                   const q36_tokens *target) {
+    if (ref->n_pos != target->len) return false;
+    for (int i = 0; i < target->len; i++) {
+        const api_pos *pos = &ref->pos[i];
+        if (!pos->bytes || pos->len <= 0) return false;
+        size_t len = 0;
+        char *text = q36_token_text(engine, target->v[i], &len);
+        bool same = text && len == (size_t)pos->len &&
+                    !memcmp(text, pos->bytes, len);
+        free(text);
+        if (!same) return false;
+    }
+    return true;
+}
+
 static int api_alt_token_id(q36_engine *engine, const api_alt *alt) {
     if (!alt || !alt->bytes || alt->len <= 0) return -1;
     for (int i = 0; i < alt->len; i++) {
         if (alt->bytes[i] == 0) return -1;
+        /* Split Unicode tokens may have lost their original bytes at the API. */
+        if (i + 2 < alt->len && alt->bytes[i] == 0xef &&
+            alt->bytes[i + 1] == 0xbf && alt->bytes[i + 2] == 0xbd) return -1;
     }
     char *text = malloc((size_t)alt->len + 1);
     if (!text) die("out of memory");
@@ -410,6 +439,28 @@ static int api_alt_token_id(q36_engine *engine, const api_alt *alt) {
     q36_tokens_free(&tv);
     free(text);
     return id;
+}
+
+static int api_top1_update(q36_engine *engine, const api_pos *pos,
+                           int greedy, api_metrics *metrics) {
+    double best = -INFINITY;
+    for (int j = 0; j < pos->n_alts; j++) {
+        if (pos->alts[j].logprob > best) best = pos->alts[j].logprob;
+    }
+
+    /* Only exact maxima qualify, even if none map. Prefer greedy among tied
+     * maxima so a position counts once and any mapped maximum can match. */
+    int ref = -1;
+    for (int j = 0; j < pos->n_alts; j++) {
+        if (pos->alts[j].logprob != best) continue;
+        const int tok = api_alt_token_id(engine, &pos->alts[j]);
+        if (tok >= 0 && (ref < 0 || tok == greedy)) ref = tok;
+    }
+    if (ref >= 0) {
+        metrics->top1_count++;
+        if (ref == greedy) metrics->top1_match++;
+    }
+    return ref;
 }
 
 static bool local_logits(q36_session *session, float *logits, int n_vocab,
@@ -679,6 +730,9 @@ int main(int argc, char **argv) {
                         "%s warning: API token count %d != local target tokens %d; "
                         "API logprob agreement skipped\n",
                         id, ref.n_pos, target.len);
+            } else if (!api_ref_matches_target(engine, &ref, &target)) {
+                fprintf(stderr, "%s warning: API bytes differ from local token boundaries; "
+                                "API logprob agreement skipped\n", id);
             } else {
                 api_aligned = true;
             }
@@ -716,6 +770,7 @@ int main(int argc, char **argv) {
 
             if (api_aligned) {
                 const api_pos *ap = &ref.pos[i];
+                api_top1_update(engine, ap, greedy, &cm);
                 if (isfinite(ap->logprob)) {
                     const double delta = target_lp - ap->logprob;
                     cm.target_count++;
@@ -740,10 +795,6 @@ int main(int argc, char **argv) {
                         if (tok < 0) continue;
                         const double lp = local_logprob(logits, n_vocab, tok, logsum);
                         if (!isfinite(lp)) continue;
-                        if (j == 0) {
-                            cm.top1_count++;
-                            if (tok == greedy) cm.top1_match++;
-                        }
                         cm.top_mapped++;
                         cm.top_logprob_count++;
                         const double delta = lp - ap->alts[j].logprob;

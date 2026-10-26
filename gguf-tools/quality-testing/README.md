@@ -84,6 +84,12 @@ Lower `avg_nll` is better. The scorer also reports local-vs-API target-logprob
 error, top-logprob coverage and error, top-1 agreement, top-N recall, and
 pairwise ordering agreement.
 
+API agreement requires matching bytes at every local token boundary; equal
+token counts alone are insufficient. A failed alignment check skips API
+agreement while retaining continuation likelihood scoring. Top-1 agreement
+accepts any mapped alternative with the maximum reported logprob, counts ties
+once, and skips unmappable maxima without substituting a lower-probability token.
+
 ## Prompt Set
 
 `prompts.jsonl` is the tracked 100-prompt quality corpus shared with DS4. Its

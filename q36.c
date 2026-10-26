@@ -5250,9 +5250,16 @@ static bool q36_streaming_hotlist_load_default(uint32_t max_entries,
     uint32_t loaded = 0;
     if (max_entries == 0 || !loaded_out) return false;
     for (uint32_t i = 0; i < q36_default_streaming_hotlist_count && loaded < max_entries; i++) {
+        uint32_t priority = q36_default_streaming_hotlist[i][2];
+#ifndef Q36_METAL
+        /* A profile is an initial preference, not recent decode traffic. */
+        if (!getenv("Q36_VK_STREAM_HOTLIST_RAW"))
+            priority = 1u + (uint32_t)(31ull * priority /
+                                      q36_default_streaming_hotlist[0][2]);
+#endif
         if (!q36_streaming_hotlist_add(q36_default_streaming_hotlist[i][0],
                                        q36_default_streaming_hotlist[i][1],
-                                       q36_default_streaming_hotlist[i][2],
+                                       priority,
                                        experts,
                                        priorities,
                                        counts,
