@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise 27B vector loading, projection, capture lifetime, and the live REPL."""
+"""Exercise vector loading, projection, capture lifetime, and the live REPL."""
 
 import argparse
 import array
@@ -15,7 +15,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--q36", default="./q36")
     ap.add_argument("--model", default="gguf/Qwen3.8-27B-UD-IQ3_S.gguf")
+    ap.add_argument("--profile", choices=("qwen3.8-27b", "qwen3.6-35b-a3b"),
+                    default="qwen3.8-27b")
     args = ap.parse_args()
+    layers, width = (40, 2048) if args.profile == "qwen3.6-35b-a3b" else (64, 5120)
     base = [str(Path(args.q36).resolve()), "-m", str(Path(args.model).resolve()),
             "--ctx", "256", "--nothink", "--temp", "0"]
     env = os.environ.copy()
@@ -41,26 +44,26 @@ def main():
     with tempfile.TemporaryDirectory(prefix="q36-steering-test-") as td:
         root = Path(td)
         bank = root / "direction.f32"
-        vectors = array.array("f", [0.0]) * (64 * 5120)
+        vectors = array.array("f", [0.0]) * (layers * width)
 
         def write_bank(layer):
             for i in range(len(vectors)):
                 vectors[i] = 0.0
-            vectors[layer * 5120] = 1.0
+            vectors[layer * width] = 1.0
             bank.write_bytes(vectors.tobytes())
 
         def read_dump(prefix, component):
             rows = []
-            for layer in range(64):
+            for layer in range(layers):
                 path = Path(f"{prefix}_{component}-{layer}_pos0.bin")
-                assert path.stat().st_size == 5120 * 4, path
+                assert path.stat().st_size == width * 4, path
                 row = array.array("f")
                 row.frombytes(path.read_bytes())
                 assert all(math.isfinite(x) for x in row), path
                 rows.append(row)
             return rows
 
-        # A fresh process must detect the dense shape before reading the bank,
+        # A fresh process must detect the model shape before reading the bank,
         # even when the initial scale is zero and /steer will enable it later.
         write_bank(0)
         steering = ["--dir-steering-file", str(bank), "--dir-steering-ffn", "0"]
@@ -72,7 +75,7 @@ def main():
 
         bank.write_bytes(b"bad")
         output = run(steering + ["--inspect"], success=False)
-        assert "64 x 5120" in output, output
+        assert f"{layers} x {width}" in output, output
         write_bank(0)
         vectors[0] = math.nan
         bank.write_bytes(vectors.tobytes())
@@ -115,7 +118,7 @@ def main():
         def row_at(prefix, name, pos):
             values = array.array("f")
             values.frombytes(Path(f"{prefix}_{name}-0_pos{pos}.bin").read_bytes())
-            assert len(values) == 5120 and all(math.isfinite(x) for x in values)
+            assert len(values) == width and all(math.isfinite(x) for x in values)
             return values
 
         for pos in (0, prompt_tokens - 1, prompt_tokens + 2):
@@ -133,7 +136,7 @@ def main():
         for name in names:
             assert row_at(selected, name, 1) == row_at(prefix, name, 1)
 
-    print("PASS steering: dense loading, zero-scale enable, invalid banks, FFN/recurrent/full-attention projection, final prompt capture, layer/position filters, residual identities, /steer and /ctx")
+    print(f"PASS steering ({args.profile}): loading, zero-scale enable, invalid banks, FFN/recurrent/full-attention projection, final prompt capture, layer/position filters, residual identities, /steer and /ctx")
 
 
 if __name__ == "__main__":

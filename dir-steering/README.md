@@ -1,8 +1,8 @@
 # Directional Steering
 
-Directional steering is a runtime activation edit for Q36's Qwen3.8 27B model.
-A steering file is a flat `f32` matrix with one normalized 5120-wide direction
-per layer. During inference, q36 can apply the edit after attention outputs,
+Directional steering is a runtime activation edit for Q36's dense and MoE models.
+A steering file is a flat `f32` matrix with one normalized hidden-width direction
+per transformer layer. During inference, q36 can apply the edit after attention outputs,
 FFN outputs, or both:
 
 ```text
@@ -16,7 +16,7 @@ Load a file at scale zero to enable it later with `/steer`.
 ## Runtime Options
 
 ```text
---dir-steering-file FILE   load a 64 x 5120 f32 direction file
+--dir-steering-file FILE   load one hidden-width f32 direction per layer
 --dir-steering-ffn F       apply steering after FFN outputs; default is 1 when a file is provided
 --dir-steering-attn F      apply steering after attention outputs; default is 0
 ```
@@ -197,10 +197,68 @@ counts from a unique matching file line so the model can retry accurately.
 calls, and disk-cache separation with and without steering.
 
 The default extractor profile is `qwen3.8-27b` (`64 x 5120`). Use
-`--profile qwen3.6-35b-a3b` for the `40 x 2048` MoE model. Vectors from a
-different model cannot be reused. `--limit N` captures the first N pairs for a
+`--profile qwen3.6-35b-a3b` for the `40 x 2048` MoE model. Directions and scales
+need validation for each set of weights. `--limit N` captures the first N pairs for a
 quick trial. `--think`, `--pair-normalize`, and `--no-orthogonalize` retain the
 DS4 extraction controls.
+
+| Model | Extractor profile | Runtime vector shape |
+| --- | --- | --- |
+| `Qwen3.8-27B-UD-IQ3_S.gguf` | `qwen3.8-27b` | `64 x 5120` |
+| `Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf` | `qwen3.8-27b` | `64 x 5120` |
+| `Qwen3.6-35B-A3B-IQ2XXS-Q2K-Q8.gguf` | `qwen3.6-35b-a3b` | `40 x 2048` |
+
+The embedded MTP block does not add a row to the steering bank. A matching
+shape allows loading; it does not establish that a direction or scale transfers
+between different weights. The IQ3_S refusal bank fits GSQ-RCO, but needs
+separate behavioral validation. It cannot be loaded by the MoE model.
+
+Build a MoE direction with the same paired prompts:
+
+```sh
+python3 dir-steering/tools/build_direction.py \
+  --model gguf/Qwen3.6-35B-A3B-IQ2XXS-Q2K-Q8.gguf \
+  --profile qwen3.6-35b-a3b \
+  --good-file dir-steering/examples/succinct.txt \
+  --bad-file dir-steering/examples/verbose.txt \
+  --out dir-steering/out/moe-verbosity.json
+```
+
+The refusal trainer below currently assumes the `64 x 5120` profile; the
+extractor's MoE support does not provide a calibrated MoE refusal bank.
+
+Run the projection and live-control regression against either additional model:
+
+```sh
+python3 tests/test_directional_steering.py \
+  --model gguf/Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf
+python3 tests/test_directional_steering.py \
+  --model gguf/Qwen3.6-35B-A3B-IQ2XXS-Q2K-Q8.gguf \
+  --profile qwen3.6-35b-a3b
+```
+
+`./q36_test --steering-sessions --model FILE` additionally checks independent
+strengths and logits in native session batches for the selected model.
+
+On 2026-10-27, both additional models passed these checks on BC-250 Vulkan,
+including FFN and recurrent/full-attention projection, zero-scale equivalence,
+activation capture identities, `/steer`, `/ctx`, and native session batching.
+Mixed-strength batches matched their reference logits exactly. Ordinary and
+MTP greedy completions matched on one benign prompt at zero and one nonzero
+FFN strength per model.
+
+The existing IQ3_S refusal bank also passed its prior probe gates on GSQ-RCO
+at FFN `1.25`: mean refusal-prefix probability was `92.99% → 88.33%` on 32
+target prompts, with benign mean KL `0.0267` on 32 controls and short-answer
+accuracy `8/8 → 8/8`. The paired-bootstrap 95% change interval was `-8.59` to
+`-1.73` percentage points. At FFN `2`, the proxy fell to `5.23%`, but benign
+KL `0.2980` exceeded the `0.1` guard. These are first-token proxy measurements.
+
+For MoE, a fresh 16-pair verbosity bank was extracted successfully; eight short
+answers stayed correct at FFN `0`, `-0.5`, and `1`. This checks extraction and
+runtime compatibility, without establishing verbosity control or a calibrated
+refusal direction. Local commands, raw outputs, and measurements are in
+`dir-steering/out/model-compatibility/report.json` and adjacent files.
 
 Reference: [Refusal in Language Models Is Mediated by a Single Direction](https://arxiv.org/html/2406.11717v3).
 This implementation follows DS4's per-layer attention/FFN projection rather
